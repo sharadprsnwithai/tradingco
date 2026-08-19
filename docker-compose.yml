@@ -1,0 +1,44 @@
+---
+services:
+  trading-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trading-bot:latest
+    container_name: trading-bot
+    restart: unless-stopped
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      - SERVER_PORT=8080
+      - INSTRUMENT_DB_PATH=/app/data/instruments.db
+      - >-
+        JAVA_OPTS=-XX:+UseSerialGC -Xms256m -Xmx384m
+        -XX:+ExitOnOutOfMemoryError -Duser.timezone=Asia/Kolkata
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 600M
+        reservations:
+          cpus: "0.25"
+          memory: 300M
+    healthcheck:
+      test:
+        - "CMD"
+        - "curl"
+        - "-f"
+        - "http://localhost:8080/actuator/health"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

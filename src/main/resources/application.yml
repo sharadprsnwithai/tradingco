@@ -1,0 +1,82 @@
+---
+server:
+  port: ${SERVER_PORT:8080}
+
+logging:
+  level:
+    com.tradingbot: DEBUG
+
+spring:
+  application:
+    name: multi-broker-trading-bot
+  r2dbc:
+    url: >-
+      ${R2DBC_URL:r2dbc:h2:mem:///tradingbot;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE}
+    username: ${DB_USER:sa}
+    password: ${DB_PASSWORD:}
+  main:
+    web-application-type: reactive
+
+trading-bot:
+  brokers:
+    kite:
+      enabled: ${KITE_ENABLED:true}
+      api-key: ${KITE_API_KEY:mock_kite_api_key}
+      api-secret: ${KITE_API_SECRET:mock_kite_secret}
+      user-id: ${KITE_USER_ID:mock_kite_user}
+      password: ${KITE_PASSWORD:mock_kite_password}
+      totp-secret: ${KITE_TOTP_SECRET:JBSWY3DPEHPK3PXP}
+      base-url: ${KITE_BASE_URL:https://api.kite.trade}
+    shoonya:
+      enabled: ${SHOONYA_ENABLED:true}
+      client-id: ${SHOONYA_CLIENT_ID:mock_shoonya_client}
+      secret-key: ${SHOONYA_SECRET_KEY:mock_shoonya_secret}
+      user-id: ${SHOONYA_USER_ID:mock_shoonya_user}
+      account-id: ${SHOONYA_ACCOUNT_ID:mock_shoonya_act}
+      password: ${SHOONYA_PASSWORD:mock_shoonya_password}
+      totp-secret: ${SHOONYA_TOTP_SECRET:JBSWY3DPEHPK3PXP}
+      vendor-code: ${SHOONYA_VENDOR_CODE:mock_vendor}
+      api-key: ${SHOONYA_API_KEY:mock_api_key}
+      base-url: ${SHOONYA_BASE_URL:https://api.shoonya.com}
+  telegram:
+    bot-token: ${TELEGRAM_BOT_TOKEN:}
+    chat-id: ${TELEGRAM_CHAT_ID:}
+
+bot:
+  instrument:
+    db-path: ${INSTRUMENT_DB_PATH:data/instruments.db}
+  marketdata:
+    silence-threshold-seconds: ${SILENCE_THRESHOLD_SECONDS:3}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: always
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      kite:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+      shoonya:
+        sliding-window-size: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+  ratelimiter:
+    instances:
+      kite:
+        limit-for-period: 3
+        limit-refresh-period: 1s
+        timeout-duration: 2s
+      shoonya:
+        limit-for-period: 5
+        limit-refresh-period: 1s
+        timeout-duration: 2s

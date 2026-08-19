@@ -1,0 +1,24 @@
+# Environment and Credentials
+.env
+.env.local
+*.log
+
+# Gradle & Build artifacts
+.gradle/
+build/
+bin/
+out/
+
+# IDE / Editor artifacts
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+
+# OS files
+.DS_Store
+Thumbs.db

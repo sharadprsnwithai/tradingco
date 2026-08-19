@@ -1,0 +1,878 @@
+<!doctype html>
+<html lang="en" class="dark">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>TradingBot — Multi-Broker Operations Desk</title>
+        <!-- Tailwind CSS CDN -->
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script>
+            tailwind.config = {
+                darkMode: "class",
+                theme: {
+                    extend: {
+                        colors: {
+                            brand: {
+                                50: "#f0fdf4",
+                                500: "#22c55e",
+                                600: "#16a34a",
+                                900: "#14532d",
+                            },
+                            darkBg: "#0f172a",
+                            cardBg: "#1e293b",
+                            borderBg: "#334155",
+                        },
+                    },
+                },
+            };
+        </script>
+        <style>
+            body {
+                font-family:
+                    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                    Helvetica, Arial, sans-serif;
+            }
+        </style>
+    </head>
+    <body
+        class="bg-slate-950 text-slate-100 min-h-screen flex flex-col antialiased selection:bg-emerald-500 selection:text-white"
+    >
+        <!-- Top Navigation / Control Plane -->
+        <header
+            class="border-b border-slate-800 bg-slate-900/90 backdrop-blur sticky top-0 z-50 px-6 py-3.5"
+        >
+            <div
+                class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-4"
+            >
+                <!-- Logo & Title -->
+                <div class="flex items-center space-x-3">
+                    <div
+                        class="w-8 h-8 rounded-lg bg-gradient-to-tr from-emerald-500 to-teal-400 flex items-center justify-center font-bold text-slate-950 shadow-lg shadow-emerald-500/20"
+                    >
+                        ⚡
+                    </div>
+                    <div>
+                        <div class="flex items-center space-x-2">
+                            <span
+                                class="font-black text-lg tracking-tight bg-gradient-to-r from-white via-slate-200 to-slate-400 bg-clip-text text-transparent"
+                                >Multi-Broker Desk</span
+                            >
+                            <span
+                                id="badge-mode"
+                                class="px-2 py-0.5 text-xs font-bold rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30"
+                                >PAPER TRADING</span
+                            >
+                        </div>
+                        <p class="text-xs text-slate-400">
+                            Zerodha Kite & Shoonya NorenAPI • Java 21 Reactive
+                        </p>
+                    </div>
+                </div>
+
+                <!-- Health & Status Badges -->
+                <div class="flex items-center space-x-3 text-xs">
+                    <!-- Feed Source -->
+                    <div
+                        class="flex items-center space-x-1.5 px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700"
+                    >
+                        <span
+                            class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"
+                        ></span>
+                        <span class="text-slate-400">Feed:</span>
+                        <span id="val-feed" class="font-bold text-slate-200"
+                            >ZERODHA (Primary)</span
+                        >
+                    </div>
+
+                    <!-- Clock IST -->
+                    <div
+                        class="flex items-center space-x-1.5 px-3 py-1.5 rounded-md bg-slate-800 border border-slate-700"
+                    >
+                        <span class="text-slate-400">IST:</span>
+                        <span
+                            id="val-clock"
+                            class="font-mono font-bold text-slate-200"
+                            >--:--:--</span
+                        >
+                    </div>
+
+                    <!-- Paper Mode Toggle -->
+                    <button
+                        onclick="togglePaperTrading()"
+                        class="px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 border border-slate-700 font-semibold transition text-slate-200 hover:text-white"
+                    >
+                        Toggle Paper Mode
+                    </button>
+
+                    <!-- Emergency Panic Button -->
+                    <button
+                        onclick="openPanicModal()"
+                        class="px-3.5 py-1.5 rounded-md bg-rose-600 hover:bg-rose-500 text-white font-bold transition shadow-lg shadow-rose-600/30 flex items-center space-x-1"
+                    >
+                        <span>🚨</span>
+                        <span>GLOBAL PANIC</span>
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Container -->
+        <main class="max-w-7xl mx-auto px-6 py-6 w-full flex-1 space-y-6">
+            <!-- Global Panic Banner (Hidden by default) -->
+            <div
+                id="banner-panic"
+                class="hidden p-4 rounded-xl bg-rose-950/80 border border-rose-600/60 flex items-center justify-between"
+            >
+                <div class="flex items-center space-x-3">
+                    <span class="text-2xl animate-bounce">🚨</span>
+                    <div>
+                        <h3 class="font-bold text-rose-300">
+                            GLOBAL PANIC KILL SWITCH IS ACTIVE
+                        </h3>
+                        <p class="text-xs text-rose-400">
+                            All open orders have been cancelled and intraday
+                            positions liquidated.
+                        </p>
+                    </div>
+                </div>
+                <button
+                    onclick="resetPanic()"
+                    class="px-4 py-1.5 bg-rose-700 hover:bg-rose-600 text-white text-xs font-bold rounded-lg transition"
+                >
+                    Reset Panic State
+                </button>
+            </div>
+
+            <!-- Metrics Overview Grid -->
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <!-- Total MTM P&L -->
+                <div
+                    class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm flex flex-col justify-between"
+                >
+                    <span
+                        class="text-xs font-semibold text-slate-400 uppercase tracking-wider"
+                        >Total MTM P&L</span
+                    >
+                    <div class="mt-2 flex items-baseline justify-between">
+                        <span
+                            id="metric-total-pnl"
+                            class="text-2xl font-black text-slate-100 font-mono"
+                            >₹0.00</span
+                        >
+                        <span
+                            id="metric-pnl-indicator"
+                            class="text-xs px-2 py-0.5 rounded font-semibold bg-slate-800 text-slate-400"
+                            >0.00%</span
+                        >
+                    </div>
+                </div>
+
+                <!-- Intraday Book P&L -->
+                <div
+                    class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm flex flex-col justify-between"
+                >
+                    <span
+                        class="text-xs font-semibold text-slate-400 uppercase tracking-wider"
+                        >Intraday (MIS) Book</span
+                    >
+                    <div class="mt-2 flex items-baseline justify-between">
+                        <span
+                            id="metric-intraday-pnl"
+                            class="text-2xl font-black text-slate-100 font-mono"
+                            >₹0.00</span
+                        >
+                        <span
+                            id="metric-intraday-count"
+                            class="text-xs text-slate-400"
+                            >0 open</span
+                        >
+                    </div>
+                </div>
+
+                <!-- Positional Book P&L -->
+                <div
+                    class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm flex flex-col justify-between"
+                >
+                    <span
+                        class="text-xs font-semibold text-slate-400 uppercase tracking-wider"
+                        >Positional (NRML) Book</span
+                    >
+                    <div class="mt-2 flex items-baseline justify-between">
+                        <span
+                            id="metric-positional-pnl"
+                            class="text-2xl font-black text-slate-100 font-mono"
+                            >₹0.00</span
+                        >
+                        <span
+                            id="metric-positional-count"
+                            class="text-xs text-slate-400"
+                            >0 open</span
+                        >
+                    </div>
+                </div>
+
+                <!-- Open Orders & Active Strategies -->
+                <div
+                    class="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow-sm flex flex-col justify-between"
+                >
+                    <span
+                        class="text-xs font-semibold text-slate-400 uppercase tracking-wider"
+                        >Engine Status</span
+                    >
+                    <div class="mt-2 flex items-baseline justify-between">
+                        <span
+                            id="metric-engine-status"
+                            class="text-base font-bold text-emerald-400 font-mono"
+                            >RUNNING</span
+                        >
+                        <span
+                            id="metric-orders-count"
+                            class="text-xs text-slate-400"
+                            >0 orders</span
+                        >
+                    </div>
+                </div>
+            </div>
+
+            <!-- Strategy Management & Controls -->
+            <div
+                class="rounded-xl bg-slate-900 border border-slate-800 overflow-hidden shadow-sm"
+            >
+                <div
+                    class="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between"
+                >
+                    <div class="flex items-center space-x-2">
+                        <span class="text-base">⚙️</span>
+                        <h2 class="font-bold text-sm text-slate-200">
+                            Active Strategy Engines (1:1 Broker Mapping)
+                        </h2>
+                    </div>
+                    <span
+                        id="strategy-count"
+                        class="text-xs font-semibold text-slate-400"
+                        >0 strategies</span
+                    >
+                </div>
+                <div
+                    class="p-4 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4"
+                    id="strategies-container"
+                >
+                    <!-- Strategy Cards injected dynamically -->
+                </div>
+            </div>
+
+            <!-- Position Books (Partitioned Tabs) -->
+            <div
+                class="rounded-xl bg-slate-900 border border-slate-800 overflow-hidden shadow-sm"
+            >
+                <div
+                    class="px-5 py-3.5 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3"
+                >
+                    <div class="flex items-center space-x-2">
+                        <span class="text-base">📊</span>
+                        <h2 class="font-bold text-sm text-slate-200">
+                            Partitioned Position Books
+                        </h2>
+                    </div>
+                    <div
+                        class="flex items-center space-x-1 bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs"
+                    >
+                        <button
+                            onclick="switchTab('intraday')"
+                            id="tab-btn-intraday"
+                            class="px-3 py-1 font-semibold rounded-md bg-slate-800 text-white transition"
+                        >
+                            Intraday (MIS)
+                        </button>
+                        <button
+                            onclick="switchTab('positional')"
+                            id="tab-btn-positional"
+                            class="px-3 py-1 font-semibold rounded-md text-slate-400 hover:text-white transition"
+                        >
+                            Positional (NRML)
+                        </button>
+                        <button
+                            onclick="switchTab('all')"
+                            id="tab-btn-all"
+                            class="px-3 py-1 font-semibold rounded-md text-slate-400 hover:text-white transition"
+                        >
+                            All Positions
+                        </button>
+                    </div>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-xs text-slate-300">
+                        <thead
+                            class="bg-slate-950/60 text-slate-400 uppercase font-semibold text-[10px] tracking-wider border-b border-slate-800"
+                        >
+                            <tr>
+                                <th class="px-5 py-3">Symbol</th>
+                                <th class="px-4 py-3">Account</th>
+                                <th class="px-4 py-3">Product</th>
+                                <th class="px-4 py-3 text-right">Net Qty</th>
+                                <th class="px-4 py-3 text-right">Avg Price</th>
+                                <th class="px-4 py-3 text-right">LTP</th>
+                                <th class="px-4 py-3 text-right">
+                                    Realized P&L
+                                </th>
+                                <th class="px-4 py-3 text-right">MTM P&L</th>
+                            </tr>
+                        </thead>
+                        <tbody
+                            id="positions-tbody"
+                            class="divide-y divide-slate-800/60"
+                        ></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Live Order Book -->
+            <div
+                class="rounded-xl bg-slate-900 border border-slate-800 overflow-hidden shadow-sm"
+            >
+                <div
+                    class="px-5 py-3.5 border-b border-slate-800 flex items-center justify-between"
+                >
+                    <div class="flex items-center space-x-2">
+                        <span class="text-base">📝</span>
+                        <h2 class="font-bold text-sm text-slate-200">
+                            Live Order Book & Reconciler Stream
+                        </h2>
+                    </div>
+                    <span
+                        id="orders-summary-count"
+                        class="text-xs text-slate-400"
+                        >0 orders</span
+                    >
+                </div>
+                <div class="overflow-x-auto max-h-72">
+                    <table class="w-full text-left text-xs text-slate-300">
+                        <thead
+                            class="bg-slate-950/60 text-slate-400 uppercase font-semibold text-[10px] tracking-wider border-b border-slate-800 sticky top-0"
+                        >
+                            <tr>
+                                <th class="px-5 py-3">Time</th>
+                                <th class="px-4 py-3">Order ID</th>
+                                <th class="px-4 py-3">Strategy</th>
+                                <th class="px-4 py-3">Symbol</th>
+                                <th class="px-4 py-3">Type</th>
+                                <th class="px-4 py-3 text-right">Qty</th>
+                                <th class="px-4 py-3 text-right">Price</th>
+                                <th class="px-4 py-3 text-center">Status</th>
+                            </tr>
+                        </thead>
+                        <tbody
+                            id="orders-tbody"
+                            class="divide-y divide-slate-800/60"
+                        ></tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+
+        <!-- Global Panic Confirmation Modal -->
+        <div
+            id="modal-panic"
+            class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4"
+        >
+            <div
+                class="bg-slate-900 border border-rose-700/60 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl shadow-rose-950/50"
+            >
+                <div
+                    class="w-12 h-12 rounded-full bg-rose-500/20 border border-rose-500/30 flex items-center justify-center text-2xl mx-auto"
+                >
+                    🚨
+                </div>
+                <div class="text-center space-y-1">
+                    <h3 class="text-lg font-black text-rose-300">
+                        CONFIRM GLOBAL PANIC (L3)
+                    </h3>
+                    <p class="text-xs text-slate-400">
+                        This action will immediately cancel ALL open orders
+                        across ALL brokers and market-liquidate all open
+                        intraday positions.
+                    </p>
+                </div>
+                <div
+                    class="p-3 bg-rose-950/40 border border-rose-800/40 rounded-lg text-[11px] text-rose-300 font-mono"
+                >
+                    • StrategyEngine execution will halt<br />
+                    • RiskManager will reject all incoming entries<br />
+                    • Open intraday trades will be squared off
+                </div>
+                <div class="flex items-center space-x-3 pt-2">
+                    <button
+                        onclick="closePanicModal()"
+                        class="flex-1 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-300 transition"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        onclick="confirmPanic()"
+                        class="flex-1 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-xs font-bold text-white shadow-lg shadow-rose-600/30 transition"
+                    >
+                        YES, TRIGGER PANIC
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- JavaScript Client -->
+        <script>
+            let currentTab = "intraday";
+            let latestData = {
+                intradayPositions: [],
+                positionalPositions: [],
+                openOrders: [],
+                strategies: [],
+                totalMtmPnl: 0,
+                intradayPnl: 0,
+                positionalPnl: 0,
+                activeBroker: "ZERODHA",
+                paperTrading: true,
+                globalPanic: false,
+            };
+
+            // Live Clock
+            setInterval(() => {
+                const now = new Date();
+                document.getElementById("val-clock").textContent =
+                    now.toLocaleTimeString("en-IN", {
+                        timeZone: "Asia/Kolkata",
+                        hour12: false,
+                    });
+            }, 1000);
+
+            // SSE Connection
+            function connectSSE() {
+                const eventSource = new EventSource("/api/telemetry/stream");
+                eventSource.addEventListener("telemetry-update", (event) => {
+                    try {
+                        const data = JSON.parse(event.data);
+                        latestData = data;
+                        renderUI();
+                    } catch (e) {
+                        console.error("Failed to parse SSE telemetry:", e);
+                    }
+                });
+                eventSource.onerror = () => {
+                    console.error("SSE stream disconnected, retrying in 3s...");
+                    eventSource.close();
+                    setTimeout(connectSSE, 3000);
+                };
+            }
+
+            // Fallback REST fetch
+            async function fetchSnapshot() {
+                try {
+                    const res = await fetch("/api/telemetry/summary");
+                    if (res.ok) {
+                        const data = await res.json();
+                        latestData = data;
+                        renderUI();
+                    }
+                } catch (e) {
+                    console.error("Telemetry fetch error:", e);
+                }
+            }
+
+            function renderUI() {
+                // Header & badges
+                document.getElementById("val-feed").textContent =
+                    `${latestData.activeBroker || "ZERODHA"} ${latestData.isFailedOver ? "(Standby)" : "(Primary)"}`;
+                const badgeMode = document.getElementById("badge-mode");
+                if (latestData.paperTrading) {
+                    badgeMode.textContent = "PAPER TRADING";
+                    badgeMode.className =
+                        "px-2 py-0.5 text-xs font-bold rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30";
+                } else {
+                    badgeMode.textContent = "REAL MONEY (LIVE)";
+                    badgeMode.className =
+                        "px-2 py-0.5 text-xs font-bold rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
+                }
+
+                // Panic Banner
+                const panicBanner = document.getElementById("banner-panic");
+                if (latestData.globalPanic) {
+                    panicBanner.classList.remove("hidden");
+                } else {
+                    panicBanner.classList.add("hidden");
+                }
+
+                // Metrics
+                formatCurrency("metric-total-pnl", latestData.totalMtmPnl || 0);
+                formatCurrency(
+                    "metric-intraday-pnl",
+                    latestData.intradayPnl || 0,
+                );
+                formatCurrency(
+                    "metric-positional-pnl",
+                    latestData.positionalPnl || 0,
+                );
+
+                document.getElementById("metric-intraday-count").textContent =
+                    `${(latestData.intradayPositions || []).length} open`;
+                document.getElementById("metric-positional-count").textContent =
+                    `${(latestData.positionalPositions || []).length} open`;
+                document.getElementById("metric-orders-count").textContent =
+                    `${(latestData.openOrders || []).length} open orders`;
+                document.getElementById("orders-summary-count").textContent =
+                    `${(latestData.openOrders || []).length} orders`;
+
+                // Strategies
+                renderStrategies(latestData.strategies || []);
+
+                // Positions Table
+                renderPositions();
+
+                // Orders Table
+                renderOrders(latestData.openOrders || []);
+            }
+
+            function formatCurrency(elementId, amount) {
+                const el = document.getElementById(elementId);
+                const val = parseFloat(amount || 0);
+                el.textContent = `₹${val.toFixed(2)}`;
+                if (val > 0) {
+                    el.className =
+                        "text-2xl font-black text-emerald-400 font-mono";
+                } else if (val < 0) {
+                    el.className =
+                        "text-2xl font-black text-rose-400 font-mono";
+                } else {
+                    el.className =
+                        "text-2xl font-black text-slate-100 font-mono";
+                }
+            }
+
+            function renderStrategies(strategies) {
+                const container = document.getElementById(
+                    "strategies-container",
+                );
+                document.getElementById("strategy-count").textContent =
+                    `${strategies.length} strategies`;
+                container.replaceChildren();
+
+                if (strategies.length === 0) {
+                    const empty = document.createElement("div");
+                    empty.className =
+                        "col-span-full py-6 text-center text-xs text-slate-500";
+                    empty.textContent = "No active strategies registered";
+                    container.appendChild(empty);
+                    return;
+                }
+
+                strategies.forEach((s) => {
+                    const card = document.createElement("div");
+                    card.className =
+                        "p-4 rounded-lg bg-slate-950/60 border border-slate-800 flex flex-col justify-between space-y-3";
+
+                    const top = document.createElement("div");
+                    const header = document.createElement("div");
+                    header.className = "flex items-center justify-between";
+
+                    const title = document.createElement("span");
+                    title.className = "font-bold text-xs text-white";
+                    title.textContent = s.strategyId;
+
+                    const badge = document.createElement("span");
+                    badge.className = `px-2 py-0.5 text-[10px] font-bold rounded ${s.enabled ? "bg-emerald-500/20 text-emerald-400" : "bg-amber-500/20 text-amber-400"}`;
+                    badge.textContent = s.enabled ? "RUNNING" : "PAUSED";
+
+                    header.appendChild(title);
+                    header.appendChild(badge);
+
+                    const info = document.createElement("div");
+                    info.className =
+                        "mt-2 text-[11px] text-slate-400 space-y-0.5";
+
+                    const accDiv = document.createElement("div");
+                    accDiv.textContent = `Account: ${s.accountId}`;
+
+                    const symDiv = document.createElement("div");
+                    symDiv.className = "truncate";
+                    symDiv.textContent = `Symbols: ${(s.symbols || []).join(", ")}`;
+
+                    info.appendChild(accDiv);
+                    info.appendChild(symDiv);
+
+                    top.appendChild(header);
+                    top.appendChild(info);
+
+                    const footer = document.createElement("div");
+                    footer.className =
+                        "flex items-center space-x-2 pt-2 border-t border-slate-800/80";
+
+                    const toggleBtn = document.createElement("button");
+                    toggleBtn.className =
+                        "flex-1 py-1 text-[11px] font-semibold rounded bg-slate-800 hover:bg-slate-700 text-slate-200 transition";
+                    toggleBtn.textContent = s.enabled ? "⏸ Pause" : "▶️ Resume";
+                    toggleBtn.onclick = () => toggleStrategy(s.strategyId);
+
+                    const killBtn = document.createElement("button");
+                    killBtn.className =
+                        "px-2.5 py-1 text-[11px] font-bold rounded bg-rose-600/20 hover:bg-rose-600/40 text-rose-300 transition";
+                    killBtn.textContent = "Kill L1";
+                    killBtn.onclick = () => killStrategy(s.strategyId);
+
+                    footer.appendChild(toggleBtn);
+                    footer.appendChild(killBtn);
+
+                    card.appendChild(top);
+                    card.appendChild(footer);
+                    container.appendChild(card);
+                });
+            }
+
+            function renderPositions() {
+                const tbody = document.getElementById("positions-tbody");
+                tbody.replaceChildren();
+
+                let list = [];
+                if (currentTab === "intraday") {
+                    list = latestData.intradayPositions || [];
+                } else if (currentTab === "positional") {
+                    list = latestData.positionalPositions || [];
+                } else {
+                    list = [
+                        ...(latestData.intradayPositions || []),
+                        ...(latestData.positionalPositions || []),
+                    ];
+                }
+
+                if (list.length === 0) {
+                    const tr = document.createElement("tr");
+                    const td = document.createElement("td");
+                    td.colSpan = 8;
+                    td.className = "text-center py-6 text-slate-500";
+                    td.textContent = `No open positions in ${currentTab} book`;
+                    tr.appendChild(td);
+                    tbody.appendChild(tr);
+                    return;
+                }
+
+                list.forEach((p) => {
+                    const tr = document.createElement("tr");
+                    tr.className = "hover:bg-slate-850/50 transition";
+
+                    const mtm = parseFloat(p.mtmPnl || 0);
+                    const realized = parseFloat(p.realizedPnl || 0);
+
+                    const tdSym = document.createElement("td");
+                    tdSym.className =
+                        "px-5 py-3 font-bold text-white font-mono";
+                    tdSym.textContent = p.symbol;
+
+                    const tdAcc = document.createElement("td");
+                    tdAcc.className =
+                        "px-4 py-3 text-slate-400 font-mono text-[11px]";
+                    tdAcc.textContent = p.accountId;
+
+                    const tdProd = document.createElement("td");
+                    tdProd.className = "px-4 py-3";
+                    const pSpan = document.createElement("span");
+                    pSpan.className =
+                        "px-2 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-300";
+                    pSpan.textContent = p.productType;
+                    tdProd.appendChild(pSpan);
+
+                    const tdQty = document.createElement("td");
+                    tdQty.className = `px-4 py-3 text-right font-mono font-bold ${p.netQuantity >= 0 ? "text-emerald-400" : "text-rose-400"}`;
+                    tdQty.textContent = p.netQuantity;
+
+                    const tdAvg = document.createElement("td");
+                    tdAvg.className = "px-4 py-3 text-right font-mono";
+                    tdAvg.textContent = `₹${parseFloat(p.buyAveragePrice || 0).toFixed(2)}`;
+
+                    const tdLtp = document.createElement("td");
+                    tdLtp.className =
+                        "px-4 py-3 text-right font-mono font-semibold text-white";
+                    tdLtp.textContent = `₹${parseFloat(p.ltp || 0).toFixed(2)}`;
+
+                    const tdRealized = document.createElement("td");
+                    tdRealized.className = "px-4 py-3 text-right font-mono";
+                    tdRealized.textContent = `₹${realized.toFixed(2)}`;
+
+                    const tdMtm = document.createElement("td");
+                    tdMtm.className = `px-4 py-3 text-right font-mono ${mtm >= 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}`;
+                    tdMtm.textContent = `₹${mtm.toFixed(2)}`;
+
+                    tr.appendChild(tdSym);
+                    tr.appendChild(tdAcc);
+                    tr.appendChild(tdProd);
+                    tr.appendChild(tdQty);
+                    tr.appendChild(tdAvg);
+                    tr.appendChild(tdLtp);
+                    tr.appendChild(tdRealized);
+                    tr.appendChild(tdMtm);
+
+                    tbody.appendChild(tr);
+                });
+            }
+
+            function getStatusColorClass(status) {
+                if (status === "FILLED") {
+                    return "bg-emerald-500/20 text-emerald-400";
+                }
+                if (status === "OPEN") {
+                    return "bg-blue-500/20 text-blue-400";
+                }
+                return "bg-rose-500/20 text-rose-400";
+            }
+
+            function renderOrders(orders) {
+                const tbody = document.getElementById("orders-tbody");
+                tbody.replaceChildren();
+
+                if (!orders || orders.length === 0) {
+                    const tr = document.createElement("tr");
+                    const td = document.createElement("td");
+                    td.colSpan = 8;
+                    td.className = "text-center py-6 text-slate-500";
+                    td.textContent = "No active orders in book";
+                    tr.appendChild(td);
+                    tbody.appendChild(tr);
+                    return;
+                }
+
+                orders.forEach((o) => {
+                    const tr = document.createElement("tr");
+                    tr.className = "hover:bg-slate-850/50 transition";
+
+                    const isBuy = o.transactionType === "BUY";
+                    const statusColor = getStatusColorClass(o.status);
+                    const time = o.createdAt
+                        ? new Date(o.createdAt).toLocaleTimeString("en-IN", {
+                              hour12: false,
+                          })
+                        : "--:--";
+
+                    const tdTime = document.createElement("td");
+                    tdTime.className =
+                        "px-5 py-2.5 text-slate-400 font-mono text-[11px]";
+                    tdTime.textContent = time;
+
+                    const tdId = document.createElement("td");
+                    tdId.className =
+                        "px-4 py-2.5 text-slate-300 font-mono text-[11px] truncate max-w-[120px]";
+                    tdId.textContent = o.id;
+
+                    const tdStrat = document.createElement("td");
+                    tdStrat.className =
+                        "px-4 py-2.5 text-slate-400 font-mono text-[11px]";
+                    tdStrat.textContent = o.strategyId || "--";
+
+                    const tdSym = document.createElement("td");
+                    tdSym.className =
+                        "px-4 py-2.5 font-bold text-white font-mono";
+                    tdSym.textContent = o.symbol;
+
+                    const tdType = document.createElement("td");
+                    tdType.className = "px-4 py-2.5";
+                    const typeBadge = document.createElement("span");
+                    typeBadge.className = `px-2 py-0.5 rounded text-[10px] font-bold ${isBuy ? "bg-emerald-950 text-emerald-300 border border-emerald-700/50" : "bg-rose-950 text-rose-300 border border-rose-700/50"}`;
+                    typeBadge.textContent = o.transactionType;
+                    tdType.appendChild(typeBadge);
+
+                    const tdQty = document.createElement("td");
+                    tdQty.className = "px-4 py-2.5 text-right font-mono";
+                    tdQty.textContent = o.quantity;
+
+                    const tdPrice = document.createElement("td");
+                    tdPrice.className = "px-4 py-2.5 text-right font-mono";
+                    tdPrice.textContent = `₹${parseFloat(o.price || 0).toFixed(2)}`;
+
+                    const tdStatus = document.createElement("td");
+                    tdStatus.className = "px-4 py-2.5 text-center";
+                    const statusBadge = document.createElement("span");
+                    statusBadge.className = `px-2 py-0.5 rounded text-[10px] font-bold ${statusColor}`;
+                    statusBadge.textContent = o.status;
+                    tdStatus.appendChild(statusBadge);
+
+                    tr.appendChild(tdTime);
+                    tr.appendChild(tdId);
+                    tr.appendChild(tdStrat);
+                    tr.appendChild(tdSym);
+                    tr.appendChild(tdType);
+                    tr.appendChild(tdQty);
+                    tr.appendChild(tdPrice);
+                    tr.appendChild(tdStatus);
+
+                    tbody.appendChild(tr);
+                });
+            }
+
+            function switchTab(tab) {
+                currentTab = tab;
+                ["intraday", "positional", "all"].forEach((t) => {
+                    const btn = document.getElementById(`tab-btn-${t}`);
+                    if (t === tab) {
+                        btn.className =
+                            "px-3 py-1 font-semibold rounded-md bg-slate-800 text-white transition";
+                    } else {
+                        btn.className =
+                            "px-3 py-1 font-semibold rounded-md text-slate-400 hover:text-white transition";
+                    }
+                });
+                renderPositions();
+            }
+
+            async function toggleStrategy(id) {
+                await fetch(`/api/telemetry/strategy/${id}/toggle`, {
+                    method: "POST",
+                });
+                fetchSnapshot();
+            }
+
+            async function killStrategy(id) {
+                if (
+                    confirm(
+                        `Are you sure you want to kill strategy ${id}? This will cancel its open orders and exit its positions.`,
+                    )
+                ) {
+                    await fetch(`/api/telemetry/kill-switch/strategy/${id}`, {
+                        method: "POST",
+                    });
+                    fetchSnapshot();
+                }
+            }
+
+            async function togglePaperTrading() {
+                await fetch("/api/telemetry/paper-trading/toggle", {
+                    method: "POST",
+                });
+                fetchSnapshot();
+            }
+
+            function openPanicModal() {
+                document
+                    .getElementById("modal-panic")
+                    .classList.remove("hidden");
+            }
+
+            function closePanicModal() {
+                document.getElementById("modal-panic").classList.add("hidden");
+            }
+
+            async function confirmPanic() {
+                closePanicModal();
+                await fetch("/api/telemetry/kill-switch/panic", {
+                    method: "POST",
+                });
+                fetchSnapshot();
+            }
+
+            async function resetPanic() {
+                await fetch("/api/telemetry/kill-switch/panic/reset", {
+                    method: "POST",
+                });
+                fetchSnapshot();
+            }
+
+            // Initialize on page load
+            connectSSE();
+            fetchSnapshot();
+            setInterval(fetchSnapshot, 3000);
+        </script>
+    </body>
+</html>
