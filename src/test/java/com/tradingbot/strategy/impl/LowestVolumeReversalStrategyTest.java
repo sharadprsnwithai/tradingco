@@ -1,0 +1,243 @@
+package com.tradingbot.strategy.impl;
+
+import com.tradingbot.instrument.LotSizeService;
+import com.tradingbot.model.Candle;
+import com.tradingbot.model.Signal;
+import com.tradingbot.model.Tick;
+import com.tradingbot.model.enums.SignalType;
+import com.tradingbot.nse.NseIndiaClient;
+import com.tradingbot.strategy.ScheduledEvent;
+import com.tradingbot.strategy.StrategyContext;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import reactor.core.publisher.Mono;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Optional;
+
+import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
+
+class LowestVolumeReversalStrategyTest {
+
+    private LowestVolumeReversalStrategy strategy;
+    private List<Signal> emittedSignals;
+    private NseIndiaClient nseClient;
+    private LotSizeService lotSizeService;
+
+    @BeforeEach
+    void setUp() {
+        emittedSignals = new ArrayList<>();
+        nseClient = mock(NseIndiaClient.class);
+        when(nseClient.fetchGainers()).thenReturn(Mono.just(List.of()));
+        when(nseClient.fetchLosers()).thenReturn(Mono.just(List.of()));
+
+        lotSizeService = mock(LotSizeService.class);
+        when(lotSizeService.getOrderQuantity("NSE:RELIANCE")).thenReturn(500);
+        when(lotSizeService.getOrderQuantity("NSE:TCS")).thenReturn(350);
+        when(lotSizeService.getOrderQuantity("NSE:INFY")).thenReturn(400);
+
+        strategy = new LowestVolumeReversalStrategy(
+            "LVR_TEST", "KITE_123", "NSE:RELIANCE,NSE:TCS,NSE:INFY",
+            2, 2.0, 2, nseClient, lotSizeService
+        );
+
+        StrategyContext context = new StrategyContext() {
+            @Override public String getStrategyId() { return "LVR_TEST"; }
+            @Override public String getAssignedAccountId() { return "KITE_123"; }
+            @Override public void emitSignal(Signal signal) { emittedSignals.add(signal); }
+            @Override public Optional<Candle> getLastCandle(String s, String tf) { return Optional.empty(); }
+            @Override public List<Candle> getHistoricalCandles(String s, String tf, int n) { return Collections.emptyList(); }
+            @Override public double[] getClosePrices(String s, String tf) { return new double[0]; }
+            @Override public Instant now() { return Instant.now(); }
+        };
+        strategy.init(context);
+    }
+
+    @Test
+    void testCompleteLongTradeLifecycle() {
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        String sym = "NSE:RELIANCE";
+
+        strategy.onCandle(c(sym, t0, 3000, 3010, 2990, 3005, 5000));
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        assertEquals(1, st.dayCandles.size());
+
+        // GREEN momentum x2
+        strategy.onCandle(c(sym, t0.plusSeconds(300), 3005, 3030, 3000, 3025, 6000));
+        assertEquals(LowestVolumeReversalStrategy.Direction.LONG, st.pendingDirection);
+        assertEquals(1, st.consecutiveMomentum);
+
+        strategy.onCandle(c(sym, t0.plusSeconds(600), 3025, 3050, 3020, 3045, 7000));
+        assertEquals(LowestVolumeReversalStrategy.SetupPhase.WAITING_FOR_PULLBACK, st.setupPhase);
+
+        // RED pullback, lowest vol
+        strategy.onCandle(c(sym, t0.plusSeconds(900), 3045, 3048, 3030, 3035, 1000));
+        assertEquals(LowestVolumeReversalStrategy.SetupPhase.WAITING_FOR_ENTRY, st.setupPhase);
+        assertNotNull(st.pullbackCandle);
+
+        // Entry trigger: close > pullback high (3048)
+        strategy.onCandle(c(sym, t0.plusSeconds(1200), 3040, 3070, 3038, 3065, 8000));
+        assertEquals(LowestVolumeReversalStrategy.TradePosition.IN_TRADE, st.position);
+        assertEquals(1, emittedSignals.size());
+        assertEquals(SignalType.ENTRY_LONG, emittedSignals.get(0).signalType());
+
+        // 1:2 RR partial: target = 3048 + 2*(3048-3030) = 3084
+        strategy.onTick(Tick.builder().symbol(sym).ltp(new BigDecimal("3090")).timestamp(t0.plusSeconds(1230)).build());
+        assertEquals(2, emittedSignals.size());
+        assertEquals(SignalType.EXIT_PARTIAL_LONG, emittedSignals.get(1).signalType());
+        assertEquals(250, emittedSignals.get(1).quantity()); // 500 / 2 = 250 (2 lots of 250)
+        assertTrue(st.partialExitBooked);
+        assertEquals(st.entryPrice, st.trailingStopLoss);
+
+        // Trailing stop hit
+        strategy.onTick(Tick.builder().symbol(sym).ltp(new BigDecimal("3045")).timestamp(t0.plusSeconds(1260)).build());
+        assertEquals(3, emittedSignals.size());
+        assertEquals(SignalType.EXIT_LONG, emittedSignals.get(2).signalType());
+        assertEquals(LowestVolumeReversalStrategy.TradePosition.FLAT, st.position);
+    }
+
+    @Test
+    void testCompleteShortTradeLifecycle() {
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        String sym = "NSE:TCS";
+
+        strategy.onCandle(c(sym, t0, 3500, 3510, 3490, 3505, 4000));
+        strategy.onCandle(c(sym, t0.plusSeconds(300), 3505, 3480, 3470, 3475, 5000));
+
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        assertEquals(LowestVolumeReversalStrategy.Direction.SHORT, st.pendingDirection);
+
+        strategy.onCandle(c(sym, t0.plusSeconds(600), 3475, 3460, 3440, 3445, 6000));
+        assertEquals(LowestVolumeReversalStrategy.SetupPhase.WAITING_FOR_PULLBACK, st.setupPhase);
+
+        // GREEN pullback, lowest vol
+        strategy.onCandle(c(sym, t0.plusSeconds(900), 3445, 3460, 3440, 3455, 800));
+        assertEquals(LowestVolumeReversalStrategy.SetupPhase.WAITING_FOR_ENTRY, st.setupPhase);
+
+        // Entry trigger: close < pullback low (3440)
+        strategy.onCandle(c(sym, t0.plusSeconds(1200), 3450, 3455, 3420, 3425, 7000));
+        assertEquals(LowestVolumeReversalStrategy.TradePosition.IN_TRADE, st.position);
+        assertEquals(SignalType.ENTRY_SHORT, emittedSignals.get(0).signalType());
+
+        // 1:2 RR partial: target = 3440 - 2*(3460-3440) = 3400
+        strategy.onTick(Tick.builder().symbol(sym).ltp(new BigDecimal("3390")).timestamp(t0.plusSeconds(1230)).build());
+        assertEquals(SignalType.EXIT_PARTIAL_SHORT, emittedSignals.get(1).signalType());
+        assertTrue(st.partialExitBooked);
+
+        // Trailing stop hit
+        strategy.onTick(Tick.builder().symbol(sym).ltp(new BigDecimal("3450")).timestamp(t0.plusSeconds(1260)).build());
+        assertEquals(SignalType.EXIT_SHORT, emittedSignals.get(2).signalType());
+        assertEquals(LowestVolumeReversalStrategy.TradePosition.FLAT, st.position);
+    }
+
+    @Test
+    void testFirstCandleDisqualification() {
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        String sym = "NSE:RELIANCE";
+
+        // First candle moves 7% (3000 -> 3210)
+        strategy.onCandle(c(sym, t0, 3000, 3210, 2990, 3200, 10000));
+        assertTrue(strategy.getState(sym).disqualified);
+
+        strategy.onCandle(c(sym, t0.plusSeconds(300), 3200, 3220, 3190, 3215, 5000));
+        assertEquals(0, emittedSignals.size());
+    }
+
+    @Test
+    void testNonLowestVolumePullbackSkipped() {
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        String sym = "NSE:RELIANCE";
+
+        strategy.onCandle(c(sym, t0, 3000, 3010, 2990, 3005, 5000));
+        strategy.onCandle(c(sym, t0.plusSeconds(300), 3005, 3030, 3000, 3025, 6000));
+        strategy.onCandle(c(sym, t0.plusSeconds(600), 3025, 3050, 3020, 3045, 7000));
+
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        assertEquals(LowestVolumeReversalStrategy.SetupPhase.WAITING_FOR_PULLBACK, st.setupPhase);
+
+        // RED pullback but vol 8000 is NOT lowest (5000, 6000, 7000 exist)
+        strategy.onCandle(c(sym, t0.plusSeconds(900), 3045, 3048, 3030, 3035, 8000));
+        assertEquals(LowestVolumeReversalStrategy.SetupPhase.WAITING_FOR_PULLBACK, st.setupPhase);
+        assertNull(st.pullbackCandle);
+    }
+
+    @Test
+    void testHardExitAt1500() {
+        String sym = "NSE:RELIANCE";
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        st.position = LowestVolumeReversalStrategy.TradePosition.IN_TRADE;
+        st.direction = LowestVolumeReversalStrategy.Direction.LONG;
+        st.remainingQuantity = 10;
+        st.highestPrice = new BigDecimal("3050");
+
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.INTRADAY_SQUARE_OFF));
+
+        assertEquals(1, emittedSignals.size());
+        assertEquals(SignalType.EXIT_LONG, emittedSignals.get(0).signalType());
+        assertEquals("LVR_EXIT_HARD_EXIT_15:00", emittedSignals.get(0).tag());
+        assertEquals(LowestVolumeReversalStrategy.TradePosition.FLAT, st.position);
+    }
+
+    @Test
+    void testMomentumDirectionChangeResets() {
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        String sym = "NSE:RELIANCE";
+
+        strategy.onCandle(c(sym, t0, 3000, 3010, 2990, 3005, 5000));
+        strategy.onCandle(c(sym, t0.plusSeconds(300), 3005, 3030, 3000, 3025, 6000));
+
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        assertEquals(LowestVolumeReversalStrategy.Direction.LONG, st.pendingDirection);
+        assertEquals(1, st.consecutiveMomentum);
+
+        // RED candle changes direction
+        strategy.onCandle(c(sym, t0.plusSeconds(600), 3025, 3028, 3000, 3005, 5000));
+        assertEquals(LowestVolumeReversalStrategy.Direction.SHORT, st.pendingDirection);
+        assertEquals(1, st.consecutiveMomentum);
+    }
+
+    @Test
+    void testDailyReset() {
+        String sym = "NSE:RELIANCE";
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        st.position = LowestVolumeReversalStrategy.TradePosition.IN_TRADE;
+        st.dayCandles.add(c(sym, Instant.now(), 3000, 3010, 2990, 3005, 5000));
+
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.MARKET_CLOSE));
+
+        assertEquals(LowestVolumeReversalStrategy.TradePosition.FLAT, st.position);
+        assertTrue(st.dayCandles.isEmpty());
+        assertFalse(st.disqualified);
+    }
+
+    @Test
+    void testStrategyDisabledSkipsProcessing() {
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        strategy.setEnabled(false);
+
+        strategy.onCandle(c("NSE:RELIANCE", t0, 3000, 3010, 2990, 3005, 5000));
+        assertEquals(0, emittedSignals.size());
+        assertTrue(strategy.getState("NSE:RELIANCE").dayCandles.isEmpty());
+    }
+
+    @Test
+    void testIgnoresWrongTimeframe() {
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        Candle c15m = new Candle("NSE:RELIANCE", "15", t0,
+            new BigDecimal("3000"), new BigDecimal("3010"), new BigDecimal("2990"),
+            new BigDecimal("3005"), 5000L);
+        strategy.onCandle(c15m);
+        assertTrue(strategy.getState("NSE:RELIANCE").dayCandles.isEmpty());
+    }
+
+    private Candle c(String sym, Instant ts, double o, double h, double l, double cl, long vol) {
+        return new Candle(sym, "5", ts,
+            BigDecimal.valueOf(o), BigDecimal.valueOf(h),
+            BigDecimal.valueOf(l), BigDecimal.valueOf(cl), vol);
+    }
+}
