@@ -1,6 +1,8 @@
 package com.tradingbot.scheduler;
 
 import com.tradingbot.adapter.BrokerAdapterRegistry;
+import com.tradingbot.instrument.InstrumentMasterService;
+import com.tradingbot.instrument.InstrumentSyncService;
 import com.tradingbot.marketdata.CandleAggregator;
 import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.marketdata.ShoonyaHistoricalDataService;
@@ -28,6 +30,8 @@ class MarketClockSchedulerTest {
     private BrokerAdapterRegistry brokerRegistry;
     private MarketDataHub marketDataHub;
     private ShoonyaHistoricalDataService historicalDataService;
+    private InstrumentMasterService instrumentMaster;
+    private InstrumentSyncService instrumentSyncService;
     private TelegramBotService telegramBot;
 
     private MarketClockScheduler scheduler;
@@ -40,6 +44,8 @@ class MarketClockSchedulerTest {
         brokerRegistry = mock(BrokerAdapterRegistry.class);
         marketDataHub = mock(MarketDataHub.class);
         historicalDataService = mock(ShoonyaHistoricalDataService.class);
+        instrumentMaster = mock(InstrumentMasterService.class);
+        instrumentSyncService = mock(InstrumentSyncService.class);
         telegramBot = mock(TelegramBotService.class);
 
         when(telegramBot.sendAlert(anyString())).thenReturn(Mono.empty());
@@ -48,6 +54,7 @@ class MarketClockSchedulerTest {
         when(historicalDataService.warmupSequentially(anyList())).thenReturn(Flux.empty());
         when(marketDataHub.getCandleAggregator()).thenReturn(new CandleAggregator());
         when(positionManager.executeEodIntradaySquareOff()).thenReturn(Mono.empty());
+        when(instrumentSyncService.syncFromKite()).thenReturn(Mono.just(0));
 
         scheduler = new MarketClockScheduler(
             strategyEngine,
@@ -56,27 +63,30 @@ class MarketClockSchedulerTest {
             brokerRegistry,
             marketDataHub,
             historicalDataService,
-            telegramBot
+            instrumentMaster,
+            instrumentSyncService,
+            telegramBot,
+            "2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25"
         );
     }
 
     @Test
     void testTradingDayAndHolidayFilter() {
         // Saturday / Sunday check
-        LocalDate saturday = LocalDate.of(2025, 2, 22);
-        LocalDate sunday = LocalDate.of(2025, 2, 23);
-        LocalDate weekday = LocalDate.of(2025, 2, 24); // Monday
+        LocalDate saturday = LocalDate.of(2026, 8, 22);
+        LocalDate sunday = LocalDate.of(2026, 8, 23);
+        LocalDate weekday = LocalDate.of(2026, 8, 24); // Monday
 
         assertFalse(scheduler.isTradingDay(saturday), "Saturday must not be a trading day");
         assertFalse(scheduler.isTradingDay(sunday), "Sunday must not be a trading day");
         assertTrue(scheduler.isTradingDay(weekday), "Regular weekday must be a trading day");
 
-        // NSE 2025 Holiday Check: Mahashivratri (26 Feb 2025)
-        LocalDate mahashivratri = LocalDate.of(2025, 2, 26);
-        assertFalse(scheduler.isTradingDay(mahashivratri), "Mahashivratri must be recognized as exchange holiday");
+        // NSE 2026 Holiday Check: Republic Day (26 Jan 2026)
+        LocalDate republicDay = LocalDate.of(2026, 1, 26);
+        assertFalse(scheduler.isTradingDay(republicDay), "Republic Day must be recognized as exchange holiday");
 
-        // Good Friday (18 April 2025)
-        LocalDate goodFriday = LocalDate.of(2025, 4, 18);
+        // Good Friday (3 April 2026)
+        LocalDate goodFriday = LocalDate.of(2026, 4, 3);
         assertFalse(scheduler.isTradingDay(goodFriday), "Good Friday must be recognized as exchange holiday");
     }
 

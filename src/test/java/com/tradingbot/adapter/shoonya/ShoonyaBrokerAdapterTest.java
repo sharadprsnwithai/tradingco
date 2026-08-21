@@ -1,8 +1,10 @@
 package com.tradingbot.adapter.shoonya;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.model.OrderRequest;
 import com.tradingbot.model.OrderResult;
+import com.tradingbot.model.Tick;
 import com.tradingbot.model.enums.OrderType;
 import com.tradingbot.model.enums.ProductType;
 import com.tradingbot.model.enums.TransactionType;
@@ -23,6 +25,7 @@ class ShoonyaBrokerAdapterTest {
     private ShoonyaAuthenticator authenticator;
     private ShoonyaBrokerAdapter adapter;
     private ObjectMapper objectMapper;
+    private InstrumentMasterService instrumentMaster;
 
     @BeforeEach
     void setUp() {
@@ -35,7 +38,9 @@ class ShoonyaBrokerAdapterTest {
 
         objectMapper = new ObjectMapper();
         authenticator = new ShoonyaAuthenticator(config, WebClient.builder(), objectMapper);
-        adapter = new ShoonyaBrokerAdapter(config, authenticator, WebClient.builder(), objectMapper);
+        instrumentMaster = new InstrumentMasterService("build/tmp/shoonya-adapter-test-instruments.db");
+        instrumentMaster.initSchema();
+        adapter = new ShoonyaBrokerAdapter(config, authenticator, WebClient.builder(), objectMapper, instrumentMaster);
     }
 
     @Test
@@ -55,12 +60,31 @@ class ShoonyaBrokerAdapterTest {
     }
 
     @Test
-    void testSubscribeMarketDataStream() {
-        StepVerifier.create(adapter.subscribeMarketData(List.of("BANKNIFTY24DEC50000CE")).take(3))
-            .expectNextMatches(tick -> "SHOONYA".equals(tick.brokerId()) && tick.ltp().compareTo(BigDecimal.ZERO) > 0)
-            .expectNextMatches(tick -> "SHOONYA".equals(tick.brokerId()) && tick.ltp().compareTo(BigDecimal.ZERO) > 0)
-            .expectNextMatches(tick -> "SHOONYA".equals(tick.brokerId()) && tick.ltp().compareTo(BigDecimal.ZERO) > 0)
+    void testSubscribeMarketDataWhenDisabledReturnsEmpty() {
+        // Disabled adapter must NOT emit synthetic data — an empty stream is the only safe answer
+        StepVerifier.create(adapter.subscribeMarketData(List.of("NFO:BANKNIFTY24DEC50000CE")))
             .verifyComplete();
+    }
+
+    @Test
+    void testShoonyaTickMapping() throws Exception {
+        adapter.registerKeyMapping("NSE|22", "NSE:ACC");
+
+        String json = "{\"t\":\"tk\",\"e\":\"NSE\",\"tk\":\"22\",\"lp\":\"2450.55\",\"o\":\"2401.0\",\"h\":\"2460.0\",\"l\":\"2398.0\",\"c\":\"2410.0\",\"v\":\"123456\"}";
+        Tick mapped = adapter.mapShoonyaTick(new ObjectMapper().readTree(json));
+
+        assertNotNull(mapped);
+        assertEquals("SHOONYA", mapped.brokerId());
+        assertEquals("NSE:ACC", mapped.symbol());
+        assertEquals("NSE", mapped.exchange());
+        assertEquals("22", mapped.instrumentToken());
+        assertEquals(0, new BigDecimal("2450.55").compareTo(mapped.ltp()));
+        assertEquals(0, new BigDecimal("2460.0").compareTo(mapped.high()));
+        assertEquals(123456L, mapped.volume());
+
+        // Unknown token must be dropped
+        String unknownJson = "{\"t\":\"tf\",\"e\":\"NSE\",\"tk\":\"99999\",\"lp\":\"100.0\"}";
+        org.junit.jupiter.api.Assertions.assertNull(adapter.mapShoonyaTick(new ObjectMapper().readTree(unknownJson)));
     }
 
     @Test

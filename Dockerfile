@@ -1,20 +1,13 @@
 # ==============================================================================
 # Build Stage
 # ==============================================================================
-FROM eclipse-temurin:21-jdk-alpine AS builder
+FROM gradle:9.3.0-jdk21 AS builder
 
-WORKDIR /build
-
-# Copy Gradle wrapper and configuration files first for layer caching
+WORKDIR /app
 COPY gradlew settings.gradle.kts build.gradle.kts ./
 COPY gradle ./gradle
-
-# Make wrapper executable and download dependencies
-RUN chmod +x gradlew && ./gradlew dependencies --no-daemon || true
-
-# Copy source code and build application jar
 COPY src ./src
-RUN ./gradlew bootJar --no-daemon -x test
+RUN GRADLE_USER_HOME=/gradle-cache gradle bootJar -x test --no-daemon
 
 # ==============================================================================
 # Runtime Stage (Optimized for 1 GB RAM VPS)
@@ -38,20 +31,20 @@ RUN addgroup -g 10001 -S appgroup && \
     chown -R 10001:10001 /app
 
 # Copy executable jar from builder stage
-COPY --from=builder --chown=10001:10001 /build/build/libs/*.jar /app/app.jar
+COPY --from=builder --chown=10001:10001 /app/build/libs/*.jar /app/app.jar
 
 USER 10001:10001
 
 # Expose HTTP / Actuator port
-EXPOSE 8080
+EXPOSE 3000
 
 # Environment and JVM settings for 1 GB VPS
 ENV JAVA_OPTS="-XX:+UseSerialGC -Xms256m -Xmx384m -XX:+ExitOnOutOfMemoryError -Duser.timezone=Asia/Kolkata -Djava.security.egd=file:/dev/./urandom"
-ENV SERVER_PORT=8080
+ENV SERVER_PORT=3000
 
 VOLUME ["/app/data"]
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-  CMD ["curl", "-f", "http://localhost:8080/actuator/health"]
+  CMD ["curl", "-f", "http://localhost:3000/actuator/health"]
 
 ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

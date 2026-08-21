@@ -47,6 +47,8 @@ public class MarketDataHub {
 
     private final AtomicReference<Disposable> feedSubscription = new AtomicReference<>();
     private final AtomicReference<Disposable> watchdogSubscription = new AtomicReference<>();
+    private final AtomicBoolean failoverRefusedLogged = new AtomicBoolean(false);
+    private final AtomicBoolean silenceWarned = new AtomicBoolean(false);
 
     /**
      * Constructs a MarketDataHub with the given dependencies.
@@ -107,13 +109,18 @@ public class MarketDataHub {
                     .subscribeOn(Schedulers.boundedElastic())
                     .doOnNext(tick -> {
                         lastTickTime.set(Instant.now());
+                        failoverRefusedLogged.set(false); // feed healthy again - re-arm refusal logging
+                        silenceWarned.set(false);
                         candleAggregator.onTick(tick);
                     })
                     .doOnError(err -> {
                         log.error("Error on {} feed stream: {}. Triggering failover.", brokerId, err.getMessage());
                         triggerFailover("Feed stream error: " + err.getMessage());
                     })
-                    .subscribe();
+                    .subscribe(
+                        v -> {},
+                        err -> log.error("{} feed stream terminated: {}", brokerId, err.getMessage())
+                    );
 
                 feedSubscription.set(newSub);
             })
@@ -137,9 +144,14 @@ public class MarketDataHub {
 
     /**
      * Checks if current active feed has gone silent beyond the threshold.
+     * Only enforced during market hours (09:15–15:31 IST, Mon–Fri) — no ticks are
+     * expected when the exchange is closed, so silence then is not an alarm.
      */
     public void checkSilence() {
         if (activeSymbols.isEmpty() || failedOver.get()) {
+            return;
+        }
+        if (!isMarketHours()) {
             return;
         }
 
@@ -147,15 +159,46 @@ public class MarketDataHub {
         if (last != null && Duration.between(last, Instant.now()).compareTo(silenceThreshold) > 0) {
             String msg = String.format("Feed silence detected on %s (> %ds without ticks). Triggering sticky failover to %s.",
                 activeBrokerId.get(), silenceThreshold.toSeconds(), SECONDARY_BROKER);
-            log.warn(msg);
+            if (silenceWarned.compareAndSet(false, true)) {
+                log.warn(msg); // once per silence episode; reset on next tick
+            }
             triggerFailover(msg);
         }
     }
 
     /**
+     * True between 09:15 and 15:31 IST on weekdays.
+     */
+    private static boolean isMarketHours() {
+        java.time.ZonedDateTime now = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+        if (now.getDayOfWeek().getValue() >= 6) return false;
+        int mins = now.getHour() * 60 + now.getMinute();
+        return mins >= 555 && mins <= 931;
+    }
+
+    /**
      * Trigger sticky failover to secondary broker (Shoonya).
+     * If the secondary broker is disabled, failover is refused — switching to a
+     * disabled adapter would mean no data at all; the primary feed's own SDK
+     * reconnect loop is the safer recovery path. The refusal is logged once and
+     * the watchdog stays armed (the latch is NOT set on refusal).
      */
     public synchronized void triggerFailover(String reason) {
+        if (failedOver.get()) return;
+
+        // Synchronous registry lookup — this method is called from the watchdog's
+        // interval thread where blocking a Mono is not permitted
+        boolean secondaryEnabled = brokerRegistry.findByBrokerId(SECONDARY_BROKER)
+            .map(BrokerAdapter::isEnabled)
+            .orElse(false);
+        if (!secondaryEnabled) {
+            if (failoverRefusedLogged.compareAndSet(false, true)) {
+                log.error("Feed failure on {} ({}), but failover target {} is DISABLED - staying on primary (SDK auto-reconnect active)",
+                    activeBrokerId.get(), reason, SECONDARY_BROKER);
+            }
+            return;
+        }
+
         if (failedOver.compareAndSet(false, true)) {
             log.warn("FAILOVER ACTIVATED: Switching MarketDataHub from {} to {} due to: {}",
                 activeBrokerId.get(), SECONDARY_BROKER, reason);

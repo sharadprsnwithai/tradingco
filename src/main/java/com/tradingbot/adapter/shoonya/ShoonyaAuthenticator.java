@@ -11,6 +11,7 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.reactive.function.client.WebClientResponseException;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
@@ -122,21 +123,28 @@ public class ShoonyaAuthenticator {
         quickAuthPayload.put("imei", "12345678-1234-1234-1234-123456789abc");
         quickAuthPayload.put("addldivinf", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
         quickAuthPayload.put("source", "API");
-        quickAuthPayload.put("vc", "NOREN_API");
+        quickAuthPayload.put("vc", config.getVendorCode() != null ? config.getVendorCode() : "NOREN_API");
         quickAuthPayload.put("app_key", config.getClientId());
 
         String quickAuthBody = "jData=" + objectMapper.writeValueAsString(quickAuthPayload);
 
-        String quickAuthResponse = webClient.post()
-            .uri("/NorenWClientAPI/QuickAuth")
-            .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-            .header("Origin", "https://api.shoonya.com")
-            .header("Referer", "https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=" + config.getClientId())
-            .body(BodyInserters.fromValue(quickAuthBody))
-            .retrieve()
-            .bodyToMono(String.class)
-            .block();
+        String quickAuthResponse;
+        try {
+            quickAuthResponse = webClient.post()
+                .uri("/NorenWClientAPI/QuickAuth")
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .header("Origin", "https://api.shoonya.com")
+                .header("Referer", "https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=" + config.getClientId())
+                .body(BodyInserters.fromValue(quickAuthBody))
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+        } catch (WebClientResponseException e) {
+            log.error("Shoonya QuickAuth HTTP {}: {}", e.getStatusCode(), e.getResponseBodyAsString());
+            throw new IllegalStateException("Shoonya QuickAuth HTTP error: " + e.getStatusCode() + " - " + e.getResponseBodyAsString());
+        }
 
+        log.info("Shoonya QuickAuth response: {}", quickAuthResponse);
         JsonNode quickAuthJson = objectMapper.readTree(quickAuthResponse);
         if (!"Ok".equalsIgnoreCase(quickAuthJson.path("stat").asText())) {
             throw new IllegalStateException("Shoonya Step 1 QuickAuth failed: " + quickAuthJson.path("emsg").asText());
@@ -153,14 +161,21 @@ public class ShoonyaAuthenticator {
         Map<String, String> genAcsPayload = Map.of("code", authCode, "checksum", checksum);
         String genAcsBody = "jData=" + objectMapper.writeValueAsString(genAcsPayload);
 
-        String genAcsResponse = webClient.post()
-            .uri("/NorenWClientAPI/GenAcsTok")
-            .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-            .body(BodyInserters.fromValue(genAcsBody))
-            .retrieve()
-            .bodyToMono(String.class)
-            .block();
+        String genAcsResponse;
+        try {
+            genAcsResponse = webClient.post()
+                .uri("/NorenWClientAPI/GenAcsTok")
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(BodyInserters.fromValue(genAcsBody))
+                .retrieve()
+                .bodyToMono(String.class)
+                .block();
+        } catch (WebClientResponseException e) {
+            log.error("Shoonya GenAcsTok HTTP {}: {}", e.getStatusCode(), e.getResponseBodyAsString());
+            throw new IllegalStateException("Shoonya GenAcsTok HTTP error: " + e.getStatusCode() + " - " + e.getResponseBodyAsString());
+        }
 
+        log.info("Shoonya GenAcsTok response: {}", genAcsResponse);
         JsonNode genAcsJson = objectMapper.readTree(genAcsResponse);
         if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
             throw new IllegalStateException("Shoonya Step 2 GenAcsTok failed: " + genAcsJson.path("emsg").asText());

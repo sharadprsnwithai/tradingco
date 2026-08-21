@@ -14,6 +14,7 @@ public class KiteConfig {
     private String password = "mock_kite_password";
     private String totpSecret = "JBSWY3DPEHPK3PXP";
     private String baseUrl = "https://api.kite.trade";
+    private String accessToken = "";
 
     /**
      * Checks if the Kite adapter is enabled.
@@ -112,4 +113,21 @@ public class KiteConfig {
      * @param baseUrl the base URL string
      */
     public void setBaseUrl(String baseUrl) { this.baseUrl = baseUrl; }
+
+    /**
+     * Returns the manually-provided access token, if configured.
+     * When set (via KITE_ACCESS_TOKEN), the bot skips the automated headless login
+     * entirely and uses this token directly — the operator logs in manually each
+     * morning through Kite's official login flow and pastes the token.
+     *
+     * @return the access token, or empty string if not configured
+     */
+    public String getAccessToken() { return accessToken; }
+
+    /**
+     * Sets a manually-obtained access token.
+     *
+     * @param accessToken the access token string
+     */
+    public void setAccessToken(String accessToken) { this.accessToken = accessToken; }
 }

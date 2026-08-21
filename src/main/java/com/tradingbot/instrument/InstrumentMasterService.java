@@ -266,6 +266,75 @@ public class InstrumentMasterService {
     }
 
     /**
+     * Finds the nearest-expiry instrument of a given type for an underlying
+     * (e.g. name="NIFTY", instrumentType="FUT" for the current NIFTY futures contract).
+     * Only expiries on or after today (IST) are considered.
+     *
+     * @param name           underlying name as in the instruments dump (e.g. "NIFTY")
+     * @param instrumentType "FUT", "CE", or "PE"
+     * @return the nearest-expiry instrument, or empty if none found
+     */
+    public Mono<Instrument> findNearestExpiring(String name, String instrumentType) {
+        return Mono.fromCallable(() -> {
+            String sql = """
+                SELECT * FROM instruments
+                WHERE name = ? AND instrument_type = ? AND expiry >= date('now', 'localtime')
+                ORDER BY expiry ASC LIMIT 1
+                """;
+            try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, name);
+                ps.setString(2, instrumentType);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        Instrument inst = mapRow(rs);
+                        cacheActive(inst);
+                        return Optional.of(inst);
+                    }
+                }
+            }
+            return Optional.<Instrument>empty();
+        }).subscribeOn(Schedulers.boundedElastic())
+          .flatMap(opt -> opt.map(Mono::just).orElseGet(Mono::empty));
+    }
+
+    /**
+     * Finds the ATM option contract for an underlying at the nearest expiry:
+     * the strike closest to the given reference price (e.g. current NIFTY futures LTP).
+     *
+     * @param name       underlying name (e.g. "NIFTY")
+     * @param refPrice   reference price to center the ATM strike on
+     * @param optionType "CE" or "PE"
+     * @return the ATM option instrument, or empty if none found
+     */
+    public Mono<Instrument> findNearestAtmOption(String name, double refPrice, String optionType) {
+        return Mono.fromCallable(() -> {
+            String sql = """
+                SELECT * FROM instruments
+                WHERE name = ? AND instrument_type = ? AND expiry >= date('now', 'localtime')
+                  AND expiry = (SELECT MIN(expiry) FROM instruments
+                                 WHERE name = ? AND instrument_type = ? AND expiry >= date('now', 'localtime'))
+                ORDER BY ABS(strike - ?) ASC LIMIT 1
+                """;
+            try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, name);
+                ps.setString(2, optionType);
+                ps.setString(3, name);
+                ps.setString(4, optionType);
+                ps.setDouble(5, refPrice);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        Instrument inst = mapRow(rs);
+                        cacheActive(inst);
+                        return Optional.of(inst);
+                    }
+                }
+            }
+            return Optional.<Instrument>empty();
+        }).subscribeOn(Schedulers.boundedElastic())
+          .flatMap(opt -> opt.map(Mono::just).orElseGet(Mono::empty));
+    }
+
+    /**
      * Pin an actively traded instrument into the bounded fast-lookup memory cache.
      */
     public void cacheActive(Instrument inst) {

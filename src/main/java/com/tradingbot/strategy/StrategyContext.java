@@ -29,6 +29,14 @@ public interface StrategyContext {
     void emitSignal(Signal signal);
 
     /**
+     * Requests the strategy engine to re-synchronize broker market-data subscriptions
+     * with the strategy's current symbol set. Call this after dynamically adding symbols
+     * (e.g. post stock-selection scan) so ticks and candles for the new symbols are
+     * actually ingested. Default no-op keeps backtest contexts unaffected.
+     */
+    default void requestSubscriptionSync() {}
+
+    /**
      * Returns the most recent completed candle for the specified symbol and timeframe.
      */
     Optional<Candle> getLastCandle(String symbol, String timeframe);

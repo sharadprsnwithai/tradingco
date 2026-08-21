@@ -2,6 +2,7 @@ package com.tradingbot;
 
 import com.tradingbot.adapter.kite.KiteBrokerAdapter;
 import com.tradingbot.adapter.shoonya.ShoonyaBrokerAdapter;
+import com.tradingbot.instrument.InstrumentSyncService;
 import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.oms.OrderManagerService;
 import com.tradingbot.position.PositionManagerService;
@@ -67,15 +68,18 @@ public class TradingBotApplication {
         OrderManagerService oms,
         MarketDataHub marketDataHub,
         StrategyEngine strategyEngine,
-        TelegramBotService telegramBot
+        TelegramBotService telegramBot,
+        InstrumentSyncService instrumentSyncService
     ) {
         return args -> {
             log.info("==================================================================");
             log.info("  MULTI-BROKER TRADING BOT STARTUP - VERIFYING LIVE BROKERS      ");
             log.info("==================================================================");
 
-            // 1. Verify Kite
+            // 1. Verify Kite (auth -> instrument master sync -> positions)
             kiteAdapter.authenticate()
+                .then(Mono.defer(instrumentSyncService::syncFromKite))
+                .doOnNext(count -> log.info(">>> KITE INSTRUMENTS SYNCED (Total: {}) <<<", count))
                 .then(Mono.defer(kiteAdapter::getPositions))
                 .doOnNext(positions -> {
                     log.info(">>> KITE POSITIONS FETCHED (Total: {}) <<<", positions.size());
@@ -88,20 +92,24 @@ public class TradingBotApplication {
                 .onErrorResume(e -> Mono.empty())
                 .block();
 
-            // 2. Verify Shoonya
-            shoonyaAdapter.authenticate()
-                .then(Mono.defer(shoonyaAdapter::getPositions))
-                .doOnNext(positions -> {
-                    log.info(">>> SHOONYA POSITIONS FETCHED (Total: {}) <<<", positions.size());
-                    for (var pos : positions) {
-                        log.info("  [SHOONYA POS] Symbol: {} | Book: {} | NetQty: {} | M2M PnL: ₹{} | BuyAvg: ₹{} | SellAvg: ₹{}",
-                            pos.symbol(), pos.bookType(), pos.netQuantity(), pos.mtmPnl(), pos.buyAveragePrice(), pos.sellAveragePrice());
-                    }
-                    log.info("==================================================================");
-                })
-                .doOnError(ex -> log.error("Failed to connect or fetch positions from Shoonya: {}", ex.getMessage()))
-                .onErrorResume(e -> Mono.empty())
-                .block();
+            // 2. Verify Shoonya (skip if disabled)
+            if (shoonyaAdapter.isEnabled()) {
+                shoonyaAdapter.authenticate()
+                    .then(Mono.defer(shoonyaAdapter::getPositions))
+                    .doOnNext(positions -> {
+                        log.info(">>> SHOONYA POSITIONS FETCHED (Total: {}) <<<", positions.size());
+                        for (var pos : positions) {
+                            log.info("  [SHOONYA POS] Symbol: {} | Book: {} | NetQty: {} | M2M PnL: ₹{} | BuyAvg: ₹{} | SellAvg: ₹{}",
+                                pos.symbol(), pos.bookType(), pos.netQuantity(), pos.mtmPnl(), pos.buyAveragePrice(), pos.sellAveragePrice());
+                        }
+                        log.info("==================================================================");
+                    })
+                    .doOnError(ex -> log.error("Failed to connect or fetch positions from Shoonya: {}", ex.getMessage()))
+                    .onErrorResume(e -> Mono.empty())
+                    .block();
+            } else {
+                log.info("Shoonya adapter is disabled; skipping verification");
+            }
 
             // 3. Send Telegram Startup / Crash Recovery Notification
             LocalDateTime nowIst = LocalDateTime.now(IST_ZONE);
@@ -130,6 +138,30 @@ public class TradingBotApplication {
 
             telegramBot.sendAlert(sb.toString()).subscribe();
             log.info("TradingBot startup & rehydration initialization complete at {}", timeStr);
+        };
+    }
+
+    /**
+     * Wires the strategy signal stream into the Order Management System.
+     * Every signal emitted by any strategy is risk-checked and routed to the
+     * appropriate broker adapter for execution. {@code concatMap} preserves
+     * signal ordering so an EXIT is never routed before its ENTRY.
+     *
+     * @param strategyEngine the strategy engine emitting trade signals
+     * @param oms            the order manager service executing signals
+     * @return an {@link ApplicationRunner} bean that activates the pipeline at startup
+     */
+    @Bean
+    public ApplicationRunner signalOrderPipeline(StrategyEngine strategyEngine, OrderManagerService oms) {
+        return args -> {
+            strategyEngine.getSignalStream()
+                .concatMap(oms::executeSignal)
+                .onErrorContinue((err, sig) -> log.error("Signal execution pipeline error for {}: {}", sig, err.getMessage()))
+                .subscribe(
+                    order -> {},
+                    err -> log.error("Signal execution pipeline terminated unexpectedly: {}", err.getMessage())
+                );
+            log.info("Signal -> OMS execution pipeline wired: strategy signals will be risk-checked and routed to brokers");
         };
     }
 

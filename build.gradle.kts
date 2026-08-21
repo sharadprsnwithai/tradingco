@@ -49,6 +49,9 @@ dependencies {
     // SQLite JDBC for disk-backed instrument master cache
     implementation("org.xerial:sqlite-jdbc:3.47.0.0")
 
+    // Zerodha Kite Connect SDK (KiteTicker WebSocket for real market data)
+    implementation("com.zerodhatech.kiteconnect:kiteconnect:3.5.0")
+
     // Testing
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("io.projectreactor:reactor-test")
@@ -62,4 +65,24 @@ tasks.withType<Test> {
 tasks.register<JavaExec>("backtest") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.tradingbot.backtest.BacktestRunner")
+}
+
+tasks.register<JavaExec>("shoonyaBacktest") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.tradingbot.backtest.ShoonyaBacktestRunner")
+}
+
+tasks.register<JavaExec>("findTokens") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.tradingbot.backtest.ShoonyaTokenFinder")
+}
+
+tasks.register<JavaExec>("backtestLvr") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.tradingbot.backtest.LowestVolumeReversalBacktestRunner")
+}
+
+tasks.register<JavaExec>("backtestVwap") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.tradingbot.backtest.VwapBacktestRunner")
 }

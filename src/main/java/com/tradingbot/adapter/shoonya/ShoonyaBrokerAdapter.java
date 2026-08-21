@@ -3,6 +3,7 @@ package com.tradingbot.adapter.shoonya;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tradingbot.adapter.BrokerAdapter;
+import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.model.MarginInfo;
 import com.tradingbot.model.Order;
 import com.tradingbot.model.OrderModifyRequest;
@@ -15,6 +16,7 @@ import com.tradingbot.model.enums.OrderStatus;
 import com.tradingbot.model.enums.OrderType;
 import com.tradingbot.model.enums.ProductType;
 import com.tradingbot.model.enums.TransactionType;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.MediaType;
@@ -23,14 +25,25 @@ import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 
 import java.math.BigDecimal;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.WebSocket;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Component
 public class ShoonyaBrokerAdapter implements BrokerAdapter {
@@ -42,6 +55,20 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
     private final ShoonyaAuthenticator authenticator;
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
+    private final InstrumentMasterService instrumentMaster;
+
+    // --- Live WebSocket (NorenWS) state ---
+    private final Sinks.Many<Tick> tickSink = Sinks.many().multicast().onBackpressureBuffer();
+    private final AtomicReference<WebSocket> wsRef = new AtomicReference<>();
+    private final Map<String, String> shoonyaKeyToSymbol = new ConcurrentHashMap<>(); // "NSE|22" -> "NSE:RELIANCE"
+    private final Set<String> subscribedKeys = ConcurrentHashMap.newKeySet();
+    private final ScheduledExecutorService heartbeatExecutor =
+        Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "shoonya-ws-heartbeat");
+            t.setDaemon(true);
+            return t;
+        });
+    private volatile boolean heartbeatStarted = false;
 
     /**
      * Constructs a ShoonyaBrokerAdapter with the specified dependencies.
@@ -50,11 +77,13 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      * @param authenticator    the authenticator for obtaining access tokens
      * @param webClientBuilder the Spring WebClient builder for HTTP communication
      * @param objectMapper     the Jackson ObjectMapper for JSON serialization/deserialization
+     * @param instrumentMaster the instrument master for symbol ↔ token resolution
      */
-    public ShoonyaBrokerAdapter(ShoonyaConfig config, ShoonyaAuthenticator authenticator, WebClient.Builder webClientBuilder, ObjectMapper objectMapper) {
+    public ShoonyaBrokerAdapter(ShoonyaConfig config, ShoonyaAuthenticator authenticator, WebClient.Builder webClientBuilder, ObjectMapper objectMapper, InstrumentMasterService instrumentMaster) {
         this.config = config;
         this.authenticator = authenticator;
         this.objectMapper = objectMapper;
+        this.instrumentMaster = instrumentMaster;
         this.webClient = webClientBuilder
             .baseUrl("https://api.shoonya.com")
             .build();
@@ -74,6 +103,14 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
     @Override
     public String getAccountId() {
         return config.getAccountId();
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public boolean isEnabled() {
+        return config.isEnabled();
     }
 
     /**
@@ -302,23 +339,236 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
     }
 
     /**
-     * {@inheritDoc}
+     * Subscribes to real market data via Shoonya's NorenWS JSON WebSocket feed.
+     * Canonical symbols ("NSE:RELIANCE") are resolved to Shoonya exchange|token keys
+     * through the instrument master. NOTE: Shoonya tokens require a Shoonya master
+     * contract sync (not yet implemented) — until then this resolves nothing and the
+     * feed stays off. Failover safety: when the adapter is disabled this returns an
+     * empty stream rather than synthetic data.
+     *
+     * @param symbols the list of canonical trading symbols to subscribe to
+     * @return a reactive Flux emitting real exchange Tick objects
      */
     @Override
     public Flux<Tick> subscribeMarketData(List<String> symbols) {
-        return Flux.interval(Duration.ofMillis(500))
-            .map(i -> Tick.builder()
-                .brokerId(BROKER_ID)
-                .symbol(symbols.isEmpty() ? "NIFTY" : symbols.get((int) (i % symbols.size())))
-                .exchange("NFO")
-                .ltp(BigDecimal.valueOf(24000.0 + (Math.cos(i) * 20.0)))
-                .open(BigDecimal.valueOf(23980.0))
-                .high(BigDecimal.valueOf(24050.0))
-                .low(BigDecimal.valueOf(23950.0))
-                .close(BigDecimal.valueOf(23990.0))
-                .volume(850L + i * 4)
-                .timestamp(Instant.now())
-                .build());
+        if (!config.isEnabled()) {
+            log.debug("Shoonya adapter disabled - market data feed not started");
+            return Flux.empty();
+        }
+        return authenticator.getAccessToken()
+            .flatMapMany(token -> Mono.fromCallable(() -> resolveShoonyaKeys(symbols))
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic()) // JDBC lookups must not block reactor threads
+                .flatMapMany(newKeys -> {
+                    if (newKeys.isEmpty() && subscribedKeys.isEmpty()) {
+                        log.warn("No Shoonya tokens resolved for {} symbols - feed NOT started", symbols.size());
+                        return Flux.empty();
+                    }
+                    ensureWsConnected(token, newKeys);
+                    return tickSink.asFlux();
+                }));
+    }
+
+    /**
+     * Resolves canonical symbols to Shoonya "EXCHANGE|token" subscription keys.
+     */
+    private List<String> resolveShoonyaKeys(List<String> symbols) {
+        List<String> keys = new ArrayList<>();
+        for (String sym : symbols) {
+            try {
+                var inst = instrumentMaster.findByCanonicalSymbol(sym).blockOptional();
+                if (inst.isPresent() && inst.get().shoonyaToken() != null && !inst.get().shoonyaToken().isBlank()) {
+                    String exchange = sym.contains(":") ? sym.substring(0, sym.indexOf(':')) : "NSE";
+                    String key = exchange + "|" + inst.get().shoonyaToken().trim();
+                    registerKeyMapping(key, sym);
+                    keys.add(key);
+                } else {
+                    log.warn("No Shoonya token found for {} - skipping", sym);
+                }
+            } catch (Exception e) {
+                log.warn("Failed to resolve Shoonya token for {}: {}", sym, e.getMessage());
+            }
+        }
+        return keys;
+    }
+
+    /**
+     * Opens the NorenWS connection on first use; subscribes additional keys on later calls.
+     */
+    private synchronized void ensureWsConnected(String susertoken, List<String> newKeys) {
+        WebSocket existing = wsRef.get();
+        if (existing != null && !existing.isOutputClosed()) {
+            subscribeKeys(newKeys);
+            return;
+        }
+
+        log.info("Connecting Shoonya NorenWS feed for {} keys...", newKeys.size());
+        subscribedKeys.addAll(newKeys);
+
+        HttpClient.newHttpClient().newWebSocketBuilder()
+            .buildAsync(URI.create(config.getWsUrl()), new WebSocket.Listener() {
+                @Override
+                public void onOpen(WebSocket webSocket) {
+                    log.info("Shoonya NorenWS socket open - sending connection init");
+                    wsRef.set(webSocket);
+                    webSocket.request(1);
+                    // NorenWS connection handshake
+                    sendJson(webSocket, Map.of(
+                        "t", "c",
+                        "uid", config.getUserId(),
+                        "actid", config.getAccountId(),
+                        "source", "API",
+                        "susertoken", susertoken
+                    ));
+                }
+
+                @Override
+                public CompletionStage<?> onText(WebSocket webSocket, CharSequence data, boolean last) {
+                    handleWsMessage(webSocket, data.toString());
+                    webSocket.request(1);
+                    return null;
+                }
+
+                @Override
+                public CompletionStage<?> onClose(WebSocket webSocket, int statusCode, String reason) {
+                    log.warn("Shoonya NorenWS closed: {} {}", statusCode, reason);
+                    wsRef.compareAndSet(webSocket, null);
+                    return null;
+                }
+
+                @Override
+                public void onError(WebSocket webSocket, Throwable error) {
+                    log.error("Shoonya NorenWS error: {}", error.getMessage());
+                    wsRef.compareAndSet(webSocket, null);
+                }
+            })
+            .exceptionally(ex -> {
+                log.error("Shoonya NorenWS connect failed: {}", ex.getMessage());
+                return null;
+            });
+
+        startHeartbeatIfNeeded();
+    }
+
+    /**
+     * Handles a NorenWS JSON message: connection ack, heartbeat, or touchline tick.
+     */
+    private void handleWsMessage(WebSocket webSocket, String message) {
+        try {
+            JsonNode node = objectMapper.readTree(message);
+            String type = node.path("t").asText("");
+
+            switch (type) {
+                case "ck" -> {
+                    // Connection acknowledged -> subscribe all pending keys
+                    log.info("Shoonya NorenWS authenticated - subscribing {} keys", subscribedKeys.size());
+                    subscribeKeys(new ArrayList<>(subscribedKeys));
+                }
+                case "tk", "tf" -> {
+                    Tick tick = mapShoonyaTick(node);
+                    if (tick != null) tickSink.tryEmitNext(tick);
+                }
+                case "h" -> { /* heartbeat from server - no action */ }
+                default -> log.trace("Shoonya NorenWS message type {}: {}", type, message);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to parse Shoonya WS message: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * Subscribes the given keys that are not yet subscribed. NorenWS touchline
+     * subscription: {"t":"t","k":"NSE|22#NFO|44671"}
+     */
+    private void subscribeKeys(List<String> keys) {
+        WebSocket ws = wsRef.get();
+        if (ws == null || ws.isOutputClosed() || keys.isEmpty()) return;
+        List<String> fresh = new ArrayList<>();
+        for (String k : keys) {
+            if (subscribedKeys.add(k)) fresh.add(k);
+        }
+        if (fresh.isEmpty()) return;
+        sendJson(ws, Map.of("t", "t", "k", String.join("#", fresh)));
+        log.info("Shoonya NorenWS: subscribed {} keys", fresh.size());
+    }
+
+    private void sendJson(WebSocket ws, Map<String, String> payload) {
+        try {
+            ws.sendText(objectMapper.writeValueAsString(payload), true);
+        } catch (Exception e) {
+            log.warn("Failed to send Shoonya WS message: {}", e.getMessage());
+        }
+    }
+
+    private void startHeartbeatIfNeeded() {
+        if (heartbeatStarted) return;
+        heartbeatStarted = true;
+        heartbeatExecutor.scheduleWithFixedDelay(() -> {
+            WebSocket ws = wsRef.get();
+            if (ws != null && !ws.isOutputClosed()) {
+                sendJson(ws, Map.of("t", "h"));
+            }
+        }, 30, 30, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Registers a Shoonya key → canonical symbol mapping for tick routing.
+     * Package-private so unit tests can seed mappings without a WebSocket.
+     */
+    void registerKeyMapping(String key, String canonicalSymbol) {
+        shoonyaKeyToSymbol.put(key, canonicalSymbol);
+    }
+
+    /**
+     * Maps a NorenWS touchline message (tk/tf) to the internal Tick model.
+     * Package-private for unit testing.
+     */
+    Tick mapShoonyaTick(JsonNode node) {
+        String exchange = node.path("e").asText("");
+        String token = node.path("tk").asText("");
+        String canonical = shoonyaKeyToSymbol.get(exchange + "|" + token);
+        if (canonical == null) return null;
+
+        return Tick.builder()
+            .brokerId(BROKER_ID)
+            .symbol(canonical)
+            .exchange(exchange)
+            .instrumentToken(token)
+            .ltp(parseDecimal(node, "lp"))
+            .open(parseDecimal(node, "o"))
+            .high(parseDecimal(node, "h"))
+            .low(parseDecimal(node, "l"))
+            .close(parseDecimal(node, "c"))
+            .volume((long) node.path("v").asDouble(0))
+            .timestamp(Instant.now())
+            .build();
+    }
+
+    private static BigDecimal parseDecimal(JsonNode node, String field) {
+        String v = node.path(field).asText("");
+        if (v.isEmpty()) return BigDecimal.ZERO;
+        try {
+            return new BigDecimal(v);
+        } catch (NumberFormatException e) {
+            return BigDecimal.ZERO;
+        }
+    }
+
+    /**
+     * Disconnects the Shoonya WebSocket and stops the heartbeat on shutdown.
+     */
+    @PreDestroy
+    public void shutdownWebSocket() {
+        WebSocket ws = wsRef.getAndSet(null);
+        if (ws != null) {
+            try {
+                ws.sendClose(WebSocket.NORMAL_CLOSURE, "shutdown");
+            } catch (Exception e) {
+                log.warn("Error closing Shoonya WS: {}", e.getMessage());
+            }
+        }
+        heartbeatExecutor.shutdownNow();
+        subscribedKeys.clear();
+        shoonyaKeyToSymbol.clear();
     }
 
     /**

@@ -1,5 +1,6 @@
 package com.tradingbot.position;
 
+import com.tradingbot.adapter.BrokerAdapter;
 import com.tradingbot.adapter.BrokerAdapterRegistry;
 import com.tradingbot.database.TradingDbService;
 import com.tradingbot.marketdata.MarketDataHub;
@@ -307,6 +308,7 @@ public class PositionManagerService {
      */
     public Mono<Void> rehydratePositionsFromBrokers() {
         return brokerRegistry.getAll()
+            .filter(BrokerAdapter::isEnabled)
             .flatMap(adapter -> adapter.getPositions()
                 .flatMapMany(Flux::fromIterable)
                 .doOnNext(pos -> {

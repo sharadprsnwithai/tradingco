@@ -3,9 +3,11 @@ package com.tradingbot.backtest;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tradingbot.model.Candle;
-import com.tradingbot.strategy.impl.PdhPdlBreakoutStrategy;
-import com.tradingbot.strategy.impl.VandeBharatStrategy;
+import com.tradingbot.nse.NseGainerLoser;
+import com.tradingbot.nse.NseIndiaClient;
+import com.tradingbot.strategy.impl.LowestVolumeReversalStrategy;
 import org.apache.commons.codec.digest.DigestUtils;
+import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
 import java.net.CookieManager;
@@ -31,7 +33,7 @@ import java.util.Map;
 
 /**
  * Standalone backtest runner that fetches real historical data from Kite Connect API
- * and runs both PdhPdlBreakoutStrategy and VandeBharatStrategy through the BacktestEngine.
+ * and runs LowestVolumeReversalStrategy through the BacktestEngine.
  */
 public class BacktestRunner {
 
@@ -118,33 +120,24 @@ public class BacktestRunner {
         BacktestEngine engine = new BacktestEngine();
         BigDecimal initialCapital = BigDecimal.valueOf(100000);
 
-        // --- Backtest 1: PdhPdlBreakoutStrategy ---
+        // --- Backtest: LowestVolumeReversalStrategy ---
         System.out.println("\n" + "=".repeat(80));
-        System.out.println("  BACKTEST 1: PDH/PDL BREAKOUT STRATEGY");
+        System.out.println("  BACKTEST: LOWEST VOLUME REVERSAL STRATEGY");
         System.out.println("=".repeat(80));
 
-        for (Map.Entry<String, List<Candle>> entry : allCandles.entrySet()) {
-            String symbol = entry.getKey();
-            List<Candle> candles = entry.getValue();
+        // No-op NSE client for backtesting (stock selection not needed — all F&O symbols tested)
+        NseIndiaClient noOpNseClient = new NseIndiaClient(
+            org.springframework.web.reactive.function.client.WebClient.builder(),
+            new com.fasterxml.jackson.databind.ObjectMapper()
+        );
 
-            if (!symbol.equals("NSE:NIFTY") && !symbol.equals("NSE:BANKNIFTY")) continue;
-
-            PdhPdlBreakoutStrategy pdhStrategy = new PdhPdlBreakoutStrategy(
-                "PDH_PDL_BACKTEST", "BACKTEST_ACCOUNT", symbol, 25
-            );
-
-            try {
-                BacktestResult result = engine.run(pdhStrategy, candles, initialCapital);
-                printResult("PDH/PDL Breakout", symbol, result);
-            } catch (Exception e) {
-                System.out.printf("  ERROR backtesting %s: %s%n", symbol, e.getMessage());
-            }
-        }
-
-        // --- Backtest 2: VandeBharatStrategy ---
-        System.out.println("\n" + "=".repeat(80));
-        System.out.println("  BACKTEST 2: VANDE BHARAT STRATEGY");
-        System.out.println("=".repeat(80));
+        // Mock lot size service for backtesting — returns default lot size of 250
+        com.tradingbot.instrument.LotSizeService mockLotSizeService = new com.tradingbot.instrument.LotSizeService(
+            null, null, org.springframework.web.reactive.function.client.WebClient.builder()
+        ) {
+            @Override public int getLotSize(String symbol) { return 250; }
+            @Override public int getOrderQuantity(String symbol) { return 500; }
+        };
 
         for (Map.Entry<String, List<Candle>> entry : allCandles.entrySet()) {
             String symbol = entry.getKey();
@@ -152,13 +145,13 @@ public class BacktestRunner {
 
             if (symbol.equals("NSE:NIFTY") || symbol.equals("NSE:BANKNIFTY")) continue;
 
-            VandeBharatStrategy vbStrategy = new VandeBharatStrategy(
-                "VB_BACKTEST", "BACKTEST_ACCOUNT", symbol, 10
+            LowestVolumeReversalStrategy lvrStrategy = new LowestVolumeReversalStrategy(
+                "LVR_BACKTEST", "BACKTEST_ACCOUNT", symbol, 2, 2.0, 2, noOpNseClient, mockLotSizeService
             );
 
             try {
-                BacktestResult result = engine.run(vbStrategy, candles, initialCapital);
-                printResult("Vande Bharat", symbol, result);
+                BacktestResult result = engine.run(lvrStrategy, candles, initialCapital);
+                printResult("Lowest Volume Reversal", symbol, result);
             } catch (Exception e) {
                 System.out.printf("  ERROR backtesting %s: %s%n", symbol, e.getMessage());
             }

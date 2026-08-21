@@ -69,6 +69,9 @@ public class OrderManagerService {
     private final Map<String, Order> orderBook = new ConcurrentHashMap<>();
     private final Sinks.Many<Order> orderSink = Sinks.many().multicast().directBestEffort();
 
+    // Resting exchange-side protective stops: strategyId|tradingSymbol -> local SL order id
+    private final Map<String, String> restingStops = new ConcurrentHashMap<>();
+
     private final AtomicLong orderSequence = new AtomicLong(1);
     private Disposable reconcilerSubscription;
 
@@ -129,8 +132,56 @@ public class OrderManagerService {
                     return dbService.saveOrder(rejectedOrder).thenReturn(rejectedOrder);
                 }
 
-                return prepareAndPlaceOrder(signal);
+                return cancelRestingStopBeforeExit(signal)
+                    .flatMap(exitAlreadyDone -> {
+                        if (exitAlreadyDone) {
+                            log.info("Resting SL already executed for {} — exit signal suppressed (position flat at exchange)",
+                                signal.symbol());
+                            return Mono.<Order>empty();
+                        }
+                        return prepareAndPlaceOrder(signal);
+                    });
             });
+    }
+
+    /**
+     * Before executing an EXIT signal, handles any resting exchange-side SL order for the
+     * same strategy+symbol: if the SL already filled at the exchange, the position is
+     * already flat and the exit is suppressed (prevents a double fill); otherwise the SL
+     * is cancelled first so it cannot fire after the exit.
+     *
+     * @param signal the exit signal about to be executed
+     * @return true if the exit should be skipped (SL already filled), false to proceed
+     */
+    private Mono<Boolean> cancelRestingStopBeforeExit(Signal signal) {
+        SignalType t = signal.signalType();
+        boolean isExit = t == SignalType.EXIT_LONG || t == SignalType.EXIT_SHORT
+            || t == SignalType.EXIT_PARTIAL_LONG || t == SignalType.EXIT_PARTIAL_SHORT;
+        if (!isExit) return Mono.just(false);
+
+        String key = stopKey(signal.strategyId(), stripExchangePrefix(signal.symbol()));
+        String slOrderId = restingStops.get(key);
+        if (slOrderId == null) return Mono.just(false);
+
+        Order slOrder = orderBook.get(slOrderId);
+        if (slOrder != null && slOrder.status() == OrderStatus.FILLED) {
+            restingStops.remove(key);
+            return Mono.just(true);
+        }
+
+        restingStops.remove(key);
+        return resolveBrokerAdapter(signal.targetAccountId())
+            .flatMap(adapter -> adapter.cancelOrder(
+                slOrder != null && slOrder.brokerOrderId() != null ? slOrder.brokerOrderId() : slOrderId))
+            .doOnSuccess(v -> {
+                updateOrderStatus(slOrderId, OrderStatus.CANCELLED, "Cancelled: strategy exit signal", null, BigDecimal.ZERO, 0);
+                log.info("Cancelled resting SL {} before strategy exit ({})", slOrderId, key);
+            })
+            .onErrorResume(e -> {
+                log.warn("Failed to cancel resting SL {}: {} — proceeding with exit anyway", slOrderId, e.getMessage());
+                return Mono.empty();
+            })
+            .thenReturn(false);
     }
 
     /**
@@ -143,6 +194,10 @@ public class OrderManagerService {
     private Mono<Order> prepareAndPlaceOrder(Signal signal) {
         String orderId = generateOrderId();
         TransactionType txnType = mapSignalToTransactionType(signal.signalType());
+        // Canonical symbols carry an "EXCHANGE:SYMBOL" prefix (e.g. "NFO:NIFTY25...CE").
+        // Brokers expect a bare tradingsymbol plus a separate exchange field.
+        String tradingSymbol = stripExchangePrefix(signal.symbol());
+        String exchange = deriveExchange(signal.symbol(), signal.exchange());
 
         return instrumentMaster.findByCanonicalSymbol(signal.symbol())
             .defaultIfEmpty(Instrument.builder().canonicalSymbol(signal.symbol()).tickSize(new BigDecimal("0.05")).build())
@@ -155,7 +210,7 @@ public class OrderManagerService {
                     .accountId(signal.targetAccountId())
                     .strategyId(signal.strategyId())
                     .symbol(signal.symbol())
-                    .exchange(signal.exchange() != null ? signal.exchange() : "NSE")
+                    .exchange(exchange)
                     .instrumentToken(instrument.kiteToken() != null ? instrument.kiteToken() : instrument.shoonyaToken())
                     .transactionType(txnType)
                     .quantity(signal.quantity())
@@ -177,8 +232,8 @@ public class OrderManagerService {
 
                 OrderRequest req = OrderRequest.builder()
                     .accountId(signal.targetAccountId())
-                    .symbol(signal.symbol())
-                    .exchange(initialOrder.exchange())
+                    .symbol(tradingSymbol)
+                    .exchange(exchange)
                     .instrumentToken(initialOrder.instrumentToken())
                     .transactionType(txnType)
                     .quantity(signal.quantity())
@@ -226,6 +281,7 @@ public class OrderManagerService {
 
                         return adapter.placeOrder(req)
                             .flatMap(result -> handleOrderResult(orderId, adapter.getBrokerId(), result))
+                            .flatMap(order -> placeProtectiveStopIfNeeded(signal, adapter, order, tradingSymbol, exchange, txnType))
                             .onErrorResume(ex -> {
                                 log.error("Order placement exception for {}: {}", orderId, ex.getMessage(), ex);
                                 Order failed = updateOrderStatus(orderId, OrderStatus.REJECTED, "Broker error: " + ex.getMessage(), null, BigDecimal.ZERO, 0);
@@ -332,6 +388,7 @@ public class OrderManagerService {
      */
     public Mono<Void> reconcileAllBrokers() {
         return brokerRegistry.getAll()
+            .filter(BrokerAdapter::isEnabled)
             .flatMap(adapter -> adapter.getOrderBook()
                 .flatMapMany(Flux::fromIterable)
                 .doOnNext(this::reconcileSingleOrder)
@@ -397,6 +454,97 @@ public class OrderManagerService {
     }
 
     /**
+     * Places an exchange-side SL-M protective stop immediately after a successful entry,
+     * when the signal carries a {@code protectiveStopTrigger}. This is the crash-insurance
+     * mechanism: the stop rests at the exchange, so it executes even if this process dies,
+     * the API session drops, or the WebSocket feed goes silent. The strategy's software
+     * trailing continues to run — on a software exit the resting SL is cancelled first
+     * (see {@link #cancelRestingStopBeforeExit}). Trailing modification of the resting
+     * stop is a v2 concern; v1 keeps it pinned at the initial stop.
+     *
+     * @return the entry order, unchanged
+     */
+    private Mono<Order> placeProtectiveStopIfNeeded(Signal signal, BrokerAdapter adapter, Order entryOrder,
+                                                    String tradingSymbol, String exchange, TransactionType entryTxn) {
+        SignalType t = signal.signalType();
+        boolean isEntry = t == SignalType.ENTRY_LONG || t == SignalType.ENTRY_SHORT;
+        if (!isEntry || signal.protectiveStopTrigger() == null || paperTrading
+            || entryOrder == null || entryOrder.status() == OrderStatus.REJECTED) {
+            return Mono.just(entryOrder);
+        }
+
+        TransactionType slTxn = entryTxn == TransactionType.BUY ? TransactionType.SELL : TransactionType.BUY;
+        String slOrderId = generateOrderId();
+
+        OrderRequest slReq = OrderRequest.builder()
+            .accountId(signal.targetAccountId())
+            .symbol(tradingSymbol)
+            .exchange(exchange)
+            .transactionType(slTxn)
+            .quantity(signal.quantity())
+            .triggerPrice(signal.protectiveStopTrigger())
+            .orderType(OrderType.SL_M)
+            .productType(signal.productType() != null ? signal.productType() : ProductType.MIS)
+            .tag(signal.tag() + "_SL")
+            .strategyId(signal.strategyId())
+            .build();
+
+        return adapter.placeOrder(slReq)
+            .doOnNext(slResult -> {
+                if (slResult.success()) {
+                    restingStops.put(stopKey(signal.strategyId(), tradingSymbol), slOrderId);
+                    registerRestingStopOrder(slOrderId, slResult.brokerOrderId(), signal, exchange, slTxn);
+                    log.info("EXCHANGE-SIDE SL-M ARMED: {} x {} trigger={} (slOrderId={}, brokerOrderId={})",
+                        tradingSymbol, signal.quantity(), signal.protectiveStopTrigger(), slOrderId, slResult.brokerOrderId());
+                } else {
+                    log.error("EXCHANGE-SIDE SL PLACEMENT FAILED for {}: {} — POSITION IS UNPROTECTED",
+                        tradingSymbol, slResult.message());
+                }
+            })
+            .onErrorResume(e -> {
+                log.error("EXCHANGE-SIDE SL placement error for {}: {} — POSITION IS UNPROTECTED", tradingSymbol, e.getMessage());
+                return Mono.empty();
+            })
+            .thenReturn(entryOrder);
+    }
+
+    /**
+     * Registers the resting SL-M order in the local order book so the 4-second
+     * reconciler tracks its lifecycle (TRIGGER_PENDING → FILLED on stop-out).
+     */
+    private void registerRestingStopOrder(String slOrderId, String brokerOrderId, Signal signal,
+                                          String exchange, TransactionType slTxn) {
+        Order slOrder = Order.builder()
+            .id(slOrderId)
+            .brokerOrderId(brokerOrderId)
+            .accountId(signal.targetAccountId())
+            .strategyId(signal.strategyId())
+            .symbol(signal.symbol())
+            .exchange(exchange)
+            .transactionType(slTxn)
+            .quantity(signal.quantity())
+            .filledQuantity(0)
+            .price(BigDecimal.ZERO)
+            .triggerPrice(signal.protectiveStopTrigger())
+            .averagePrice(BigDecimal.ZERO)
+            .orderType(OrderType.SL_M)
+            .productType(signal.productType() != null ? signal.productType() : ProductType.MIS)
+            .bookType(signal.bookType() != null ? signal.bookType() : BookType.INTRADAY)
+            .status(OrderStatus.TRIGGER_PENDING)
+            .tag(signal.tag() + "_SL")
+            .createdAt(Instant.now())
+            .updatedAt(Instant.now())
+            .build();
+        orderBook.put(slOrderId, slOrder);
+        orderSink.tryEmitNext(slOrder);
+        dbService.saveOrder(slOrder).subscribe();
+    }
+
+    private static String stopKey(String strategyId, String tradingSymbol) {
+        return strategyId + "|" + tradingSymbol;
+    }
+
+    /**
      * Computes Marketable LIMIT price with dynamic 0.5% buffer rounded to tick size.
      */
     public BigDecimal calculateMarketableLimitPrice(Signal signal, TransactionType txnType, BigDecimal tickSize) {
@@ -431,6 +579,38 @@ public class OrderManagerService {
         return brokerRegistry.getByAccountId(targetAccountId)
             .switchIfEmpty(brokerRegistry.getByBrokerId(targetAccountId))
             .switchIfEmpty(brokerRegistry.getByBrokerId("ZERODHA"));
+    }
+
+    /**
+     * Strips the canonical "EXCHANGE:SYMBOL" prefix, returning the bare tradingsymbol
+     * that broker APIs expect (e.g. "NFO:NIFTY25AUG24500CE" → "NIFTY25AUG24500CE").
+     *
+     * @param symbol the canonical symbol, possibly prefixed
+     * @return the bare tradingsymbol
+     */
+    private static String stripExchangePrefix(String symbol) {
+        if (symbol != null && symbol.contains(":")) {
+            return symbol.substring(symbol.indexOf(':') + 1);
+        }
+        return symbol;
+    }
+
+    /**
+     * Derives the broker exchange from an explicit signal exchange, falling back to
+     * the canonical symbol's "EXCHANGE:" prefix, and finally to "NSE".
+     *
+     * @param symbol         the canonical symbol, possibly prefixed (e.g. "NFO:...")
+     * @param signalExchange the exchange explicitly set on the signal, or {@code null}
+     * @return the exchange code to send to the broker
+     */
+    private static String deriveExchange(String symbol, String signalExchange) {
+        if (signalExchange != null && !signalExchange.isBlank()) {
+            return signalExchange;
+        }
+        if (symbol != null && symbol.contains(":")) {
+            return symbol.substring(0, symbol.indexOf(':'));
+        }
+        return "NSE";
     }
 
     /**

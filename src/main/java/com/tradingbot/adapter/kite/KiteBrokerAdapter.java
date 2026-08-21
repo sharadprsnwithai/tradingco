@@ -3,6 +3,7 @@ package com.tradingbot.adapter.kite;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tradingbot.adapter.BrokerAdapter;
+import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.model.MarginInfo;
 import com.tradingbot.model.Order;
 import com.tradingbot.model.OrderModifyRequest;
@@ -15,6 +16,10 @@ import com.tradingbot.model.enums.OrderStatus;
 import com.tradingbot.model.enums.OrderType;
 import com.tradingbot.model.enums.ProductType;
 import com.tradingbot.model.enums.TransactionType;
+import com.zerodhatech.kiteconnect.kitehttp.exceptions.KiteException;
+import com.zerodhatech.ticker.KiteTicker;
+import com.zerodhatech.ticker.OnError;
+import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
@@ -24,12 +29,18 @@ import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Component
 public class KiteBrokerAdapter implements BrokerAdapter {
@@ -41,19 +52,28 @@ public class KiteBrokerAdapter implements BrokerAdapter {
     private final KiteAuthenticator authenticator;
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
+    private final InstrumentMasterService instrumentMaster;
+
+    // --- Live WebSocket (KiteTicker) state ---
+    private final Sinks.Many<Tick> tickSink = Sinks.many().multicast().onBackpressureBuffer();
+    private final AtomicReference<KiteTicker> tickerRef = new AtomicReference<>();
+    private final Map<Long, String> tokenToSymbol = new ConcurrentHashMap<>();
+    private final Set<Long> subscribedTokens = ConcurrentHashMap.newKeySet();
 
     /**
      * Constructs a new KiteBrokerAdapter with the provided dependencies.
      *
-     * @param config           the Kite broker configuration
-     * @param authenticator    the authenticator for managing Kite sessions
-     * @param webClientBuilder the WebClient builder for HTTP communication
-     * @param objectMapper     the Jackson ObjectMapper for JSON parsing
+     * @param config            the Kite broker configuration
+     * @param authenticator     the authenticator for managing Kite sessions
+     * @param webClientBuilder  the WebClient builder for HTTP communication
+     * @param objectMapper      the Jackson ObjectMapper for JSON parsing
+     * @param instrumentMaster  the instrument master for symbol ↔ token resolution
      */
-    public KiteBrokerAdapter(KiteConfig config, KiteAuthenticator authenticator, WebClient.Builder webClientBuilder, ObjectMapper objectMapper) {
+    public KiteBrokerAdapter(KiteConfig config, KiteAuthenticator authenticator, WebClient.Builder webClientBuilder, ObjectMapper objectMapper, InstrumentMasterService instrumentMaster) {
         this.config = config;
         this.authenticator = authenticator;
         this.objectMapper = objectMapper;
+        this.instrumentMaster = instrumentMaster;
         this.webClient = webClientBuilder
             .baseUrl(config.getBaseUrl())
             .defaultHeader("X-Kite-Version", "3")
@@ -91,6 +111,14 @@ public class KiteBrokerAdapter implements BrokerAdapter {
     }
 
     /**
+     * {@inheritDoc}
+     */
+    @Override
+    public boolean isEnabled() {
+        return config.isEnabled();
+    }
+
+    /**
      * Checks if the current session is valid.
      *
      * @return a reactive Mono containing true if session is valid, false otherwise
@@ -108,52 +136,60 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<OrderResult> placeOrder(OrderRequest request) {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
-                var bodyBuilder = BodyInserters.fromFormData("tradingsymbol", request.symbol())
-                    .with("exchange", request.exchange() != null ? request.exchange() : "NFO")
-                    .with("transaction_type", request.transactionType().name())
-                    .with("order_type", mapOrderTypeToKite(request.orderType()))
-                    .with("quantity", String.valueOf(request.quantity()))
-                    .with("product", mapProductTypeToKite(request.productType()))
-                    .with("validity", "DAY");
+        return withTokenRetry(token -> {
+            var bodyBuilder = BodyInserters.fromFormData("tradingsymbol", request.symbol())
+                .with("exchange", request.exchange() != null ? request.exchange() : "NFO")
+                .with("transaction_type", request.transactionType().name())
+                .with("order_type", mapOrderTypeToKite(request.orderType()))
+                .with("quantity", String.valueOf(request.quantity()))
+                .with("product", mapProductTypeToKite(request.productType()))
+                .with("validity", "DAY");
 
-                if (request.price() != null && request.price().compareTo(BigDecimal.ZERO) > 0) {
-                    bodyBuilder = bodyBuilder.with("price", request.price().toPlainString());
-                }
-                if (request.triggerPrice() != null && request.triggerPrice().compareTo(BigDecimal.ZERO) > 0) {
-                    bodyBuilder = bodyBuilder.with("trigger_price", request.triggerPrice().toPlainString());
-                }
-                if (request.tag() != null) {
-                    bodyBuilder = bodyBuilder.with("tag", request.tag());
-                }
+            // Kite rejects a price field on MARKET orders
+            if (request.orderType() != OrderType.MARKET && request.price() != null && request.price().compareTo(BigDecimal.ZERO) > 0) {
+                bodyBuilder = bodyBuilder.with("price", request.price().toPlainString());
+            }
+            // trigger_price is only meaningful for SL/SL-M orders
+            if ((request.orderType() == OrderType.SL_M || request.orderType() == OrderType.SL_L)
+                && request.triggerPrice() != null && request.triggerPrice().compareTo(BigDecimal.ZERO) > 0) {
+                bodyBuilder = bodyBuilder.with("trigger_price", request.triggerPrice().toPlainString());
+            }
+            if (request.tag() != null) {
+                bodyBuilder = bodyBuilder.with("tag", request.tag());
+            }
 
-                return webClient.post()
-                    .uri("/orders/regular")
-                    .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
-                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                    .body(bodyBuilder)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .map(json -> {
-                        try {
-                            JsonNode root = objectMapper.readTree(json);
-                            if ("success".equalsIgnoreCase(root.path("status").asText())) {
-                                String brokerOrderId = root.path("data").path("order_id").asText();
-                                return OrderResult.success(brokerOrderId, request.tag(), OrderStatus.OPEN);
-                            } else {
-                                String msg = root.path("message").asText("Kite order placement failed");
-                                return OrderResult.failure(request.tag(), msg);
-                            }
-                        } catch (Exception e) {
-                            return OrderResult.failure(request.tag(), "Error parsing Kite response: " + e.getMessage());
+            return webClient.post()
+                .uri("/orders/regular")
+                .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(bodyBuilder)
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(json -> {
+                    try {
+                        JsonNode root = objectMapper.readTree(json);
+                        if ("success".equalsIgnoreCase(root.path("status").asText())) {
+                            String brokerOrderId = root.path("data").path("order_id").asText();
+                            return OrderResult.success(brokerOrderId, request.tag(), OrderStatus.OPEN);
+                        } else {
+                            String msg = root.path("message").asText("Kite order placement failed");
+                            return OrderResult.failure(request.tag(), msg);
                         }
-                    })
-                    .onErrorResume(ex -> {
-                        log.error("Error placing Kite order for {}: {}", request.symbol(), ex.getMessage());
-                        return Mono.just(OrderResult.failure(request.tag(), ex.getMessage()));
-                    });
-            });
+                    } catch (Exception e) {
+                        return OrderResult.failure(request.tag(), "Error parsing Kite response: " + e.getMessage());
+                    }
+                })
+                .onErrorResume(ex -> {
+                    if (isTokenError(ex)) return Mono.error(ex); // propagate so withTokenRetry re-authenticates
+                    log.error("Error placing Kite order for {}: {}", request.symbol(), ex.getMessage());
+                    return Mono.just(OrderResult.failure(request.tag(), ex.getMessage()));
+                });
+        })
+        // Token retry also failed (or non-token error after retry): fail gracefully, never throw
+        .onErrorResume(ex -> {
+            log.error("Kite order placement failed for {} after token retry: {}", request.symbol(), ex.getMessage());
+            return Mono.just(OrderResult.failure(request.tag(), ex.getMessage()));
+        });
     }
 
     /**
@@ -165,41 +201,45 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<OrderResult> modifyOrder(String orderId, OrderModifyRequest request) {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
-                var bodyBuilder = BodyInserters.fromFormData("quantity", String.valueOf(request.quantity()))
-                    .with("order_type", mapOrderTypeToKite(request.orderType()))
-                    .with("validity", "DAY");
+        return withTokenRetry(token -> {
+            var bodyBuilder = BodyInserters.fromFormData("quantity", String.valueOf(request.quantity()))
+                .with("order_type", mapOrderTypeToKite(request.orderType()))
+                .with("validity", "DAY");
 
-                if (request.price() != null && request.price().compareTo(BigDecimal.ZERO) > 0) {
-                    bodyBuilder = bodyBuilder.with("price", request.price().toPlainString());
-                }
-                if (request.triggerPrice() != null && request.triggerPrice().compareTo(BigDecimal.ZERO) > 0) {
-                    bodyBuilder = bodyBuilder.with("trigger_price", request.triggerPrice().toPlainString());
-                }
+            if (request.orderType() != OrderType.MARKET && request.price() != null && request.price().compareTo(BigDecimal.ZERO) > 0) {
+                bodyBuilder = bodyBuilder.with("price", request.price().toPlainString());
+            }
+            if (request.triggerPrice() != null && request.triggerPrice().compareTo(BigDecimal.ZERO) > 0) {
+                bodyBuilder = bodyBuilder.with("trigger_price", request.triggerPrice().toPlainString());
+            }
 
-                return webClient.put()
-                    .uri("/orders/regular/{order_id}", orderId)
-                    .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
-                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                    .body(bodyBuilder)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .map(json -> {
-                        try {
-                            JsonNode root = objectMapper.readTree(json);
-                            if ("success".equalsIgnoreCase(root.path("status").asText())) {
-                                String brokerOrderId = root.path("data").path("order_id").asText(orderId);
-                                return OrderResult.success(brokerOrderId, request.orderId(), OrderStatus.OPEN);
-                            } else {
-                                return OrderResult.failure(request.orderId(), root.path("message").asText());
-                            }
-                        } catch (Exception e) {
-                            return OrderResult.failure(request.orderId(), "Parse error: " + e.getMessage());
+            return webClient.put()
+                .uri("/orders/regular/{order_id}", orderId)
+                .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(bodyBuilder)
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(json -> {
+                    try {
+                        JsonNode root = objectMapper.readTree(json);
+                        if ("success".equalsIgnoreCase(root.path("status").asText())) {
+                            String brokerOrderId = root.path("data").path("order_id").asText(orderId);
+                            return OrderResult.success(brokerOrderId, request.orderId(), OrderStatus.OPEN);
+                        } else {
+                            return OrderResult.failure(request.orderId(), root.path("message").asText());
                         }
-                    })
-                    .onErrorResume(ex -> Mono.just(OrderResult.failure(request.orderId(), ex.getMessage())));
-            });
+                    } catch (Exception e) {
+                        return OrderResult.failure(request.orderId(), "Parse error: " + e.getMessage());
+                    }
+                })
+                .onErrorResume(ex -> {
+                    if (isTokenError(ex)) return Mono.error(ex); // propagate so withTokenRetry re-authenticates
+                    return Mono.just(OrderResult.failure(request.orderId(), ex.getMessage()));
+                });
+        })
+        // Token retry also failed: fail gracefully, never throw
+        .onErrorResume(ex -> Mono.just(OrderResult.failure(request.orderId(), ex.getMessage())));
     }
 
     /**
@@ -210,17 +250,22 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<Void> cancelOrder(String orderId) {
-        return authenticator.getAccessToken()
-            .flatMap(token -> webClient.delete()
-                .uri("/orders/regular/{order_id}", orderId)
-                .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
-                .retrieve()
-                .bodyToMono(Void.class)
-                .onErrorResume(ex -> {
-                    log.error("Failed to cancel Kite order {}: {}", orderId, ex.getMessage());
-                    return Mono.empty();
-                })
-            );
+        return withTokenRetry(token -> webClient.delete()
+            .uri("/orders/regular/{order_id}", orderId)
+            .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
+            .retrieve()
+            .bodyToMono(Void.class)
+            .onErrorResume(ex -> {
+                if (isTokenError(ex)) return Mono.error(ex); // propagate so withTokenRetry re-authenticates
+                log.error("Failed to cancel Kite order {}: {}", orderId, ex.getMessage());
+                return Mono.empty();
+            })
+        )
+        // Token retry also failed: fail gracefully, never throw
+        .onErrorResume(ex -> {
+            log.error("Failed to cancel Kite order {} after token retry: {}", orderId, ex.getMessage());
+            return Mono.empty();
+        });
     }
 
     /**
@@ -230,18 +275,15 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<List<Order>> getOrderBook() {
-        return authenticator.getAccessToken()
-            .flatMap(token -> webClient.get()
-                .uri("/orders")
-                .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
-                .retrieve()
-                .bodyToMono(String.class)
-                .map(this::parseOrderBook)
-                .onErrorResume(ex -> {
-                    log.error("Failed to fetch Kite order book: {}", ex.getMessage());
-                    return Mono.just(List.of());
-                })
-            );
+        // Errors propagate to callers (reconciler handles them) — an empty list here
+        // would be indistinguishable from "no orders", which is dangerous for a money system.
+        return withTokenRetry(token -> webClient.get()
+            .uri("/orders")
+            .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
+            .retrieve()
+            .bodyToMono(String.class)
+            .map(this::parseOrderBook)
+        );
     }
 
     /**
@@ -251,23 +293,18 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<List<Position>> getPositions() {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
-                log.info("Fetching Kite positions with access_token: {}...", token.substring(0, Math.min(6, token.length())));
-                return webClient.get()
-                    .uri("/portfolio/positions")
-                    .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .map(json -> {
-                        log.debug("Kite positions raw JSON: {}", json);
-                        return parsePositions(json);
-                    })
-                    .onErrorResume(ex -> {
-                        log.error("Failed to fetch Kite positions: {}", ex.getMessage(), ex);
-                        return Mono.just(List.of());
-                    });
-            });
+        // Errors propagate — silently returning empty would make rehydration believe
+        // there are no open positions after a crash, risking double-entry.
+        return withTokenRetry(token -> webClient.get()
+            .uri("/portfolio/positions")
+            .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
+            .retrieve()
+            .bodyToMono(String.class)
+            .map(json -> {
+                log.debug("Kite positions raw JSON: {}", json);
+                return parsePositions(json);
+            })
+        );
     }
 
     /**
@@ -277,52 +314,195 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<MarginInfo> getMargins() {
-        return authenticator.getAccessToken()
-            .flatMap(token -> webClient.get()
-                .uri("/user/margins")
-                .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
-                .retrieve()
-                .bodyToMono(String.class)
-                .map(json -> {
-                    try {
-                        JsonNode root = objectMapper.readTree(json);
-                        JsonNode equity = root.path("data").path("equity");
-                        BigDecimal available = BigDecimal.valueOf(equity.path("available").path("live_balance").asDouble(0.0));
-                        BigDecimal used = BigDecimal.valueOf(equity.path("utilised").path("debits").asDouble(0.0));
-                        BigDecimal total = available.add(used);
-                        BigDecimal cash = BigDecimal.valueOf(equity.path("available").path("cash").asDouble(0.0));
-                        return MarginInfo.of(config.getUserId(), BROKER_ID, available, used, total, cash);
-                    } catch (Exception e) {
-                        return MarginInfo.of(config.getUserId(), BROKER_ID, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
-                    }
-                })
-                .onErrorResume(ex -> Mono.just(MarginInfo.of(config.getUserId(), BROKER_ID, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO)))
-            );
+        return withTokenRetry(token -> webClient.get()
+            .uri("/user/margins")
+            .header(HttpHeaders.AUTHORIZATION, "token " + config.getApiKey() + ":" + token)
+            .retrieve()
+            .bodyToMono(String.class)
+            .map(json -> {
+                try {
+                    JsonNode root = objectMapper.readTree(json);
+                    JsonNode equity = root.path("data").path("equity");
+                    BigDecimal available = BigDecimal.valueOf(equity.path("available").path("live_balance").asDouble(0.0));
+                    BigDecimal used = BigDecimal.valueOf(equity.path("utilised").path("debits").asDouble(0.0));
+                    BigDecimal total = available.add(used);
+                    BigDecimal cash = BigDecimal.valueOf(equity.path("available").path("cash").asDouble(0.0));
+                    return MarginInfo.of(config.getUserId(), BROKER_ID, available, used, total, cash);
+                } catch (Exception e) {
+                    return MarginInfo.of(config.getUserId(), BROKER_ID, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+                }
+            })
+            .onErrorResume(ex -> {
+                if (isTokenError(ex)) return Mono.error(ex); // propagate so withTokenRetry re-authenticates
+                return Mono.error(ex); // margins are informational but still fail loudly
+            })
+        );
     }
 
     /**
-     * Subscribes to market data for the specified symbols.
-     * Returns a reactive tick stream with simulated data.
+     * Subscribes to real market data for the specified symbols via Kite's binary
+     * WebSocket feed (KiteTicker). Symbols are canonical ("NSE:RELIANCE") and are
+     * resolved to Kite instrument tokens through the instrument master — which must
+     * be synced first (see InstrumentSyncService, runs at 08:30 IST pre-market).
+     * The ticker auto-reconnects internally; prolonged silence is caught by the
+     * MarketDataHub watchdog which handles cross-broker failover.
      *
-     * @param symbols the list of trading symbols to subscribe to
-     * @return a reactive Flux emitting Tick objects for the subscribed symbols
+     * @param symbols the list of canonical trading symbols to subscribe to
+     * @return a reactive Flux emitting real exchange Tick objects for the subscribed symbols
      */
     @Override
     public Flux<Tick> subscribeMarketData(List<String> symbols) {
-        // Returns reactive tick stream (bridged to live WebSocket or synthetic ticker)
-        return Flux.interval(Duration.ofMillis(500))
-            .map(i -> Tick.builder()
-                .brokerId(BROKER_ID)
-                .symbol(symbols.isEmpty() ? "NIFTY" : symbols.get((int) (i % symbols.size())))
-                .exchange("NFO")
-                .ltp(BigDecimal.valueOf(24000.0 + (Math.sin(i) * 20.0)))
-                .open(BigDecimal.valueOf(23980.0))
-                .high(BigDecimal.valueOf(24050.0))
-                .low(BigDecimal.valueOf(23950.0))
-                .close(BigDecimal.valueOf(23990.0))
-                .volume(1000L + i * 5)
-                .timestamp(Instant.now())
-                .build());
+        if (!config.isEnabled()) {
+            log.debug("Kite adapter disabled - market data feed not started");
+            return Flux.empty();
+        }
+        return authenticator.getAccessToken()
+            .flatMapMany(token -> Mono.fromCallable(() -> resolveTokens(symbols))
+                .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic()) // JDBC lookups must not block reactor threads
+                .flatMapMany(newTokens -> {
+                    if (newTokens.isEmpty() && subscribedTokens.isEmpty()) {
+                        log.warn("No Kite instrument tokens resolved for {} symbols - feed NOT started. " +
+                            "Ensure the instrument master is synced (runs at 08:30 IST pre-market).", symbols.size());
+                        return Flux.empty();
+                    }
+                    ensureTickerConnected(token, newTokens);
+                    return tickSink.asFlux();
+                }));
+    }
+
+    /**
+     * Resolves canonical symbols to Kite instrument tokens via the instrument master.
+     */
+    private List<Long> resolveTokens(List<String> symbols) {
+        List<Long> tokens = new ArrayList<>();
+        for (String sym : symbols) {
+            try {
+                var inst = instrumentMaster.findByCanonicalSymbol(sym).blockOptional();
+                if (inst.isPresent() && inst.get().kiteToken() != null && !inst.get().kiteToken().isBlank()) {
+                    long token = Long.parseLong(inst.get().kiteToken().trim());
+                    registerTokenMapping(token, sym);
+                    tokens.add(token);
+                } else {
+                    log.warn("No Kite token found for {} - skipping (instrument master not synced?)", sym);
+                }
+            } catch (Exception e) {
+                log.warn("Failed to resolve Kite token for {}: {}", sym, e.getMessage());
+            }
+        }
+        return tokens;
+    }
+
+    /**
+     * Creates the KiteTicker on first use and subscribes any new tokens on subsequent calls.
+     * NOTE: KiteTicker constructor takes (accessToken, apiKey) in that order.
+     */
+    private synchronized void ensureTickerConnected(String accessToken, List<Long> newTokens) {
+        KiteTicker existing = tickerRef.get();
+        if (existing != null && existing.isConnectionOpen()) {
+            ArrayList<Long> toAdd = new ArrayList<>();
+            for (Long t : newTokens) {
+                if (subscribedTokens.add(t)) toAdd.add(t);
+            }
+            if (!toAdd.isEmpty()) {
+                existing.subscribe(toAdd);
+                existing.setMode(toAdd, KiteTicker.modeQuote);
+                log.info("Kite WebSocket: subscribed {} additional tokens (total {})", toAdd.size(), subscribedTokens.size());
+            }
+            return;
+        }
+
+        log.info("Connecting Kite WebSocket (KiteTicker) for {} tokens...", newTokens.size());
+        KiteTicker ticker = new KiteTicker(accessToken, config.getApiKey());
+        ticker.setTryReconnection(true);
+        try {
+            ticker.setMaximumRetries(100);
+            ticker.setMaximumRetryInterval(30);
+        } catch (KiteException e) {
+            log.warn("Could not set ticker reconnection params: {}", e.getMessage());
+        }
+
+        ticker.setOnConnectedListener(() -> {
+            ArrayList<Long> all = new ArrayList<>(subscribedTokens);
+            log.info("Kite WebSocket CONNECTED - subscribing {} tokens in quote mode", all.size());
+            if (!all.isEmpty()) {
+                ticker.subscribe(all);
+                ticker.setMode(all, KiteTicker.modeQuote);
+            }
+        });
+        ticker.setOnTickerArrivalListener(sdkTicks -> {
+            for (com.zerodhatech.models.Tick sdkTick : sdkTicks) {
+                Tick mapped = mapSdkTick(sdkTick);
+                if (mapped != null) {
+                    tickSink.tryEmitNext(mapped);
+                }
+            }
+        });
+        ticker.setOnDisconnectedListener(() ->
+            log.warn("Kite WebSocket disconnected - SDK auto-reconnect is active"));
+        ticker.setOnErrorListener(new OnError() {
+            @Override public void onError(Exception exception) {
+                log.error("Kite WebSocket error: {}", exception.getMessage());
+            }
+            @Override public void onError(KiteException kiteException) {
+                log.error("Kite WebSocket KiteException: {}", kiteException.getMessage());
+            }
+            @Override public void onError(String error) {
+                log.error("Kite WebSocket error: {}", error);
+            }
+        });
+
+        subscribedTokens.addAll(newTokens);
+        tickerRef.set(ticker);
+        ticker.connect();
+    }
+
+    /**
+     * Registers a token → canonical symbol mapping for tick routing.
+     * Package-private so unit tests can seed mappings without a WebSocket.
+     */
+    void registerTokenMapping(long token, String canonicalSymbol) {
+        tokenToSymbol.put(token, canonicalSymbol);
+    }
+
+    /**
+     * Maps an SDK tick to the internal Tick model. Package-private for unit testing.
+     */
+    Tick mapSdkTick(com.zerodhatech.models.Tick t) {
+        String canonical = tokenToSymbol.get(t.getInstrumentToken());
+        if (canonical == null) return null;
+        String exchange = canonical.contains(":") ? canonical.substring(0, canonical.indexOf(':')) : "NSE";
+        Date ts = t.getTickTimestamp() != null ? t.getTickTimestamp() : t.getLastTradedTime();
+        return Tick.builder()
+            .brokerId(BROKER_ID)
+            .symbol(canonical)
+            .exchange(exchange)
+            .instrumentToken(String.valueOf(t.getInstrumentToken()))
+            .ltp(BigDecimal.valueOf(t.getLastTradedPrice()))
+            .open(BigDecimal.valueOf(t.getOpenPrice()))
+            .high(BigDecimal.valueOf(t.getHighPrice()))
+            .low(BigDecimal.valueOf(t.getLowPrice()))
+            .close(BigDecimal.valueOf(t.getClosePrice()))
+            .volume(t.getVolumeTradedToday())
+            .timestamp(ts != null ? ts.toInstant() : Instant.now())
+            .build();
+    }
+
+    /**
+     * Disconnects the Kite WebSocket on application shutdown.
+     */
+    @PreDestroy
+    public void shutdownTicker() {
+        KiteTicker ticker = tickerRef.getAndSet(null);
+        if (ticker != null) {
+            try {
+                ticker.disconnect();
+                log.info("Kite WebSocket disconnected on shutdown");
+            } catch (Exception e) {
+                log.warn("Error disconnecting Kite ticker: {}", e.getMessage());
+            }
+        }
+        subscribedTokens.clear();
+        tokenToSymbol.clear();
     }
 
     /**
@@ -406,6 +586,42 @@ public class KiteBrokerAdapter implements BrokerAdapter {
             log.error("Failed to parse Kite positions JSON: {}", e.getMessage());
         }
         return positions;
+    }
+
+    /**
+     * Executes an authenticated Kite API call, transparently re-authenticating and
+     * retrying exactly once when Kite rejects the access token (HTTP 401/403).
+     * Kite access tokens expire daily, so a mid-session expiry would otherwise fail
+     * every subsequent call until a manual restart.
+     *
+     * @param apiCall the API call to execute with a valid access token
+     * @param <T>     the response type
+     * @return a reactive Mono containing the API response
+     */
+    private <T> Mono<T> withTokenRetry(java.util.function.Function<String, Mono<T>> apiCall) {
+        return authenticator.getAccessToken()
+            .flatMap(apiCall)
+            .onErrorResume(KiteBrokerAdapter::isTokenError, ex -> {
+                log.warn("Kite rejected access token (401/403) - re-authenticating and retrying once");
+                authenticator.invalidateToken();
+                return authenticator.getAccessToken().flatMap(apiCall);
+            });
+    }
+
+    /**
+     * Determines whether an error indicates an invalid/expired Kite access token
+     * (HTTP 401 Unauthorized or 403 Forbidden, which Kite returns as a TokenException).
+     *
+     * @param ex the error to inspect
+     * @return true if the error is an authentication/token failure
+     */
+    private static boolean isTokenError(Throwable ex) {
+        if (ex instanceof org.springframework.web.reactive.function.client.WebClientResponseException wcre) {
+            int status = wcre.getStatusCode().value();
+            return status == 401 || status == 403;
+        }
+        String msg = ex.getMessage();
+        return msg != null && (msg.contains("401") || msg.contains("403"));
     }
 
     /**

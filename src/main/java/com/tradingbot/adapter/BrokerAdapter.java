@@ -35,6 +35,13 @@ public interface BrokerAdapter {
     Mono<Boolean> isSessionValid();
 
     /**
+     * Whether this adapter is enabled via configuration.
+     */
+    default boolean isEnabled() {
+        return true;
+    }
+
+    /**
      * Place an order on the exchange through the broker.
      */
     Mono<OrderResult> placeOrder(OrderRequest request);

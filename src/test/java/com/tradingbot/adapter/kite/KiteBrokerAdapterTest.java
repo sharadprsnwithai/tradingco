@@ -1,12 +1,10 @@
 package com.tradingbot.adapter.kite;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tradingbot.model.Order;
+import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.model.OrderRequest;
 import com.tradingbot.model.OrderResult;
-import com.tradingbot.model.Position;
-import com.tradingbot.model.enums.BookType;
-import com.tradingbot.model.enums.OrderStatus;
+import com.tradingbot.model.Tick;
 import com.tradingbot.model.enums.OrderType;
 import com.tradingbot.model.enums.ProductType;
 import com.tradingbot.model.enums.TransactionType;
@@ -16,7 +14,11 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.test.StepVerifier;
 
 import java.math.BigDecimal;
+import java.util.Date;
 import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 class KiteBrokerAdapterTest {
 
@@ -24,6 +26,7 @@ class KiteBrokerAdapterTest {
     private KiteAuthenticator authenticator;
     private KiteBrokerAdapter adapter;
     private ObjectMapper objectMapper;
+    private InstrumentMasterService instrumentMaster;
 
     @BeforeEach
     void setUp() {
@@ -35,7 +38,9 @@ class KiteBrokerAdapterTest {
 
         objectMapper = new ObjectMapper();
         authenticator = new KiteAuthenticator(config, objectMapper);
-        adapter = new KiteBrokerAdapter(config, authenticator, WebClient.builder(), objectMapper);
+        instrumentMaster = new InstrumentMasterService("build/tmp/kite-adapter-test-instruments.db");
+        instrumentMaster.initSchema();
+        adapter = new KiteBrokerAdapter(config, authenticator, WebClient.builder(), objectMapper, instrumentMaster);
     }
 
     @Test
@@ -50,17 +55,47 @@ class KiteBrokerAdapterTest {
 
     @Test
     void testGetBrokerIdAndAccount() {
-        org.junit.jupiter.api.Assertions.assertEquals("ZERODHA", adapter.getBrokerId());
-        org.junit.jupiter.api.Assertions.assertEquals("TEST_KITE_USER", adapter.getAccountId());
+        assertEquals("ZERODHA", adapter.getBrokerId());
+        assertEquals("TEST_KITE_USER", adapter.getAccountId());
     }
 
     @Test
-    void testSubscribeMarketDataStream() {
-        StepVerifier.create(adapter.subscribeMarketData(List.of("NIFTY24DEC24000CE")).take(3))
-            .expectNextMatches(tick -> "ZERODHA".equals(tick.brokerId()) && tick.ltp().compareTo(BigDecimal.ZERO) > 0)
-            .expectNextMatches(tick -> "ZERODHA".equals(tick.brokerId()) && tick.ltp().compareTo(BigDecimal.ZERO) > 0)
-            .expectNextMatches(tick -> "ZERODHA".equals(tick.brokerId()) && tick.ltp().compareTo(BigDecimal.ZERO) > 0)
+    void testSubscribeMarketDataWhenDisabledReturnsEmpty() {
+        // Disabled adapter must NOT emit synthetic data — an empty stream is the only safe answer
+        StepVerifier.create(adapter.subscribeMarketData(List.of("NFO:NIFTY24DEC24000CE")))
             .verifyComplete();
+    }
+
+    @Test
+    void testSdkTickMapping() {
+        adapter.registerTokenMapping(256265L, "NSE:INFY");
+
+        com.zerodhatech.models.Tick sdkTick = new com.zerodhatech.models.Tick();
+        sdkTick.setInstrumentToken(256265L);
+        sdkTick.setLastTradedPrice(1534.55);
+        sdkTick.setOpenPrice(1520.0);
+        sdkTick.setHighPrice(1540.1);
+        sdkTick.setLowPrice(1518.25);
+        sdkTick.setClosePrice(1522.8);
+        sdkTick.setVolumeTradedToday(1234567L);
+        sdkTick.setTickTimestamp(new Date());
+
+        Tick mapped = adapter.mapSdkTick(sdkTick);
+        assertNotNull(mapped);
+        assertEquals("ZERODHA", mapped.brokerId());
+        assertEquals("NSE:INFY", mapped.symbol());
+        assertEquals("NSE", mapped.exchange());
+        assertEquals("256265", mapped.instrumentToken());
+        assertEquals(0, new BigDecimal("1534.55").compareTo(mapped.ltp()));
+        assertEquals(0, new BigDecimal("1540.1").compareTo(mapped.high()));
+        assertEquals(1234567L, mapped.volume());
+        assertNotNull(mapped.timestamp());
+
+        // Unknown token must be dropped, not emitted with null symbol
+        com.zerodhatech.models.Tick unknown = new com.zerodhatech.models.Tick();
+        unknown.setInstrumentToken(999999L);
+        unknown.setLastTradedPrice(1.0);
+        org.junit.jupiter.api.Assertions.assertNull(adapter.mapSdkTick(unknown));
     }
 
     @Test

@@ -13,7 +13,7 @@ import java.util.List;
 public interface Strategy {
 
     /**
-     * Unique identifier for this strategy instance (e.g., "VANDE_BHARAT_KITE_01").
+     * Unique identifier for this strategy instance (e.g., "LOWEST_VOL_REV_01").
      */
     String getStrategyId();
 
@@ -38,7 +38,7 @@ public interface Strategy {
     void onTick(Tick tick);
 
     /**
-     * Closed candle event handler for indicator evaluations (EMA, Supertrend, PDH/PDL, Inside Candle).
+     * Closed candle event handler for indicator evaluations (volume, momentum, pullback detection).
      */
     void onCandle(Candle candle);
 

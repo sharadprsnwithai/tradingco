@@ -24,7 +24,8 @@ public record Signal(
     ProductType productType,
     BookType bookType,
     String tag,
-    Instant timestamp
+    Instant timestamp,
+    BigDecimal protectiveStopTrigger
 ) {
     /**
      * Creates a new {@link Builder} for constructing {@link Signal} instances.
@@ -52,6 +53,7 @@ public record Signal(
         private BookType bookType = BookType.INTRADAY;
         private String tag;
         private Instant timestamp;
+        private BigDecimal protectiveStopTrigger;
 
         /** Sets the strategy ID that generated the signal. */
         public Builder strategyId(String strategyId) { this.strategyId = strategyId; return this; }
@@ -79,6 +81,12 @@ public record Signal(
         public Builder tag(String tag) { this.tag = tag; return this; }
         /** Sets the signal generation timestamp. */
         public Builder timestamp(Instant timestamp) { this.timestamp = timestamp; return this; }
+        /**
+         * Sets an absolute protective stop-loss trigger price. When present on an ENTRY signal,
+         * the OMS places an exchange-side SL-M order immediately after entry fill, so the stop
+         * survives bot crashes / API disconnects. Null means software-monitored stop only.
+         */
+        public Builder protectiveStopTrigger(BigDecimal protectiveStopTrigger) { this.protectiveStopTrigger = protectiveStopTrigger; return this; }
 
         /**
          * Builds and returns the {@link Signal} instance.
@@ -87,7 +95,7 @@ public record Signal(
          * @return a new Signal with the configured values
          */
         public Signal build() {
-            return new Signal(strategyId, targetAccountId, symbol, exchange, signalType, quantity, price, triggerPrice, orderType, productType, bookType, tag, timestamp != null ? timestamp : Instant.now());
+            return new Signal(strategyId, targetAccountId, symbol, exchange, signalType, quantity, price, triggerPrice, orderType, productType, bookType, tag, timestamp != null ? timestamp : Instant.now(), protectiveStopTrigger);
         }
     }
 }

@@ -55,6 +55,8 @@ class MarketDataHubTest {
 
         when(brokerRegistry.getByBrokerId("ZERODHA")).thenReturn(Mono.just(kiteAdapter));
         when(brokerRegistry.getByBrokerId("SHOONYA")).thenReturn(Mono.just(shoonyaAdapter));
+        when(brokerRegistry.findByBrokerId("ZERODHA")).thenReturn(Optional.of(kiteAdapter));
+        when(brokerRegistry.findByBrokerId("SHOONYA")).thenReturn(Optional.of(shoonyaAdapter));
 
         when(instrumentMaster.findByCanonicalSymbol(anyString())).thenReturn(Mono.just(
             Instrument.builder().canonicalSymbol("NSE:RELIANCE").kiteToken("738561").shoonyaToken("2885").build()
@@ -91,6 +93,8 @@ class MarketDataHubTest {
 
     @Test
     void testFailoverOnSilence() throws InterruptedException {
+        when(shoonyaAdapter.isEnabled()).thenReturn(true); // failover target must be enabled
+
         StepVerifier.create(hub.subscribe(List.of("NSE:RELIANCE")))
             .verifyComplete();
 
@@ -122,6 +126,19 @@ class MarketDataHubTest {
 
         assertEquals(1, receivedTicks.size());
         assertEquals(new BigDecimal("2505.00"), receivedTicks.get(0).ltp());
+    }
+
+    @Test
+    void testFailoverRefusedWhenSecondaryDisabled() {
+        // shoonyaAdapter.isEnabled() defaults to false (Mockito) — failover must be refused
+        StepVerifier.create(hub.subscribe(List.of("NSE:RELIANCE")))
+            .verifyComplete();
+
+        hub.triggerFailover("Test silence with disabled secondary");
+
+        // Must stay on primary and NOT latch the failover flag (watchdog stays armed)
+        assertFalse(hub.isFailedOver());
+        assertEquals("ZERODHA", hub.getActiveBroker());
     }
 
     @Test

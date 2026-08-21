@@ -27,6 +27,8 @@ trading-bot:
       password: ${KITE_PASSWORD:mock_kite_password}
       totp-secret: ${KITE_TOTP_SECRET:JBSWY3DPEHPK3PXP}
       base-url: ${KITE_BASE_URL:https://api.kite.trade}
+      # Optional: paste a manually-obtained daily access token to skip automated headless login
+      access-token: ${KITE_ACCESS_TOKEN:}
     shoonya:
       enabled: ${SHOONYA_ENABLED:true}
       client-id: ${SHOONYA_CLIENT_ID:mock_shoonya_client}
@@ -43,10 +45,28 @@ trading-bot:
     chat-id: ${TELEGRAM_CHAT_ID:}
 
 bot:
+  paper-trading:
+    # Default ON for safety. Set PAPER_TRADING_ENABLED=false explicitly for live money.
+    enabled: ${PAPER_TRADING_ENABLED:true}
   instrument:
     db-path: ${INSTRUMENT_DB_PATH:data/instruments.db}
   marketdata:
     silence-threshold-seconds: ${SILENCE_THRESHOLD_SECONDS:3}
+  calendar:
+    # NSE trading holidays (official 2026 list). Override via NSE_HOLIDAYS env.
+    holidays: ${NSE_HOLIDAYS:2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25}
+  strategies:
+    lowest-volume-reversal:
+      id: ${LVR_STRATEGY_ID:LOWEST_VOL_REV_01}
+      account-id: ${LVR_ACCOUNT_ID:KITE_USER_01}
+      symbols: ${LVR_SYMBOLS:}
+      max-trades-per-day: ${LVR_MAX_TRADES:2}
+      min-rr-ratio: ${LVR_MIN_RR:2.0}
+      momentum-candles: ${LVR_MOMENTUM_CANDLES:2}
+    vwap-nifty:
+      id: ${VWAP_STRATEGY_ID:VWAP_NIFTY_01}
+      account-id: ${VWAP_ACCOUNT_ID:KITE_USER_01}
+      symbol: ${VWAP_SYMBOL:NFO:NIFTY_FUT}
 
 management:
   endpoints:

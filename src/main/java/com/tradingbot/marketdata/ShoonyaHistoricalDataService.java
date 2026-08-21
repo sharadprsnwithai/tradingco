@@ -38,7 +38,7 @@ public class ShoonyaHistoricalDataService {
 
     private static final Logger log = LoggerFactory.getLogger(ShoonyaHistoricalDataService.class);
     private static final ZoneId IST_ZONE = ZoneId.of("Asia/Kolkata");
-    private static final DateTimeFormatter SHOONYA_TIME_FORMATTER = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss");
+    private static final DateTimeFormatter SHOONYA_TIME_FORMATTER = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
 
     private final ShoonyaConfig config;
     private final ShoonyaAuthenticator authenticator;
@@ -206,7 +206,9 @@ public class ShoonyaHistoricalDataService {
             try {
                 LocalDateTime ldt = LocalDateTime.parse(timeStr, SHOONYA_TIME_FORMATTER);
                 return ldt.atZone(IST_ZONE).toInstant();
-            } catch (Exception ignored) {}
+            } catch (Exception e) {
+                log.debug("Could not parse Shoonya timestamp '{}': {}", timeStr, e.getMessage());
+            }
         }
         return Instant.now();
     }

@@ -56,6 +56,21 @@ public class BrokerAdapterRegistry {
     }
 
     /**
+     * Synchronously retrieves the broker adapter for the given broker identifier.
+     * Safe to call from any thread (backed by a ConcurrentHashMap) — prefer this over
+     * {@link #getByBrokerId(String)} in code paths that cannot block a reactor thread.
+     *
+     * @param brokerId the broker identifier to look up; may be {@code null}
+     * @return an Optional containing the adapter, or empty if not registered
+     */
+    public java.util.Optional<BrokerAdapter> findByBrokerId(String brokerId) {
+        if (brokerId == null) {
+            return java.util.Optional.empty();
+        }
+        return java.util.Optional.ofNullable(adaptersByBrokerId.get(brokerId.toUpperCase()));
+    }
+
+    /**
      * Retrieves the broker adapter whose account identifier matches the given value.
      *
      * @param accountId the account identifier to look up; may be {@code null}

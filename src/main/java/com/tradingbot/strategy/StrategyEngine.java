@@ -368,6 +368,12 @@ public class StrategyEngine {
         }
 
         @Override
+        public void requestSubscriptionSync() {
+            log.info("Strategy '{}' requested subscription sync", strategyId);
+            StrategyEngine.this.syncSubscriptions();
+        }
+
+        @Override
         public Optional<Candle> getLastCandle(String symbol, String timeframe) {
             return candleAggregator.getBuffer(symbol, timeframe)
                 .flatMap(CircularCandleBuffer::getLast);

@@ -19,7 +19,15 @@ A structured breakdown of the intraday price action and volume trading strategy 
 | **Observation Phase** | 09:15 AM – 09:25 AM | Do not trade. Let the opening 10-minute volatility settle. |
 | **Scanner Check** | 09:26 AM | Open NSE India and navigate to **Market Data > Equity & SME > Securities in F&O**. |
 | **List Filter** | 09:26 AM | Check **Top Gainers** (for long setups) and **Top Losers** (for short setups). |
+Api to do the above 2 
+https://www.nseindia.com/api/live-analysis-variations?index=gainers
+https://www.nseindia.com/api/live-analysis-variations?index=loosers
+FOSec
+https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings
+stocks with highest OI
 | **Trend & Sentiment** | Pre-Market / Open | Align trades with the major trend of Nifty and intraday market breadth (advances vs. declines). |
+take nifty advances and declines from https://www.nseindia.com/api/market-data-pre-open?key=NIFTY 
+search if you can get a similar api which is not pre market
 
 ---
 
