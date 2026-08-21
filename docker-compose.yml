@@ -44,6 +44,18 @@ services:
         max-file: "3"
     networks:
       - trading-net
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+
+  init-permissions:
+    image: alpine:latest
+    container_name: trading-bot-init-permissions
+    user: root
+    volumes:
+      - ./data:/app/data
+    command: ["sh", "-c", "chown -R 10001:10001 /app/data && chmod -R 777 /app/data"]
+
 
   ngrok:
     container_name: trading-bot-ngrok
