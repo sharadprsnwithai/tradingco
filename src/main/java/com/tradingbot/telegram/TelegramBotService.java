@@ -12,6 +12,8 @@ import com.tradingbot.position.PositionManagerService;
 import com.tradingbot.risk.KillSwitchService;
 import com.tradingbot.strategy.Strategy;
 import com.tradingbot.strategy.StrategyEngine;
+import com.tradingbot.strategy.ironfly.IronFlyPosition;
+import com.tradingbot.strategy.ironfly.IronFlyService;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -47,6 +49,7 @@ public class TelegramBotService {
     private final PositionManagerService positionManager;
     private final KillSwitchService killSwitch;
     private final MarketDataHub marketDataHub;
+    private final IronFlyService ironFlyService;
 
     private final String botToken;
     private final String chatId;
@@ -79,6 +82,7 @@ public class TelegramBotService {
         PositionManagerService positionManager,
         KillSwitchService killSwitch,
         MarketDataHub marketDataHub,
+        IronFlyService ironFlyService,
         @Value("${trading-bot.telegram.bot-token:}") String botToken,
         @Value("${trading-bot.telegram.chat-id:}") String chatId,
         WebClient.Builder webClientBuilder,
@@ -89,6 +93,7 @@ public class TelegramBotService {
         this.positionManager = positionManager;
         this.killSwitch = killSwitch;
         this.marketDataHub = marketDataHub;
+        this.ironFlyService = ironFlyService;
         this.botToken = botToken;
         this.chatId = chatId;
         this.enabled = botToken != null && !botToken.isBlank() && chatId != null && !chatId.isBlank();
@@ -267,14 +272,18 @@ public class TelegramBotService {
             handlePanicPrompt();
         } else if (cmd.startsWith("/strategies")) {
             handleStrategiesCommand();
+        } else if (cmd.startsWith("/ironfly")) {
+            handleIronFlyCommand(text.trim());
         } else if (cmd.startsWith("/help") || cmd.startsWith("/start")) {
             sendAlert("""
-                📋 *Available Commands:*
-                • /status - System & broker connectivity overview
-                • /pnl - Live MTM & Realized P&L breakdown
-                • /strategies - Manage & toggle active strategies
-                • /panic - Emergency L3 Global Panic Liquidation
-                • /help - Show this command menu
+                \ud83d\udccb *Available Commands:*
+                \u2022 /status - System & broker connectivity overview
+                \u2022 /pnl - Live MTM & Realized P&L breakdown
+                \u2022 /strategies - Manage & toggle active strategies
+                \u2022 /ironfly - Iron Fly positions & breakevens
+                \u2022 /ironfly book RELIANCE credit=47 spot=1390 lot=250 - Book manual entry
+                \u2022 /panic - Emergency L3 Global Panic Liquidation
+                \u2022 /help - Show this command menu
             """).subscribe();
         }
     }
@@ -375,20 +384,101 @@ public class TelegramBotService {
      * Sends an interactive strategy controller with pause/resume buttons for each registered strategy.
      */
     private void handleStrategiesCommand() {
+        StringBuilder sb = new StringBuilder("\u2699\ufe0f *STRATEGY DASHBOARD*\n\n");
+
+        // 1. Registered strategies (VWAP, LVR, etc.)
         List<Strategy> list = strategyEngine.getRegisteredStrategies();
-        if (list.isEmpty()) {
-            sendAlert("No strategies currently registered.").subscribe();
-            return;
+        if (!list.isEmpty()) {
+            sb.append("*Intraday Strategies:*\n");
+            for (Strategy s : list) {
+                sb.append("\u2022 `").append(s.getStrategyId()).append("` ")
+                  .append(s.isEnabled() ? "\u2705 RUNNING" : "\u23f8 PAUSED")
+                  .append(" (").append(s.getAssignedAccountId()).append(")\n");
+            }
+            sb.append("\n");
         }
 
+        // 2. Iron Fly status
+        Map<String, IronFlyPosition> ironFlyPositions = ironFlyService.getActivePositions();
+        sb.append("*Iron Fly (Monthly Option Selling):*\n");
+        if (ironFlyPositions.isEmpty()) {
+            sb.append("  No active positions\n");
+        } else {
+            for (Map.Entry<String, IronFlyPosition> entry : ironFlyPositions.entrySet()) {
+                IronFlyPosition p = entry.getValue();
+                sb.append("\u2022 `").append(entry.getKey()).append("` [").append(p.status()).append("]\n");
+                sb.append("  Credit: \u20b9").append(p.getCurrentNetCredit())
+                  .append(" | MTM: \u20b9").append(p.getTotalMtm()).append("\n");
+            }
+        }
+        sb.append("\n");
+
+        // 3. Pause/Resume buttons for registered strategies
         List<List<Map<String, String>>> buttons = new ArrayList<>();
         for (Strategy s : list) {
-            String btnText = (s.isEnabled() ? "⏸ Pause " : "▶️ Resume ") + s.getStrategyId();
+            String btnText = (s.isEnabled() ? "\u23f8 Pause " : "\u25b6\ufe0f Resume ") + s.getStrategyId();
             String cbData = (s.isEnabled() ? "PAUSE_STRAT:" : "RESUME_STRAT:") + s.getStrategyId();
             buttons.add(List.of(Map.of("text", btnText, "callback_data", cbData)));
         }
 
-        sendMessageWithButtons("⚙️ *Strategy Controller*\nClick buttons below to pause or resume individual strategies:", buttons).subscribe();
+        if (buttons.isEmpty()) {
+            sendAlert(sb.toString()).subscribe();
+        } else {
+            sendMessageWithButtons(sb.toString(), buttons).subscribe();
+        }
+    }
+
+    /**
+     * Builds and displays Iron Fly position status with breakevens, decay, and adjustment history.
+     */
+    private void handleIronFlyCommand(String fullCmd) {
+        String[] parts = fullCmd.split("\\s+");
+        if (parts.length >= 2 && "book".equalsIgnoreCase(parts[1])) {
+            handleIronFlyBook(parts);
+            return;
+        }
+        Map<String, IronFlyPosition> positions = ironFlyService.getActivePositions();
+        if (positions.isEmpty()) {
+            sendAlert("No active Iron Fly positions.\n\nUsage: /ironfly book RELIANCE credit=47.26 spot=1390 lot=250").subscribe();
+            return;
+        }
+        StringBuilder sb = new StringBuilder("\ud83e\udde9 *IRON FLY POSITIONS*\n\n");
+        for (Map.Entry<String, IronFlyPosition> entry : positions.entrySet()) {
+            IronFlyPosition p = entry.getValue();
+            sb.append("*").append(entry.getKey()).append("* [").append(p.status()).append("]\n");
+            sb.append("  ATM: `").append(p.getAtmStrike()).append("`\n");
+            sb.append("  Credit: `\u20b9").append(p.getCurrentNetCredit()).append("`\n");
+            sb.append("  MTM: `\u20b9").append(p.getTotalMtm()).append("`\n");
+            sb.append("  BE: `\u20b9").append(p.getUpperBreakeven()).append(" / \u20b9").append(p.getLowerBreakeven()).append("`\n");
+            sb.append("  Adjustments: `").append(p.getAdjustmentCount()).append("`\n\n");
+        }
+        sendAlert(sb.toString()).subscribe();
+    }
+
+    private void handleIronFlyBook(String[] parts) {
+        if (parts.length < 5) {
+            sendAlert("Usage: /ironfly book RELIANCE credit=47.26 spot=1390 lot=250").subscribe();
+            return;
+        }
+        String underlying = parts[2].toUpperCase();
+        double credit = 0, spot = 0;
+        int lot = 250;
+        for (int i = 3; i < parts.length; i++) {
+            String[] kv = parts[i].split("=");
+            if (kv.length == 2) {
+                switch (kv[0].toLowerCase()) {
+                    case "credit" -> credit = Double.parseDouble(kv[1]);
+                    case "spot" -> spot = Double.parseDouble(kv[1]);
+                    case "lot" -> lot = Integer.parseInt(kv[1]);
+                }
+            }
+        }
+        if (credit <= 0 || spot <= 0) {
+            sendAlert("Invalid credit or spot. Usage: /ironfly book RELIANCE credit=47.26 spot=1390 lot=250").subscribe();
+            return;
+        }
+        String result = ironFlyService.bookManualEntry(underlying, credit, spot, lot);
+        sendAlert(result).subscribe();
     }
 
     /**

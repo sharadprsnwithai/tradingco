@@ -26,6 +26,7 @@ public record Position(
     BigDecimal mtmPnl,
     BigDecimal realizedPnl,
     BigDecimal unrealizedPnl,
+    boolean autoSquareOff,
     Instant updatedAt
 ) {
     /**
@@ -57,6 +58,7 @@ public record Position(
         private BigDecimal mtmPnl = BigDecimal.ZERO;
         private BigDecimal realizedPnl = BigDecimal.ZERO;
         private BigDecimal unrealizedPnl = BigDecimal.ZERO;
+        private boolean autoSquareOff = true;
         private Instant updatedAt;
 
         /** Sets the account ID holding the position. */
@@ -91,6 +93,8 @@ public record Position(
         public Builder realizedPnl(BigDecimal realizedPnl) { this.realizedPnl = realizedPnl; return this; }
         /** Sets the unrealized (open) profit and loss. */
         public Builder unrealizedPnl(BigDecimal unrealizedPnl) { this.unrealizedPnl = unrealizedPnl; return this; }
+        /** Sets whether this position should be auto-squared off at EOD (default true). */
+        public Builder autoSquareOff(boolean autoSquareOff) { this.autoSquareOff = autoSquareOff; return this; }
         /** Sets the last-updated timestamp. */
         public Builder updatedAt(Instant updatedAt) { this.updatedAt = updatedAt; return this; }
 
@@ -105,6 +109,7 @@ public record Position(
                 accountId, brokerId, symbol, exchange, instrumentToken,
                 productType, bookType, netQuantity, buyQuantity, sellQuantity,
                 buyAveragePrice, sellAveragePrice, ltp, mtmPnl, realizedPnl, unrealizedPnl,
+                autoSquareOff,
                 updatedAt != null ? updatedAt : Instant.now()
             );
         }

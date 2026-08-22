@@ -124,6 +124,7 @@ public class TradingDbService {
                     mtm_pnl REAL,
                     realized_pnl REAL,
                     unrealized_pnl REAL,
+                    auto_square_off INTEGER DEFAULT 1,
                     updated_at INTEGER
                 );
             """);
@@ -172,7 +173,14 @@ public class TradingDbService {
      * @throws SQLException if a database access error occurs
      */
     private Connection getConnection() throws SQLException {
-        return DriverManager.getConnection(dbUrl);
+        Connection conn = DriverManager.getConnection(dbUrl);
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("PRAGMA journal_mode=WAL");
+            stmt.execute("PRAGMA busy_timeout=5000");
+            stmt.execute("PRAGMA synchronous=NORMAL");
+            stmt.execute("PRAGMA foreign_keys=ON");
+        }
+        return conn;
     }
 
     // =========================================================================
@@ -307,8 +315,9 @@ public class TradingDbService {
                 INSERT OR REPLACE INTO positions (
                     id, account_id, broker_id, symbol, exchange, instrument_token,
                     product_type, book_type, net_quantity, buy_quantity, sell_quantity,
-                    buy_average_price, sell_average_price, ltp, mtm_pnl, realized_pnl, unrealized_pnl, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    buy_average_price, sell_average_price, ltp, mtm_pnl, realized_pnl, unrealized_pnl,
+                    auto_square_off, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
             try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, id);
@@ -328,7 +337,8 @@ public class TradingDbService {
                 ps.setDouble(15, pos.mtmPnl() != null ? pos.mtmPnl().doubleValue() : 0.0);
                 ps.setDouble(16, pos.realizedPnl() != null ? pos.realizedPnl().doubleValue() : 0.0);
                 ps.setDouble(17, pos.unrealizedPnl() != null ? pos.unrealizedPnl().doubleValue() : 0.0);
-                ps.setLong(18, pos.updatedAt() != null ? pos.updatedAt().toEpochMilli() : System.currentTimeMillis());
+                ps.setInt(18, pos.autoSquareOff() ? 1 : 0);
+                ps.setLong(19, pos.updatedAt() != null ? pos.updatedAt().toEpochMilli() : System.currentTimeMillis());
                 ps.executeUpdate();
             } catch (SQLException e) {
                 log.error("Failed to persist position for {}", pos.symbol(), e);
@@ -555,6 +565,7 @@ public class TradingDbService {
             .mtmPnl(BigDecimal.valueOf(rs.getDouble("mtm_pnl")))
             .realizedPnl(BigDecimal.valueOf(rs.getDouble("realized_pnl")))
             .unrealizedPnl(BigDecimal.valueOf(rs.getDouble("unrealized_pnl")))
+            .autoSquareOff(rs.getInt("auto_square_off") != 0)
             .updatedAt(Instant.ofEpochMilli(rs.getLong("updated_at")))
             .build();
     }

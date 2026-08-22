@@ -13,6 +13,7 @@ import com.tradingbot.position.PositionManagerService;
 import com.tradingbot.risk.KillSwitchService;
 import com.tradingbot.strategy.Strategy;
 import com.tradingbot.strategy.StrategyEngine;
+import com.tradingbot.strategy.ironfly.IronFlyService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -32,6 +33,7 @@ class TelegramBotServiceTest {
     private PositionManagerService positionManager;
     private KillSwitchService killSwitch;
     private MarketDataHub marketDataHub;
+    private IronFlyService ironFlyService;
     private ObjectMapper objectMapper;
 
     private TelegramBotService botService;
@@ -43,6 +45,7 @@ class TelegramBotServiceTest {
         positionManager = mock(PositionManagerService.class);
         killSwitch = mock(KillSwitchService.class);
         marketDataHub = mock(MarketDataHub.class);
+        ironFlyService = mock(IronFlyService.class);
         objectMapper = new ObjectMapper();
 
         when(strategyEngine.getSignalStream()).thenReturn(Flux.empty());
@@ -51,6 +54,7 @@ class TelegramBotServiceTest {
         when(marketDataHub.isFailedOver()).thenReturn(false);
         when(oms.isPaperTrading()).thenReturn(true);
         when(killSwitch.isGlobalPanicActive()).thenReturn(false);
+        when(ironFlyService.getActivePositions()).thenReturn(java.util.Map.of());
 
         botService = new TelegramBotService(
             strategyEngine,
@@ -58,6 +62,7 @@ class TelegramBotServiceTest {
             positionManager,
             killSwitch,
             marketDataHub,
+            ironFlyService,
             "123456:MOCK_TOKEN",
             "999999",
             WebClient.builder(),

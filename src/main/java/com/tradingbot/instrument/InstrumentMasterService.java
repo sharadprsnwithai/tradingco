@@ -101,7 +101,13 @@ public class InstrumentMasterService {
      * @throws SQLException if a database access error occurs
      */
     private Connection getConnection() throws SQLException {
-        return DriverManager.getConnection(dbUrl);
+        Connection conn = DriverManager.getConnection(dbUrl);
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("PRAGMA journal_mode=WAL");
+            stmt.execute("PRAGMA busy_timeout=5000");
+            stmt.execute("PRAGMA synchronous=NORMAL");
+        }
+        return conn;
     }
 
     /**

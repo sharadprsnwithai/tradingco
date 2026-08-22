@@ -44,7 +44,24 @@ trading-bot:
     bot-token: ${TELEGRAM_BOT_TOKEN:}
     chat-id: ${TELEGRAM_CHAT_ID:}
 
+ironfly:
+  underlyings: ${IRONFLY_UNDERLYINGS:NIFTY,RELIANCE,HDFCBANK}
+  max-concurrent: ${IRONFLY_MAX_CONCURRENT:3}
+  discovery-window-mins: ${IRONFLY_DISCOVERY_WINDOW:30}
+  profit-target-pct: ${IRONFLY_PROFIT_TARGET:4}
+  stop-loss-pct: ${IRONFLY_STOP_LOSS:8}
+  expiry-guard-days: ${IRONFLY_EXPIRY_GUARD:4}
+  decay-threshold-pct: ${IRONFLY_DECAY_THRESHOLD:70}
+  target-delta: ${IRONFLY_TARGET_DELTA:0.25}
+  hedge-credit-buffer: ${IRONFLY_HEDGE_BUFFER:0.5}
+  min-straddle-pct-of-spot: ${IRONFLY_MIN_STRADDLE_PCT:2.0}
+  min-oi: ${IRONFLY_MIN_OI:1000}
+  max-bid-ask-spread-pct: ${IRONFLY_MAX_SPREAD:1.5}
+  short-leg-loss-pct: ${IRONFLY_SHORT_LEG_LOSS:70}
+  hedge-profit-pct: ${IRONFLY_HEDGE_PROFIT:50}
+
 bot:
+  db-path: ${BOT_DB_PATH:data/trading_state.db}
   paper-trading:
     # Default ON for safety. Set PAPER_TRADING_ENABLED=false explicitly for live money.
     enabled: ${PAPER_TRADING_ENABLED:true}

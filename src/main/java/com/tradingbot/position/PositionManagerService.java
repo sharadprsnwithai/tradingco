@@ -265,16 +265,18 @@ public class PositionManagerService {
 
     /**
      * EOD Automated Square-off (15:18 IST).
-     * Scans IntradayBook ONLY and generates market-exit orders for all open positions.
-     * PositionalBook is completely untouched.
+     * Scans IntradayBook and generates market-exit orders for all open positions
+     * where autoSquareOff is true. Positions with autoSquareOff=false are skipped.
      */
     public Mono<Void> executeEodIntradaySquareOff() {
-        log.warn("15:18 EOD INTRADAY AUTO SQUARE-OFF TRIGGERED. Liquidating IntradayBook positions.");
+        log.warn("15:18 EOD INTRADAY AUTO SQUARE-OFF TRIGGERED. Liquidating eligible IntradayBook positions.");
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.INTRADAY_SQUARE_OFF));
 
-        List<Position> openIntraday = getOpenIntradayPositions();
+        List<Position> openIntraday = getOpenIntradayPositions().stream()
+            .filter(Position::autoSquareOff)
+            .toList();
         if (openIntraday.isEmpty()) {
-            log.info("No open intraday positions found for 15:18 EOD square-off");
+            log.info("No auto-square-off eligible intraday positions found for 15:18 EOD");
             return Mono.empty();
         }
 

@@ -40,6 +40,20 @@ public class TradingBotApplication {
      */
     public static void main(String[] args) {
         loadDotEnv();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            log.info("Shutdown hook triggered — checkpointing SQLite WAL...");
+            try {
+                String dbPath = System.getProperty("bot.db.path", "data/trading_state.db");
+                java.sql.Connection conn = java.sql.DriverManager.getConnection("jdbc:sqlite:" + dbPath);
+                try (java.sql.Statement stmt = conn.createStatement()) {
+                    stmt.execute("PRAGMA wal_checkpoint(TRUNCATE)");
+                }
+                conn.close();
+                log.info("SQLite WAL checkpoint completed");
+            } catch (Exception e) {
+                log.warn("WAL checkpoint on shutdown failed: {}", e.getMessage());
+            }
+        }));
         SpringApplication.run(TradingBotApplication.class, args);
     }
 

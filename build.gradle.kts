@@ -86,3 +86,8 @@ tasks.register<JavaExec>("backtestVwap") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.tradingbot.backtest.VwapBacktestRunner")
 }
+
+tasks.register<JavaExec>("backtestIronFly") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.tradingbot.backtest.IronFlyBacktestRunner")
+}

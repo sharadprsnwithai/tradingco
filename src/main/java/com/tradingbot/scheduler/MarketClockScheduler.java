@@ -12,6 +12,7 @@ import com.tradingbot.risk.RiskManager;
 import com.tradingbot.strategy.ScheduledEvent;
 import com.tradingbot.strategy.Strategy;
 import com.tradingbot.strategy.StrategyEngine;
+import com.tradingbot.strategy.ironfly.IronFlyService;
 import com.tradingbot.telegram.TelegramBotService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -26,6 +27,7 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Supplier;
 
 /**
  * Automated Master Market Clock aligned to Indian Standard Time (Asia/Kolkata).
@@ -47,6 +49,10 @@ public class MarketClockScheduler {
     private final InstrumentMasterService instrumentMaster;
     private final InstrumentSyncService instrumentSyncService;
     private final TelegramBotService telegramBot;
+    private final IronFlyService ironFlyService;
+
+    // Injectable clock for testing — defaults to real IST clock
+    private Supplier<LocalDate> clock = () -> LocalDate.now(IST_ZONE);
 
     // NSE trading holidays — configured via NSE_HOLIDAYS (comma-separated YYYY-MM-DD),
     // defaults to the official NSE 2026 trading holiday list
@@ -62,6 +68,7 @@ public class MarketClockScheduler {
         InstrumentMasterService instrumentMaster,
         InstrumentSyncService instrumentSyncService,
         TelegramBotService telegramBot,
+        IronFlyService ironFlyService,
         @Value("${bot.calendar.holidays:2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25}") String holidaysCsv
     ) {
         this.strategyEngine = strategyEngine;
@@ -73,8 +80,14 @@ public class MarketClockScheduler {
         this.instrumentMaster = instrumentMaster;
         this.instrumentSyncService = instrumentSyncService;
         this.telegramBot = telegramBot;
+        this.ironFlyService = ironFlyService;
 
         initHolidays(holidaysCsv);
+    }
+
+    /** Package-private clock setter for testing. */
+    void setClock(Supplier<LocalDate> clock) {
+        this.clock = clock;
     }
 
     /**
@@ -122,7 +135,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 30 8 * * MON-FRI", zone = "Asia/Kolkata")
     public void onPreMarketAuth() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.info("⏰ 08:30 IST: Triggering Pre-Market Broker Authentication & Master Sync");
 
         brokerRegistry.getAll()
@@ -155,7 +168,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 5 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onPreMarketWarmup() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.info("⏰ 09:05 IST: Triggering Historical Indicator Warm-Up (350ms Sequential Throttle)");
 
         List<ShoonyaHistoricalDataService.HistoricalWarmupRequest> requests = new ArrayList<>();
@@ -191,7 +204,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 15 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onMarketOpen() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.info("🔔 09:15 IST: MARKET OPEN — Activating Strategy Engine Event Loop");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.MARKET_OPEN));
@@ -203,7 +216,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 25 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onPreMarketOiScan() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.info("📊 09:25 IST: Triggering Option Chain OI Scan & Top 5 Watchlist Selection");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.OI_SCAN));
@@ -219,7 +232,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 26 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onStockSelectionScan() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.info("📊 09:26 IST: Triggering Stock Selection Scan (Gainers/Losers)");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.STOCK_SELECTION_SCAN));
@@ -240,7 +253,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 30 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onVwapBaseline() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.info("📊 09:30 IST: VWAP Strategy — Capturing 9:30 Baseline Snapshot");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.VWAP_BASELINE_930));
@@ -253,7 +266,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 0 11 * * MON-FRI", zone = "Asia/Kolkata")
     public void onVwapBiasCheck() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.info("📊 11:00 IST: VWAP Strategy — Capturing 11:00 Bias Check Snapshot");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.VWAP_BIAS_CHECK_1100));
@@ -265,7 +278,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 0 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onHardExit() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.warn("⚡ 15:00 IST: HARD EXIT — Closing all Lowest Volume Reversal positions");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.INTRADAY_SQUARE_OFF));
@@ -277,7 +290,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 10 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onIntradayEntryCutoff() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.warn("🔒 15:10 IST: INTRADAY ENTRY CUTOFF — Locking all new trade entries");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.INTRADAY_ENTRY_CUTOFF));
@@ -289,7 +302,7 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 14 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onIntradaySquareOff() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
+        if (!isTradingDay(clock.get())) return;
         log.warn("⚡ 15:14 IST: AUTOMATED INTRADAY SQUARE-OFF — Liquidating IntradayBook positions");
 
         positionManager.executeEodIntradaySquareOff().subscribe();
@@ -301,11 +314,44 @@ public class MarketClockScheduler {
      */
     @Scheduled(cron = "0 30 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onMarketClose() {
-        if (!isTradingDay(LocalDate.now(IST_ZONE))) return;
-        log.info("🏁 15:30 IST: MARKET CLOSED — Resetting Daily RMS & Strategy States");
+        if (!isTradingDay(clock.get())) return;
+        log.info("15:30 IST: MARKET CLOSED - Resetting Daily RMS & Strategy States");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.MARKET_CLOSE));
         riskManager.resetDailyStats();
-        telegramBot.sendAlert("🏁 *Market Closed (15:30 IST)*\n• Trading session ended\n• Daily risk metrics & strategy states reset").subscribe();
+        telegramBot.sendAlert("\ud83c\udfc1 *Market Closed (15:30 IST)*\n\u2022 Trading session ended\n\u2022 Daily risk metrics & strategy states reset").subscribe();
+    }
+
+    /**
+     * 09:30 AM IST: Iron Fly Entry Recommendations.
+     * Sends Telegram recommendations for configured underlyings.
+     */
+    @Scheduled(cron = "0 30 9 * * MON-FRI", zone = "Asia/Kolkata")
+    public void onIronFlyRecommendation() {
+        if (!isTradingDay(clock.get())) return;
+        log.info("09:30 IST: Iron Fly - Sending entry recommendations");
+        ironFlyService.sendRecommendations().subscribe();
+    }
+
+    /**
+     * 10:00 AM IST: Iron Fly Position Discovery.
+     * Fetches broker positions and starts tracking discovered Iron Fly legs.
+     */
+    @Scheduled(cron = "0 0 10 * * MON-FRI", zone = "Asia/Kolkata")
+    public void onIronFlyDiscovery() {
+        if (!isTradingDay(clock.get())) return;
+        log.info("10:00 IST: Iron Fly - Discovering positions from broker");
+        ironFlyService.discoverPositions().subscribe();
+    }
+
+    /**
+     * 15:00 PM IST: Iron Fly Daily Evaluation.
+     * Evaluates all tracked positions for profit target, stop loss, expiry, and decay triggers.
+     */
+    @Scheduled(cron = "0 0 15 * * MON-FRI", zone = "Asia/Kolkata")
+    public void onIronFlyEvaluation() {
+        if (!isTradingDay(clock.get())) return;
+        log.info("15:00 IST: Iron Fly - Running daily evaluation");
+        ironFlyService.runDailyEvaluation().subscribe();
     }
 }

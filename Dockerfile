@@ -47,4 +47,6 @@ VOLUME ["/app/data"]
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
   CMD ["curl", "-f", "http://localhost:3000/actuator/health"]
 
+STOPSIGNAL SIGTERM
+
 ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

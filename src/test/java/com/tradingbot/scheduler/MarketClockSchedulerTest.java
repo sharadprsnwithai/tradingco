@@ -10,6 +10,7 @@ import com.tradingbot.position.PositionManagerService;
 import com.tradingbot.risk.RiskManager;
 import com.tradingbot.strategy.ScheduledEvent;
 import com.tradingbot.strategy.StrategyEngine;
+import com.tradingbot.strategy.ironfly.IronFlyService;
 import com.tradingbot.telegram.TelegramBotService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -18,6 +19,7 @@ import reactor.core.publisher.Mono;
 
 import java.time.LocalDate;
 import java.util.List;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -33,6 +35,7 @@ class MarketClockSchedulerTest {
     private InstrumentMasterService instrumentMaster;
     private InstrumentSyncService instrumentSyncService;
     private TelegramBotService telegramBot;
+    private IronFlyService ironFlyService;
 
     private MarketClockScheduler scheduler;
 
@@ -47,6 +50,7 @@ class MarketClockSchedulerTest {
         instrumentMaster = mock(InstrumentMasterService.class);
         instrumentSyncService = mock(InstrumentSyncService.class);
         telegramBot = mock(TelegramBotService.class);
+        ironFlyService = mock(IronFlyService.class);
 
         when(telegramBot.sendAlert(anyString())).thenReturn(Mono.empty());
         when(brokerRegistry.getAll()).thenReturn(Flux.empty());
@@ -55,6 +59,9 @@ class MarketClockSchedulerTest {
         when(marketDataHub.getCandleAggregator()).thenReturn(new CandleAggregator());
         when(positionManager.executeEodIntradaySquareOff()).thenReturn(Mono.empty());
         when(instrumentSyncService.syncFromKite()).thenReturn(Mono.just(0));
+        when(ironFlyService.sendRecommendations()).thenReturn(Mono.empty());
+        when(ironFlyService.discoverPositions()).thenReturn(Mono.empty());
+        when(ironFlyService.runDailyEvaluation()).thenReturn(Mono.empty());
 
         scheduler = new MarketClockScheduler(
             strategyEngine,
@@ -66,8 +73,12 @@ class MarketClockSchedulerTest {
             instrumentMaster,
             instrumentSyncService,
             telegramBot,
+            ironFlyService,
             "2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25"
         );
+
+        // Override clock to return a trading weekday (Monday 2026-08-24)
+        scheduler.setClock(() -> LocalDate.of(2026, 8, 24));
     }
 
     @Test
