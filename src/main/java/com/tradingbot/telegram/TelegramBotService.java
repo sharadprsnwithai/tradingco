@@ -28,10 +28,12 @@ import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -213,44 +215,67 @@ public class TelegramBotService {
      */
     private void startPolling() {
         this.running.set(true);
-        this.pollingDisposable = Schedulers.boundedElastic().schedulePeriodically(this::pollUpdates, 0, 1, java.util.concurrent.TimeUnit.SECONDS);
+        pollLoop();
     }
 
     /**
-     * Polls the Telegram Bot API for new messages and callback queries.
-     * Processes each update and advances the offset to avoid reprocessing.
+     * Executes sequential, non-overlapping long-polling against Telegram getUpdates API.
      */
-    private void pollUpdates() {
+    private void pollLoop() {
         if (!running.get() || !enabled) return;
 
+        String url = String.format("/bot%s/getUpdates?offset=%d&timeout=10", botToken, updateOffset.get());
+        this.pollingDisposable = webClient.get()
+            .uri(url)
+            .retrieve()
+            .bodyToMono(String.class)
+            .timeout(Duration.ofSeconds(15))
+            .doOnNext(this::processUpdatesResponse)
+            .onErrorResume(e -> {
+                log.debug("Telegram polling timeout or retry: {}", e.getMessage());
+                return Mono.empty();
+            })
+            .delayElement(Duration.ofMillis(500))
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe(
+                v -> {
+                    if (running.get()) {
+                        pollLoop();
+                    }
+                },
+                err -> {
+                    log.debug("Telegram poll loop error: {}", err.getMessage());
+                    if (running.get()) {
+                        Schedulers.boundedElastic().schedule(this::pollLoop, 2, TimeUnit.SECONDS);
+                    }
+                }
+            );
+    }
+
+    /**
+     * Parses the response from Telegram and dispatches updates.
+     */
+    private void processUpdatesResponse(String response) {
+        if (response == null || response.isBlank()) return;
         try {
-            String url = String.format("/bot%s/getUpdates?offset=%d&timeout=10", botToken, updateOffset.get());
-            String response = webClient.get()
-                .uri(url)
-                .retrieve()
-                .bodyToMono(String.class)
-                .block(java.time.Duration.ofSeconds(12));
+            JsonNode root = objectMapper.readTree(response);
+            if (root.path("ok").asBoolean(false)) {
+                JsonNode result = root.path("result");
+                if (result.isArray()) {
+                    for (JsonNode update : result) {
+                        long updateId = update.path("update_id").asLong();
+                        updateOffset.set(updateId + 1);
 
-            if (response != null) {
-                JsonNode root = objectMapper.readTree(response);
-                if (root.path("ok").asBoolean(false)) {
-                    JsonNode result = root.path("result");
-                    if (result.isArray()) {
-                        for (JsonNode update : result) {
-                            long updateId = update.path("update_id").asLong();
-                            updateOffset.set(updateId + 1);
-
-                            if (update.has("message")) {
-                                handleMessage(update.path("message"));
-                            } else if (update.has("callback_query")) {
-                                handleCallbackQuery(update.path("callback_query"));
-                            }
+                        if (update.has("message")) {
+                            handleMessage(update.path("message"));
+                        } else if (update.has("callback_query")) {
+                            handleCallbackQuery(update.path("callback_query"));
                         }
                     }
                 }
             }
         } catch (Exception e) {
-            log.debug("Telegram polling timeout or retry: {}", e.getMessage());
+            log.debug("Error processing Telegram updates: {}", e.getMessage());
         }
     }
 

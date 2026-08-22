@@ -107,12 +107,16 @@ public class ShoonyaHistoricalDataService {
                     return Mono.error(new RuntimeException("Failed to serialize Shoonya TPSeries request", e));
                 }
 
+                String userKey = authenticator.getSUserToken() != null && !authenticator.getSUserToken().isBlank()
+                    ? authenticator.getSUserToken()
+                    : accessToken;
+
                 Mono<List<Candle>> rawRequest = webClient.post()
                     .uri("/NorenWClientAPI/TPSeries")
                     .header("Authorization", accessToken)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromFormData("jData", jDataStr)
-                        .with("jKey", authenticator.getSUserToken() != null ? authenticator.getSUserToken() : ""))
+                        .with("jKey", userKey))
                     .retrieve()
                     .bodyToMono(String.class)
                     .map(responseBody -> parseCandleResponse(responseBody, symbol, timeframe, numCandles))

@@ -19,6 +19,7 @@ import com.tradingbot.model.enums.TransactionType;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.reactive.function.BodyInserters;
@@ -161,6 +162,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
                 return webClient.post()
                     .uri("/NorenWClientAPI/PlaceOrder")
+                    .header(HttpHeaders.AUTHORIZATION, token)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromValue(formBody))
                     .retrieve()
@@ -212,6 +214,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
                 return webClient.post()
                     .uri("/NorenWClientAPI/ModifyOrder")
+                    .header(HttpHeaders.AUTHORIZATION, token)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromValue(formBody))
                     .retrieve()
@@ -245,6 +248,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
                 return webClient.post()
                     .uri("/NorenWClientAPI/CancelOrder")
+                    .header(HttpHeaders.AUTHORIZATION, token)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromValue(formBody))
                     .retrieve()
@@ -268,6 +272,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
                 return webClient.post()
                     .uri("/NorenWClientAPI/OrderBook")
+                    .header(HttpHeaders.AUTHORIZATION, token)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromValue(formBody))
                     .retrieve()
@@ -293,6 +298,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                 log.info("Fetching Shoonya positions for user: {}", config.getUserId());
                 return webClient.post()
                     .uri("/NorenWClientAPI/PositionBook")
+                    .header(HttpHeaders.AUTHORIZATION, token)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromValue(formBody))
                     .retrieve()
@@ -317,6 +323,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
                 return webClient.post()
                     .uri("/NorenWClientAPI/Limits")
+                    .header(HttpHeaders.AUTHORIZATION, token)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromValue(formBody))
                     .retrieve()

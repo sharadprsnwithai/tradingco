@@ -78,6 +78,7 @@ public class ShoonyaAuthenticator {
         if (config.getAccessToken() != null && !config.getAccessToken().isBlank()) {
             log.info("Using configured SHOONYA_ACCESS_TOKEN for user: {}", config.getUserId());
             accessToken.set(config.getAccessToken());
+            sUserToken.set(config.getAccessToken());
             return Mono.just(config.getAccessToken());
         }
 
@@ -106,25 +107,42 @@ public class ShoonyaAuthenticator {
         log.info("Starting 100% automated headless Shoonya login for user: {}", config.getUserId());
 
         // Step 1: Compute derived appkey
-        StringBuilder keyBuilder = new StringBuilder(config.getUserId()).append("|");
-        for (int p = 0; p < KEY_OFFSETS.length; p++) {
-            keyBuilder.append((char) (KEY_OFFSETS[p] + p));
+        // Finvasia NorenAPI requires SHA-256(uid + "|" + api_key)
+        String rawApiKey = null;
+        if (config.getApiKey() != null && !config.getApiKey().isBlank() && !"mock_api_key".equals(config.getApiKey())) {
+            rawApiKey = config.getApiKey().trim();
+        } else if (config.getSecretKey() != null && !config.getSecretKey().isBlank() && !"mock_shoonya_secret".equals(config.getSecretKey())) {
+            rawApiKey = config.getSecretKey().trim();
         }
-        String appkey = DigestUtils.sha256Hex(keyBuilder.toString());
+
+        String appkey;
+        if (rawApiKey != null) {
+            appkey = DigestUtils.sha256Hex(config.getUserId() + "|" + rawApiKey);
+        } else {
+            StringBuilder keyBuilder = new StringBuilder(config.getUserId()).append("|");
+            for (int p = 0; p < KEY_OFFSETS.length; p++) {
+                keyBuilder.append((char) (KEY_OFFSETS[p] + p));
+            }
+            appkey = DigestUtils.sha256Hex(keyBuilder.toString());
+        }
+
         String pwdSha = DigestUtils.sha256Hex(config.getPassword());
         String totp = generateTotp();
 
+        String vendorCode = config.getVendorCode();
+        if (vendorCode == null || vendorCode.isBlank() || "mock_vendor".equals(vendorCode)) {
+            vendorCode = config.getUserId() + "_U";
+        }
+
         Map<String, Object> quickAuthPayload = new HashMap<>();
-        quickAuthPayload.put("apkversion", "W2_20250926");
+        quickAuthPayload.put("apkversion", "js:1.0.0");
         quickAuthPayload.put("uid", config.getUserId());
         quickAuthPayload.put("pwd", pwdSha);
         quickAuthPayload.put("factor2", totp);
+        quickAuthPayload.put("vc", vendorCode);
         quickAuthPayload.put("appkey", appkey);
         quickAuthPayload.put("imei", "12345678-1234-1234-1234-123456789abc");
-        quickAuthPayload.put("addldivinf", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
         quickAuthPayload.put("source", "API");
-        quickAuthPayload.put("vc", config.getVendorCode() != null ? config.getVendorCode() : "NOREN_API");
-        quickAuthPayload.put("app_key", config.getClientId());
 
         String quickAuthBody = "jData=" + objectMapper.writeValueAsString(quickAuthPayload);
 
@@ -133,8 +151,6 @@ public class ShoonyaAuthenticator {
             quickAuthResponse = webClient.post()
                 .uri("/NorenWClientAPI/QuickAuth")
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .header("Origin", "https://api.shoonya.com")
-                .header("Referer", "https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=" + config.getClientId())
                 .body(BodyInserters.fromValue(quickAuthBody))
                 .retrieve()
                 .bodyToMono(String.class)
@@ -150,9 +166,27 @@ public class ShoonyaAuthenticator {
             throw new IllegalStateException("Shoonya Step 1 QuickAuth failed: " + quickAuthJson.path("emsg").asText());
         }
 
+        // Check if QuickAuth returned direct session tokens (Standard NorenAPI flow)
+        String directUserToken = quickAuthJson.path("susertoken").asText(null);
+        String directAccessToken = quickAuthJson.path("access_token").asText(null);
+        if (directAccessToken == null && directUserToken != null) {
+            directAccessToken = directUserToken;
+        } else if (directUserToken == null && directAccessToken != null) {
+            directUserToken = directAccessToken;
+        }
+
         String authCode = quickAuthJson.path("code").asText(null);
+
+        if (directAccessToken != null && !directAccessToken.isBlank() && (authCode == null || authCode.isBlank())) {
+            log.info("Shoonya QuickAuth returned direct session token.");
+            accessToken.set(directAccessToken);
+            sUserToken.set(directUserToken);
+            saveDiskSession(directAccessToken, directUserToken);
+            return directAccessToken;
+        }
+
         if (authCode == null || authCode.isBlank()) {
-            throw new IllegalStateException("Shoonya QuickAuth did not return an authorization code");
+            throw new IllegalStateException("Shoonya QuickAuth did not return an authorization code or session token");
         }
         log.info("Shoonya Step 1 QuickAuth succeeded. Authorization code acquired.");
 
@@ -228,6 +262,7 @@ public class ShoonyaAuthenticator {
      */
     public void setAccessToken(String token) {
         this.accessToken.set(token);
+        this.sUserToken.set(token);
     }
 
     /**
@@ -240,10 +275,12 @@ public class ShoonyaAuthenticator {
             try {
                 JsonNode root = objectMapper.readTree(SESSION_FILE);
                 String token = root.path("accessToken").asText(null);
+                String userToken = root.path("susertoken").asText(token);
                 String createdAtStr = root.path("createdAt").asText(null);
                 if (token != null && createdAtStr != null) {
                     Instant createdAt = Instant.parse(createdAtStr);
                     if (createdAt.plus(12, ChronoUnit.HOURS).isAfter(Instant.now())) {
+                        sUserToken.set(userToken != null ? userToken : token);
                         return token;
                     }
                 }
