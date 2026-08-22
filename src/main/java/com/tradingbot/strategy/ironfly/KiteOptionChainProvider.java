@@ -6,6 +6,7 @@ import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.model.Instrument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -13,6 +14,8 @@ import reactor.core.publisher.Mono;
 import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.List;
+
+@Primary
 import java.util.Map;
 
 /**
