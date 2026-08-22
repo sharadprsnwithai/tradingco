@@ -8,6 +8,7 @@ import com.tradingbot.telegram.TelegramBotService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -53,7 +54,7 @@ public class IronFlyService {
         InstrumentMasterService instrumentMaster,
         BrokerAdapterRegistry brokerRegistry,
         PositionManagerService positionManager,
-        TelegramBotService telegramBot,
+        @Lazy TelegramBotService telegramBot,
         IronFlyDbService dbService,
         @Value("${ironfly.underlyings:NIFTY,RELIANCE,HDFCBANK}") String underlyingsCsv,
         @Value("${ironfly.maxConcurrent:3}") int maxConcurrent,

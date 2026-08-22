@@ -130,6 +130,11 @@ public class TradingDbService {
             """);
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_positions_book ON positions(account_id, book_type);");
 
+            // Migrate: add auto_square_off if missing
+            try {
+                stmt.execute("ALTER TABLE positions ADD COLUMN auto_square_off INTEGER DEFAULT 1");
+            } catch (Exception ignored) { /* column already exists */ }
+
             // 3. Authentic Historical Candles table (for deterministic replay backtesting)
             stmt.execute("""
                 CREATE TABLE IF NOT EXISTS historical_candles (

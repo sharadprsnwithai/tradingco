@@ -14,14 +14,13 @@ import reactor.core.publisher.Mono;
 import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.List;
-
-@Primary
 import java.util.Map;
 
 /**
  * Kite (Zerodha) implementation of OptionChainProvider.
  * Uses the instrument master to find option contracts and broker quotes for pricing.
  */
+@Primary
 @Component
 public class KiteOptionChainProvider implements OptionChainProvider {
 
