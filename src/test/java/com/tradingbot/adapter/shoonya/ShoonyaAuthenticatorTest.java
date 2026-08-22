@@ -109,4 +109,24 @@ class ShoonyaAuthenticatorTest {
         assertEquals("manual_token_999", authenticator.getAccessToken().block());
         assertEquals("manual_token_999", authenticator.getSUserToken());
     }
+
+    @Test
+    void testDirectTotpCodeAndWithoutFactor2() {
+        config.setEnabled(false);
+        config.setUserId("FA12345");
+
+        // When raw 6-digit TOTP code is provided directly
+        config.setTotpSecret("654321");
+        ShoonyaAuthenticator authWithCode = new ShoonyaAuthenticator(config, WebClient.builder(), objectMapper);
+        StepVerifier.create(authWithCode.authenticate())
+            .expectNextCount(1)
+            .verifyComplete();
+
+        // When no factor2 / TOTP secret is configured (login without factor2)
+        config.setTotpSecret("");
+        ShoonyaAuthenticator authNoFactor2 = new ShoonyaAuthenticator(config, WebClient.builder(), objectMapper);
+        StepVerifier.create(authNoFactor2.authenticate())
+            .expectNextCount(1)
+            .verifyComplete();
+    }
 }

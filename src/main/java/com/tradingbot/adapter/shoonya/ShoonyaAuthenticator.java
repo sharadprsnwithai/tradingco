@@ -138,7 +138,9 @@ public class ShoonyaAuthenticator {
         quickAuthPayload.put("apkversion", "js:1.0.0");
         quickAuthPayload.put("uid", config.getUserId());
         quickAuthPayload.put("pwd", pwdSha);
-        quickAuthPayload.put("factor2", totp);
+        if (totp != null && !totp.isBlank()) {
+            quickAuthPayload.put("factor2", totp);
+        }
         quickAuthPayload.put("vc", vendorCode);
         quickAuthPayload.put("appkey", appkey);
         quickAuthPayload.put("imei", "12345678-1234-1234-1234-123456789abc");
@@ -313,17 +315,26 @@ public class ShoonyaAuthenticator {
     }
 
     /**
-     * Generates a TOTP code using the configured secret.
+     * Generates a TOTP code using the configured secret, or returns the raw code if directly provided.
+     * If no secret or code is configured, returns null (allowing login without factor2).
      *
-     * @return a 6-digit TOTP code as a string, or "000000" if generation fails
+     * @return a 6-digit TOTP code as a string, or null if not configured
      */
     private String generateTotp() {
+        if (config.getTotpSecret() == null || config.getTotpSecret().isBlank()) {
+            return null;
+        }
+        String secret = config.getTotpSecret().trim().replace(" ", "");
+        // If the user provided a direct 6-digit numeric TOTP code, use it directly
+        if (secret.matches("^\\d{6}$")) {
+            return secret;
+        }
         try {
-            int code = gAuth.getTotpPassword(config.getTotpSecret());
+            int code = gAuth.getTotpPassword(secret);
             return String.format("%06d", code);
         } catch (Exception e) {
-            log.warn("Could not compute TOTP for Shoonya, fallback to 000000: {}", e.getMessage());
-            return "000000";
+            log.warn("Could not compute TOTP from secret, using raw value: {}", e.getMessage());
+            return secret;
         }
     }
 }
