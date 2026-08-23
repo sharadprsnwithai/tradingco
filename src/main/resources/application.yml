@@ -27,7 +27,7 @@ trading-bot:
       password: ${KITE_PASSWORD:mock_kite_password}
       totp-secret: ${KITE_TOTP_SECRET:JBSWY3DPEHPK3PXP}
       base-url: ${KITE_BASE_URL:https://api.kite.trade}
-      # Optional: paste a manually-obtained daily access token to skip automated headless login
+      # Optional: daily access token to skip headless login
       access-token: ${KITE_ACCESS_TOKEN:}
     shoonya:
       enabled: ${SHOONYA_ENABLED:true}
@@ -60,10 +60,33 @@ ironfly:
   short-leg-loss-pct: ${IRONFLY_SHORT_LEG_LOSS:70}
   hedge-profit-pct: ${IRONFLY_HEDGE_PROFIT:50}
 
+st-intraday:
+  enabled: ${ST_INTRADAY_ENABLED:false}
+  strategy-id: ${ST_INTRADAY_STRATEGY_ID:ST_INTRADAY_01}
+  account-id: ${ST_INTRADAY_ACCOUNT_ID:KITE_USER_01}
+  symbol: ${ST_INTRADAY_SYMBOL:NFO:NIFTY_50}
+  super-trend:
+    atr-length: ${ST_INTRADAY_ATR_LENGTH:7}
+    multiplier: ${ST_INTRADAY_MULTIPLIER:3.0}
+  rsi:
+    period: ${ST_INTRADAY_RSI_PERIOD:14}
+    threshold: ${ST_INTRADAY_RSI_THRESHOLD:50.0}
+  option-selection:
+    target-delta: ${ST_INTRADAY_TARGET_DELTA:0.20}
+    min-premium: ${ST_INTRADAY_MIN_PREMIUM:70.0}
+  risk:
+    stop-loss-pct: ${ST_INTRADAY_STOP_LOSS_PCT:30.0}
+    profit-target-pct: ${ST_INTRADAY_PROFIT_TARGET_PCT:0.0}
+    max-trades-per-day: ${ST_INTRADAY_MAX_TRADES:2}
+  lots: ${ST_INTRADAY_LOTS:1}
+  eod-exit-time: ${ST_INTRADAY_EOD_EXIT_TIME:15:20}
+  re-entry-cooldown-candles: ${ST_INTRADAY_REENTRY_COOLDOWN:3}
+  blackout-days: ${ST_INTRADAY_BLACKOUT_DAYS:}
+
 bot:
   db-path: ${BOT_DB_PATH:data/trading_state.db}
   paper-trading:
-    # Default ON for safety. Set PAPER_TRADING_ENABLED=false explicitly for live money.
+    # Default ON for safety. Set PAPER_TRADING_ENABLED=false for live money.
     enabled: ${PAPER_TRADING_ENABLED:true}
   instrument:
     db-path: ${INSTRUMENT_DB_PATH:data/instruments.db}

@@ -107,44 +107,29 @@ public class ShoonyaAuthenticator {
         log.info("Starting 100% automated headless Shoonya login for user: {}", config.getUserId());
 
         // Step 1: Compute derived appkey
-        // Finvasia NorenAPI requires SHA-256(uid + "|" + api_key)
-        String rawApiKey = null;
-        if (config.getApiKey() != null && !config.getApiKey().isBlank() && !"mock_api_key".equals(config.getApiKey())) {
-            rawApiKey = config.getApiKey().trim();
-        } else if (config.getSecretKey() != null && !config.getSecretKey().isBlank() && !"mock_shoonya_secret".equals(config.getSecretKey())) {
-            rawApiKey = config.getSecretKey().trim();
+        StringBuilder keyBuilder = new StringBuilder(config.getUserId()).append("|");
+        for (int p = 0; p < KEY_OFFSETS.length; p++) {
+            keyBuilder.append((char) (KEY_OFFSETS[p] + p));
         }
-
-        String appkey;
-        if (rawApiKey != null) {
-            appkey = DigestUtils.sha256Hex(config.getUserId() + "|" + rawApiKey);
-        } else {
-            StringBuilder keyBuilder = new StringBuilder(config.getUserId()).append("|");
-            for (int p = 0; p < KEY_OFFSETS.length; p++) {
-                keyBuilder.append((char) (KEY_OFFSETS[p] + p));
-            }
-            appkey = DigestUtils.sha256Hex(keyBuilder.toString());
-        }
-
+        String appkey = DigestUtils.sha256Hex(keyBuilder.toString());
         String pwdSha = DigestUtils.sha256Hex(config.getPassword());
         String totp = generateTotp();
 
-        String vendorCode = config.getVendorCode();
-        if (vendorCode == null || vendorCode.isBlank() || "mock_vendor".equals(vendorCode)) {
-            vendorCode = config.getUserId() + "_U";
-        }
+        String vc = (config.getVendorCode() != null && !config.getVendorCode().isBlank() && !"mock_vendor".equals(config.getVendorCode()))
+            ? config.getVendorCode()
+            : "NOREN_API";
 
         Map<String, Object> quickAuthPayload = new HashMap<>();
-        quickAuthPayload.put("apkversion", "js:1.0.0");
+        quickAuthPayload.put("apkversion", "W2_20250926");
         quickAuthPayload.put("uid", config.getUserId());
         quickAuthPayload.put("pwd", pwdSha);
-        if (totp != null && !totp.isBlank()) {
-            quickAuthPayload.put("factor2", totp);
-        }
-        quickAuthPayload.put("vc", vendorCode);
+        quickAuthPayload.put("factor2", totp);
         quickAuthPayload.put("appkey", appkey);
         quickAuthPayload.put("imei", "12345678-1234-1234-1234-123456789abc");
+        quickAuthPayload.put("addldivinf", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
         quickAuthPayload.put("source", "API");
+        quickAuthPayload.put("vc", vc);
+        quickAuthPayload.put("app_key", config.getClientId());
 
         String quickAuthBody = "jData=" + objectMapper.writeValueAsString(quickAuthPayload);
 
@@ -153,6 +138,8 @@ public class ShoonyaAuthenticator {
             quickAuthResponse = webClient.post()
                 .uri("/NorenWClientAPI/QuickAuth")
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .header("Origin", "https://api.shoonya.com")
+                .header("Referer", "https://api.shoonya.com/OAuthlogin/authorize/oauth?client_id=" + config.getClientId())
                 .body(BodyInserters.fromValue(quickAuthBody))
                 .retrieve()
                 .bodyToMono(String.class)
@@ -168,27 +155,19 @@ public class ShoonyaAuthenticator {
             throw new IllegalStateException("Shoonya Step 1 QuickAuth failed: " + quickAuthJson.path("emsg").asText());
         }
 
-        // Check if QuickAuth returned direct session tokens (Standard NorenAPI flow)
-        String directUserToken = quickAuthJson.path("susertoken").asText(null);
-        String directAccessToken = quickAuthJson.path("access_token").asText(null);
-        if (directAccessToken == null && directUserToken != null) {
-            directAccessToken = directUserToken;
-        } else if (directUserToken == null && directAccessToken != null) {
-            directUserToken = directAccessToken;
-        }
-
         String authCode = quickAuthJson.path("code").asText(null);
-
-        if (directAccessToken != null && !directAccessToken.isBlank() && (authCode == null || authCode.isBlank())) {
-            log.info("Shoonya QuickAuth returned direct session token.");
-            accessToken.set(directAccessToken);
-            sUserToken.set(directUserToken);
-            saveDiskSession(directAccessToken, directUserToken);
-            return directAccessToken;
-        }
-
         if (authCode == null || authCode.isBlank()) {
-            throw new IllegalStateException("Shoonya QuickAuth did not return an authorization code or session token");
+            // Check if direct token was returned
+            String directUserToken = quickAuthJson.path("susertoken").asText(null);
+            String directAccessToken = quickAuthJson.path("access_token").asText(null);
+            if (directAccessToken != null && !directAccessToken.isBlank()) {
+                accessToken.set(directAccessToken);
+                sUserToken.set(directUserToken != null ? directUserToken : directAccessToken);
+                saveDiskSession(directAccessToken, sUserToken.get());
+                log.info("Shoonya QuickAuth returned direct session token.");
+                return directAccessToken;
+            }
+            throw new IllegalStateException("Shoonya QuickAuth did not return an authorization code");
         }
         log.info("Shoonya Step 1 QuickAuth succeeded. Authorization code acquired.");
 

@@ -25,7 +25,7 @@ import java.util.concurrent.ConcurrentHashMap;
 public class CandleAggregator {
 
     private static final Logger log = LoggerFactory.getLogger(CandleAggregator.class);
-    private static final List<Integer> HIGHER_TIMEFRAMES = List.of(3, 5, 15);
+    private static final List<Integer> HIGHER_TIMEFRAMES = List.of(3, 5, 15, 60);
 
     // symbol -> (timeframe -> CircularCandleBuffer)
     private final Map<String, Map<String, CircularCandleBuffer>> buffers = new ConcurrentHashMap<>();

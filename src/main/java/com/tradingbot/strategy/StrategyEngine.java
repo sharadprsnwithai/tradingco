@@ -20,10 +20,12 @@ import reactor.core.scheduler.Schedulers;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -42,7 +44,7 @@ public class StrategyEngine {
 
     private final Map<String, Strategy> strategies = new ConcurrentHashMap<>();
     private final Map<String, ExecutorService> strategyExecutors = new ConcurrentHashMap<>();
-    private final Map<String, List<Strategy>> symbolToStrategies = new ConcurrentHashMap<>();
+    private volatile Map<String, List<Strategy>> symbolToStrategies = Map.of();
 
     // Reactive multicast sink for all generated trading signals
     private final Sinks.Many<Signal> signalSink = Sinks.many().multicast().directBestEffort();
@@ -237,12 +239,13 @@ public class StrategyEngine {
      * and mapping each subscribed symbol to its subscribing strategies.
      */
     private synchronized void updateSymbolIndex() {
-        symbolToStrategies.clear();
+        Map<String, List<Strategy>> newIndex = new HashMap<>();
         for (Strategy strategy : strategies.values()) {
             for (String symbol : strategy.getSubscribedSymbols()) {
-                symbolToStrategies.computeIfAbsent(symbol, k -> new ArrayList<>()).add(strategy);
+                newIndex.computeIfAbsent(symbol, k -> new CopyOnWriteArrayList<>()).add(strategy);
             }
         }
+        this.symbolToStrategies = Map.copyOf(newIndex);
     }
 
     /**

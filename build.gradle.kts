@@ -52,6 +52,9 @@ dependencies {
     // Zerodha Kite Connect SDK (KiteTicker WebSocket for real market data)
     implementation("com.zerodhatech.kiteconnect:kiteconnect:3.5.0")
 
+    // TA-Lib (Technical Analysis Library - Java wrapper)
+    implementation("com.tictactec:ta-lib:0.4.0")
+
     // Testing
     testImplementation("org.springframework.boot:spring-boot-starter-test")
     testImplementation("io.projectreactor:reactor-test")
@@ -90,4 +93,9 @@ tasks.register<JavaExec>("backtestVwap") {
 tasks.register<JavaExec>("backtestIronFly") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.tradingbot.backtest.IronFlyBacktestRunner")
+}
+
+tasks.register<JavaExec>("backtestStIntraday") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.tradingbot.backtest.IntradayTrendMomentumBacktestRunner")
 }
