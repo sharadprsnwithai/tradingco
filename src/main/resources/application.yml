@@ -30,7 +30,7 @@ trading-bot:
       # Optional: daily access token to skip headless login
       access-token: ${KITE_ACCESS_TOKEN:}
     shoonya:
-      enabled: ${SHOONYA_ENABLED:true}
+      enabled: ${SHOONYA_ENABLED:false}
       client-id: ${SHOONYA_CLIENT_ID:mock_shoonya_client}
       secret-key: ${SHOONYA_SECRET_KEY:mock_shoonya_secret}
       user-id: ${SHOONYA_USER_ID:mock_shoonya_user}
@@ -61,7 +61,7 @@ ironfly:
   hedge-profit-pct: ${IRONFLY_HEDGE_PROFIT:50}
 
 st-intraday:
-  enabled: ${ST_INTRADAY_ENABLED:false}
+  enabled: ${ST_INTRADAY_ENABLED:true}
   strategy-id: ${ST_INTRADAY_STRATEGY_ID:ST_INTRADAY_01}
   account-id: ${ST_INTRADAY_ACCOUNT_ID:KITE_USER_01}
   symbol: ${ST_INTRADAY_SYMBOL:NFO:NIFTY_50}
