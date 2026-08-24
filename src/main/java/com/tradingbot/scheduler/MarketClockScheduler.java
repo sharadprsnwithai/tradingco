@@ -301,13 +301,15 @@ public class MarketClockScheduler {
 
     /**
      * 15:00 PM IST: Hard Exit for Lowest Volume Reversal Strategy.
+     * Uses a strategy-specific event so it does not force VWAP / Option-Selling
+     * strategies to exit at 15:00 (those follow the 15:14 intraday square-off).
      */
     @Scheduled(cron = "0 0 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onHardExit() {
         if (!isTradingDay(clock.get())) return;
         log.warn("⚡ 15:00 IST: HARD EXIT — Closing all Lowest Volume Reversal positions");
 
-        strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.INTRADAY_SQUARE_OFF));
+        strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.LVR_HARD_EXIT));
         telegramBot.sendAlert("⚡ *Hard Exit (15:00 IST)*\n• Closing all open positions for Lowest Volume Reversal strategy").subscribe();
     }
 

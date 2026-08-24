@@ -25,6 +25,7 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
@@ -54,13 +55,17 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     private static final double BREAKEVEN_LOCK_POINTS = 0.0;
     private static final int MAX_ENTRIES_PER_DAY = 3;
     private static final int GRACE_CANDLES = 2;
-    private static final int IST_OFFSET_HOURS = 5;
-    private static final int IST_OFFSET_MINUTES = 30;
 
     private final String strategyId;
     private final String assignedAccountId;
     /** Configured fallback symbol, used in backtest/legacy mode (no instrument services). */
     private final String symbol;
+    /**
+     * Trigger tolerance (in underlying points). Adds hysteresis to the VWAP-cross entry,
+     * the VWAP-cross exit, and the 930/1100 bias snapshot so that tiny broker-feed
+     * differences (a few paise in OHLC) don't flip signals. 0 = exact (legacy) behaviour.
+     */
+    private final double triggerTolerance;
     private final KitePcrProvider kitePcrProvider;
     private final InstrumentMasterService instrumentMaster;
     private final LotSizeService lotSizeService;
@@ -91,6 +96,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         this.strategyId = strategyId;
         this.assignedAccountId = assignedAccountId;
         this.symbol = symbol;
+        this.triggerTolerance = 0.0;
         this.kitePcrProvider = kitePcrProvider;
         this.instrumentMaster = instrumentMaster;
         this.lotSizeService = lotSizeService;
@@ -101,16 +107,27 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     /**
      * Simple constructor for backtest (no Kite PCR, no instrument services — legacy mode
      * where the configured symbol's candles double as the premium series).
+     * @param triggerTolerance hysteresis band (underlying points) for VWAP-cross and bias.
      */
-    public NiftyVwapMomentumReversalStrategy(String strategyId, String assignedAccountId, String symbol) {
+    public NiftyVwapMomentumReversalStrategy(String strategyId, String assignedAccountId, String symbol,
+                                             double triggerTolerance) {
         this.strategyId = strategyId;
         this.assignedAccountId = assignedAccountId;
         this.symbol = symbol;
+        this.triggerTolerance = triggerTolerance;
         this.kitePcrProvider = null;
         this.instrumentMaster = null;
         this.lotSizeService = null;
         this.underlyingSymbol = symbol;
         this.symbols.add(symbol);
+    }
+
+    /**
+     * Simple constructor for backtest (no Kite PCR, no instrument services — legacy mode
+     * where the configured symbol's candles double as the premium series).
+     */
+    public NiftyVwapMomentumReversalStrategy(String strategyId, String assignedAccountId, String symbol) {
+        this(strategyId, assignedAccountId, symbol, 0.0);
     }
 
     /** Live mode = real instrument services available (option resolution + premium quotes). */
@@ -304,11 +321,12 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         Direction entryDir = null;
 
         if (daily.bias == Bias.BULLISH && isGreen) {
-            if (close > vwap && low < vwap) {
+            // Require close to clear VWAP by the tolerance band (avoids borderline-flip entries).
+            if (close > vwap + triggerTolerance && low < vwap) {
                 entryDir = Direction.LONG;
             }
         } else if (daily.bias == Bias.BEARISH && isRed) {
-            if (close < vwap && high > vwap) {
+            if (close < vwap - triggerTolerance && high > vwap) {
                 entryDir = Direction.SHORT;
             }
         }
@@ -405,12 +423,13 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
 
         // Rule A: VWAP cross exit (after grace period) — always evaluated on FUTURES candles.
         // tradeDirection tracks the BIAS side: LONG = bullish (bought CE), SHORT = bearish (bought PE).
+        // triggerTolerance requires a clear penetration so a single noisy wick can't flip the exit.
         if (daily.candlesSinceEntry > GRACE_CANDLES) {
-            if (daily.tradeDirection == Direction.LONG && close < vwap) {
+            if (daily.tradeDirection == Direction.LONG && close < vwap - triggerTolerance) {
                 exitTrade(exitPriceForCandle(close), "VWAP_CROSS_BELOW", candle.timestamp());
                 return;
             }
-            if (daily.tradeDirection == Direction.SHORT && close > vwap) {
+            if (daily.tradeDirection == Direction.SHORT && close > vwap + triggerTolerance) {
                 exitTrade(exitPriceForCandle(close), "VWAP_CROSS_ABOVE", candle.timestamp());
                 return;
             }
@@ -441,13 +460,19 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         double ltp = tick.ltp().doubleValue();
 
         // Live mode: both CE and PE are BOUGHT options — long-premium logic for both.
-        // Target is premium +40, stop is premium -20 (trailed to breakeven+5 when in profit).
+        // Target is premium +40, protective stop is premium -20, ALWAYS active (with
+        // breakeven trailing once halfway to target). VWAP cross is the candle-based exit.
         if (daily.longPremium) {
             if (ltp >= daily.entryPremium + TARGET_POINTS) {
                 exitTrade(ltp, "TARGET_HIT", tick.timestamp());
                 return;
             }
-            if (daily.candlesSinceEntry <= GRACE_CANDLES && ltp <= daily.entryPremium - INITIAL_SL_POINTS) {
+            // Breakeven trailing: once halfway to target, lock stop to entry.
+            if (ltp >= daily.entryPremium + TARGET_POINTS / 2.0
+                && daily.currentSlPremium < daily.entryPremium) {
+                daily.currentSlPremium = daily.entryPremium;
+            }
+            if (ltp <= daily.currentSlPremium) {
                 exitTrade(ltp, "INITIAL_SL_HIT", tick.timestamp());
                 return;
             }
@@ -458,24 +483,28 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         }
 
         if (daily.tradeDirection == Direction.LONG) {
-            // Check target
             if (ltp >= daily.entryPremium + TARGET_POINTS) {
                 exitTrade(ltp, "TARGET_HIT", tick.timestamp());
                 return;
             }
-            // Check initial SL (only during grace period — after that, VWAP cross is primary exit)
-            if (daily.candlesSinceEntry <= GRACE_CANDLES && ltp <= daily.entryPremium - INITIAL_SL_POINTS) {
+            if (ltp >= daily.entryPremium + TARGET_POINTS / 2.0
+                && daily.currentSlPremium < daily.entryPremium) {
+                daily.currentSlPremium = daily.entryPremium;
+            }
+            if (ltp <= daily.currentSlPremium) {
                 exitTrade(ltp, "INITIAL_SL_HIT", tick.timestamp());
                 return;
             }
         } else if (daily.tradeDirection == Direction.SHORT) {
-            // Check target
             if (ltp <= daily.entryPremium - TARGET_POINTS) {
                 exitTrade(ltp, "TARGET_HIT", tick.timestamp());
                 return;
             }
-            // Check initial SL (during grace period)
-            if (daily.candlesSinceEntry <= GRACE_CANDLES && ltp >= daily.entryPremium + INITIAL_SL_POINTS) {
+            if (ltp <= daily.entryPremium - TARGET_POINTS / 2.0
+                && daily.currentSlPremium > daily.entryPremium) {
+                daily.currentSlPremium = daily.entryPremium;
+            }
+            if (ltp >= daily.currentSlPremium) {
                 exitTrade(ltp, "INITIAL_SL_HIT", tick.timestamp());
                 return;
             }
@@ -559,7 +588,6 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         double entryPremium = 0;
         double entryUnderlying = 0;
         double currentSlPremium = 0;
-        double currentSlUnderlying = 0;
         java.time.Instant entryTime = null;
 
         // Live-mode option position state
@@ -580,10 +608,8 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
             if (longPremium || dir == Direction.LONG) {
                 // Bought option (or legacy long): stop below entry
                 this.currentSlPremium = entryPremium - INITIAL_SL_POINTS;
-                this.currentSlUnderlying = entryUnderlying;
             } else {
                 this.currentSlPremium = entryPremium + INITIAL_SL_POINTS;
-                this.currentSlUnderlying = entryUnderlying;
             }
         }
 
@@ -593,7 +619,6 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
             this.entryPremium = 0;
             this.entryUnderlying = 0;
             this.currentSlPremium = 0;
-            this.currentSlUnderlying = 0;
             this.entryTime = null;
             this.candlesSinceEntry = 0;
             this.activeOptionSymbol = null;
@@ -622,7 +647,6 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
             entryPremium = 0;
             entryUnderlying = 0;
             currentSlPremium = 0;
-            currentSlUnderlying = 0;
             entryTime = null;
             activeOptionSymbol = null;
             positionQty = 0;
@@ -673,9 +697,10 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
 
         // Bullish: Price up & PCR not declining (allowing small tolerance if flat)
         // Bearish: Price down & PCR not expanding (allowing small tolerance if flat)
-        if (daily.nifty1100 > daily.nifty930 && daily.pcr1100 >= daily.pcr930 - 0.01) {
+        // triggerTolerance adds hysteresis so a few-paise feed gap can't flip the bias.
+        if (daily.nifty1100 > daily.nifty930 + triggerTolerance && daily.pcr1100 >= daily.pcr930 - 0.01) {
             daily.bias = Bias.BULLISH;
-        } else if (daily.nifty1100 < daily.nifty930 && daily.pcr1100 <= daily.pcr930 + 0.01) {
+        } else if (daily.nifty1100 < daily.nifty930 - triggerTolerance && daily.pcr1100 <= daily.pcr930 + 0.01) {
             daily.bias = Bias.BEARISH;
         } else {
             daily.bias = Bias.NEUTRAL;
@@ -687,13 +712,25 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     // ========== Live Mode: Baseline Capture ==========
 
     /**
+     * Returns the most recent available candle for the underlying (live first, then
+     * historical fallback) so baseline snapshots still compute if the live feed is late.
+     */
+    private Optional<Candle> lastAvailableCandle() {
+        var last = context.getLastCandle(underlyingSymbol, TIMEFRAME);
+        if (last.isPresent()) return last;
+        List<Candle> hist = context.getHistoricalCandles(underlyingSymbol, TIMEFRAME, 1);
+        if (hist != null && !hist.isEmpty()) return Optional.of(hist.get(hist.size() - 1));
+        return Optional.empty();
+    }
+
+    /**
      * Captures 9:30 AM baseline: Nifty Futures price from last candle + PCR from NSE.
      */
     private void captureBaseline930() {
         if (context == null) return;
 
         // Get current Nifty Futures price from last candle
-        var lastCandle = context.getLastCandle(underlyingSymbol, TIMEFRAME);
+        var lastCandle = lastAvailableCandle();
         if (lastCandle.isEmpty()) {
             log.warn("[{}] No candle available for 9:30 baseline (underlying={})", strategyId, underlyingSymbol);
             return;
@@ -712,7 +749,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     private void captureBiasCheck1100() {
         if (context == null) return;
 
-        var lastCandle = context.getLastCandle(underlyingSymbol, TIMEFRAME);
+        var lastCandle = lastAvailableCandle();
         if (lastCandle.isEmpty()) {
             log.warn("[{}] No candle available for 11:00 bias check (underlying={})", strategyId, underlyingSymbol);
             return;

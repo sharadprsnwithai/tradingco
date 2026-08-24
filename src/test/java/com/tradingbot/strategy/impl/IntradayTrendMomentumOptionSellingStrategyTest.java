@@ -1,5 +1,7 @@
 package com.tradingbot.strategy.impl;
 
+import com.tradingbot.instrument.InstrumentMasterService;
+import com.tradingbot.marketdata.KitePcrProvider;
 import com.tradingbot.model.Candle;
 import com.tradingbot.model.Signal;
 import com.tradingbot.model.Tick;
@@ -9,6 +11,7 @@ import com.tradingbot.strategy.StrategyContext;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -18,6 +21,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 /**
  * Comprehensive unit tests for IntradayTrendMomentumOptionSellingStrategy.
@@ -469,6 +473,64 @@ class IntradayTrendMomentumOptionSellingStrategyTest {
         strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.MARKET_CLOSE));
         assertEquals(IntradayTrendMomentumOptionSellingStrategy.Position.FLAT, strategy.getPosition());
         assertEquals(0, strategy.getEntriesToday(), "Market close must reset entriesToday to 0");
+    }
+
+    @Test
+    void testReEntryUsesFreshLivePremiumAfterStopLoss() throws Exception {
+        // Regression: after a stop-loss, the stale post-exit premium used to block
+        // re-entry for the rest of the day. Re-entry must now refresh the premium
+        // from a live LTP quote so it can re-enter when the premium has recovered.
+        KitePcrProvider pcr = mock(KitePcrProvider.class);
+        when(pcr.fetchLtp("NFO:NIFTY_TEST_PE")).thenReturn(100.0);
+
+        IntradayTrendMomentumOptionSellingStrategy liveStrategy = new IntradayTrendMomentumOptionSellingStrategy(
+            "ST_REENTRY_LIVE", "ACC", "NIFTY_FUT",
+            7, 3.0, 14, 50.0, 0.20, 70.0, 30.0, 0.0, 1, "15:00", 3, 0,
+            List.of(), pcr, mock(InstrumentMasterService.class), null, null
+        );
+        List<Signal> signals = new ArrayList<>();
+        MockStrategyContext ctx = new MockStrategyContext(signals);
+        liveStrategy.init(ctx);
+
+        for (int i = 0; i < 25; i++) {
+            double p = 22000.0 + i * 50.0;
+            ctx.addCandle15m(createCandle("15", p, p + 20, p - 10, p + 10, i));
+            ctx.addCandle1h(createCandle("60", p, p + 40, p - 20, p + 30, i));
+        }
+
+        // WAIT_FOR_REENTRY with a stale high premium (300) that would block re-entry
+        setDaily(liveStrategy, "NFO:NIFTY_TEST_PE");
+
+        Candle c3 = createCandle("15", 23280, 23330, 23270, 23320, 28);
+        ctx.addCandle15m(c3);
+        liveStrategy.onCandle(c3);
+
+        assertEquals(IntradayTrendMomentumOptionSellingStrategy.Position.IN_TRADE, liveStrategy.getPosition());
+        assertEquals(1, signals.size());
+        assertEquals(SignalType.ENTRY_SHORT, signals.get(0).signalType());
+        assertTrue(signals.get(0).tag().contains("REENTRY"));
+    }
+
+    private static void setDaily(IntradayTrendMomentumOptionSellingStrategy s, String activeShort) throws Exception {
+        Field f = IntradayTrendMomentumOptionSellingStrategy.class.getDeclaredField("daily");
+        f.setAccessible(true);
+        Object daily = f.get(s);
+        setField(daily, "position", IntradayTrendMomentumOptionSellingStrategy.Position.WAIT_FOR_REENTRY);
+        setField(daily, "tradeDirection", IntradayTrendMomentumOptionSellingStrategy.Direction.BULLISH);
+        setField(daily, "activeShortSymbol", activeShort);
+        setField(daily, "entryPremium", 100.0);
+        setField(daily, "lastPremiumLtp", 300.0); // stale; would block re-entry without refresh
+        setField(daily, "slPrice", 130.0);
+        setField(daily, "positionQty", 25);
+        setField(daily, "candlesSinceExit", 5);
+        setField(daily, "entriesToday", 1);
+        setField(daily, "currentDate", "2023-11-15"); // match createCandle() epoch -> avoid new-day reset
+    }
+
+    private static void setField(Object obj, String name, Object value) throws Exception {
+        Field f = obj.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        f.set(obj, value);
     }
 
     private static Candle createCandle(String timeframe, double open, double high, double low, double close, int index) {

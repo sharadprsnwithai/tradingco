@@ -149,61 +149,59 @@ public class ShoonyaAuthenticator {
             throw new IllegalStateException("Shoonya QuickAuth HTTP error: " + e.getStatusCode() + " - " + e.getResponseBodyAsString());
         }
 
-        log.info("Shoonya QuickAuth response: {}", quickAuthResponse);
-        JsonNode quickAuthJson = objectMapper.readTree(quickAuthResponse);
-        if (!"Ok".equalsIgnoreCase(quickAuthJson.path("stat").asText())) {
-            throw new IllegalStateException("Shoonya Step 1 QuickAuth failed: " + quickAuthJson.path("emsg").asText());
-        }
-
-        String authCode = quickAuthJson.path("code").asText(null);
-        if (authCode == null || authCode.isBlank()) {
-            // Check if direct token was returned
-            String directUserToken = quickAuthJson.path("susertoken").asText(null);
-            String directAccessToken = quickAuthJson.path("access_token").asText(null);
-            if (directAccessToken != null && !directAccessToken.isBlank()) {
-                accessToken.set(directAccessToken);
-                sUserToken.set(directUserToken != null ? directUserToken : directAccessToken);
-                saveDiskSession(directAccessToken, sUserToken.get());
-                log.info("Shoonya QuickAuth returned direct session token.");
-                return directAccessToken;
-            }
-            throw new IllegalStateException("Shoonya QuickAuth did not return an authorization code");
-        }
-        log.info("Shoonya Step 1 QuickAuth succeeded. Authorization code acquired.");
-
-        // Step 2: Exchange auth code via /GenAcsTok
-        String checksum = DigestUtils.sha256Hex(config.getClientId() + config.getSecretKey() + authCode);
-        Map<String, String> genAcsPayload = Map.of("code", authCode, "checksum", checksum);
-        String genAcsBody = "jData=" + objectMapper.writeValueAsString(genAcsPayload);
-
-        String genAcsResponse;
-        try {
-            genAcsResponse = webClient.post()
-                .uri("/NorenWClientAPI/GenAcsTok")
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .body(BodyInserters.fromValue(genAcsBody))
-                .retrieve()
-                .bodyToMono(String.class)
-                .block();
-        } catch (WebClientResponseException e) {
-            log.error("Shoonya GenAcsTok HTTP {}: {}", e.getStatusCode(), e.getResponseBodyAsString());
-            throw new IllegalStateException("Shoonya GenAcsTok HTTP error: " + e.getStatusCode() + " - " + e.getResponseBodyAsString());
-        }
-
-        log.info("Shoonya GenAcsTok response: {}", genAcsResponse);
-        JsonNode genAcsJson = objectMapper.readTree(genAcsResponse);
-        if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
-            throw new IllegalStateException("Shoonya Step 2 GenAcsTok failed: " + genAcsJson.path("emsg").asText());
-        }
-
-        String token = genAcsJson.path("access_token").asText(genAcsJson.path("susertoken").asText());
-        String userToken = genAcsJson.path("susertoken").asText(token);
-        accessToken.set(token);
-        sUserToken.set(userToken);
-        saveDiskSession(token, userToken);
-        log.info("Shoonya Step 2 GenAcsTok succeeded. Session token cached.");
-        return token;
+    log.info("Shoonya QuickAuth response: {}", quickAuthResponse);
+    JsonNode quickAuthJson = objectMapper.readTree(quickAuthResponse);
+    if (!"Ok".equalsIgnoreCase(quickAuthJson.path("stat").asText())) {
+        throw new IllegalStateException("Shoonya Step 1 QuickAuth failed: " + quickAuthJson.path("emsg").asText());
     }
+
+    // The QuickAuth susertoken is NOT valid for REST calls. Always exchange the
+    // authorization code via GenAcsTok to obtain the real session token (susertoken).
+    String authCode = quickAuthJson.path("code").asText(null);
+    if (authCode == null || authCode.isBlank()) {
+        throw new IllegalStateException("Shoonya QuickAuth did not return an authorization code needed for GenAcsTok");
+    }
+    log.info("Shoonya Step 1 QuickAuth succeeded, auth code acquired");
+
+    // Step 2: GenAcsTok (only when code exchange required)
+    String checksum = DigestUtils.sha256Hex(config.getClientId() + config.getSecretKey() + authCode);
+    Map<String, String> genAcsPayload = Map.of(
+        "code", authCode,
+        "checksum", checksum
+    );
+
+    String genAcsBody = "jData=" + objectMapper.writeValueAsString(genAcsPayload);
+
+    String genAcsResponse;
+    try {
+        genAcsResponse = webClient.post()
+            .uri("/NorenWClientAPI/GenAcsTok")
+            .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+            .body(BodyInserters.fromValue(genAcsBody))
+            .retrieve()
+            .bodyToMono(String.class)
+            .block();
+    } catch (WebClientResponseException e) {
+        log.error("Shoonya GenAcsTok HTTP {}: {}", e.getStatusCode(), e.getResponseBodyAsString());
+        throw new IllegalStateException("Shoonya GenAcsTok HTTP error: " + e.getStatusCode() + " - " + e.getResponseBodyAsString());
+    }
+
+    log.info("Shoonya GenAcsTok response: {}", genAcsResponse);
+    JsonNode genAcsJson = objectMapper.readTree(genAcsResponse);
+    if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
+        throw new IllegalStateException("Shoonya Step 2 GenAcsTok failed: " + genAcsJson.path("emsg").asText());
+    }
+
+    String userToken = genAcsJson.path("susertoken").asText(genAcsJson.path("access_token").asText());
+    String token = genAcsJson.path("access_token").asText(userToken);
+    // NorenAPI REST calls authenticate with the session token (susertoken) as jKey.
+    // Prefer the susertoken for both the access token and the WebSocket session token.
+    accessToken.set(userToken);
+    sUserToken.set(userToken);
+    saveDiskSession(token, userToken);
+    log.info("Shoonya Step 2 GenAcsTok succeeded. Session token cached.");
+    return token;
+}
 
     /**
      * Gets the current access token, authenticating if necessary.

@@ -167,20 +167,79 @@ class LowestVolumeReversalStrategyTest {
     }
 
     @Test
-    void testHardExitAt1500() {
+    void testHardExitAt1500UsesLastTradedPriceNotHigh() {
         String sym = "NSE:RELIANCE";
         LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
         st.position = LowestVolumeReversalStrategy.TradePosition.IN_TRADE;
         st.direction = LowestVolumeReversalStrategy.Direction.LONG;
         st.remainingQuantity = 10;
-        st.highestPrice = new BigDecimal("3050");
+        st.highestPrice = new BigDecimal("3050");   // must NOT be used for exit price
+        st.lastLtp = new BigDecimal("3030");          // last traded price
+
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.LVR_HARD_EXIT));
+
+        assertEquals(1, emittedSignals.size());
+        Signal exit = emittedSignals.get(0);
+        assertEquals(SignalType.EXIT_LONG, exit.signalType());
+        assertEquals("LVR_EXIT_HARD_EXIT_15:00", exit.tag());
+        assertEquals(0, new BigDecimal("3030").compareTo(exit.price())); // uses lastLtp, not highestPrice
+        assertEquals(com.tradingbot.model.enums.OrderType.MARKET, exit.orderType());
+        assertEquals(com.tradingbot.model.enums.ProductType.MIS, exit.productType());
+        assertEquals(com.tradingbot.model.enums.BookType.INTRADAY, exit.bookType());
+        assertEquals(LowestVolumeReversalStrategy.TradePosition.FLAT, st.position);
+    }
+
+    @Test
+    void testHardExitShortUsesLastTradedPrice() {
+        String sym = "NSE:TCS";
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        st.position = LowestVolumeReversalStrategy.TradePosition.IN_TRADE;
+        st.direction = LowestVolumeReversalStrategy.Direction.SHORT;
+        st.remainingQuantity = 8;
+        st.highestPrice = new BigDecimal("3500");   // wrong price for a short exit
+        st.lastLtp = new BigDecimal("3440");          // last traded price
+
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.LVR_HARD_EXIT));
+
+        assertEquals(1, emittedSignals.size());
+        Signal exit = emittedSignals.get(0);
+        assertEquals(SignalType.EXIT_SHORT, exit.signalType());
+        assertEquals(0, new BigDecimal("3440").compareTo(exit.price())); // uses lastLtp
+        assertEquals(com.tradingbot.model.enums.OrderType.MARKET, exit.orderType());
+        assertEquals(com.tradingbot.model.enums.ProductType.MIS, exit.productType());
+        assertEquals(com.tradingbot.model.enums.BookType.INTRADAY, exit.bookType());
+    }
+
+    @Test
+    void testHardExitFallsBackToLastCandleWhenNoTick() {
+        String sym = "NSE:INFY";
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        st.position = LowestVolumeReversalStrategy.TradePosition.IN_TRADE;
+        st.direction = LowestVolumeReversalStrategy.Direction.LONG;
+        st.remainingQuantity = 5;
+        st.lastLtp = null; // no tick seen
+        st.dayCandles.add(c(sym, Instant.parse("2024-12-18T09:30:00Z"), 1500, 1510, 1490, 1505, 5000));
+
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.LVR_HARD_EXIT));
+
+        assertEquals(1, emittedSignals.size());
+        // Falls back to last candle close (1505), not highestPrice (null/0)
+        assertEquals(0, new BigDecimal("1505").compareTo(emittedSignals.get(0).price()));
+    }
+
+    @Test
+    void testIntradaySquareOffStillClosesPositions() {
+        String sym = "NSE:RELIANCE";
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        st.position = LowestVolumeReversalStrategy.TradePosition.IN_TRADE;
+        st.direction = LowestVolumeReversalStrategy.Direction.LONG;
+        st.remainingQuantity = 10;
+        st.lastLtp = new BigDecimal("3030");
 
         strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.INTRADAY_SQUARE_OFF));
 
         assertEquals(1, emittedSignals.size());
         assertEquals(SignalType.EXIT_LONG, emittedSignals.get(0).signalType());
-        assertEquals("LVR_EXIT_HARD_EXIT_15:00", emittedSignals.get(0).tag());
-        assertEquals(LowestVolumeReversalStrategy.TradePosition.FLAT, st.position);
     }
 
     @Test

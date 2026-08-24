@@ -111,12 +111,13 @@ public class ShoonyaHistoricalDataService {
                     ? authenticator.getSUserToken()
                     : accessToken;
 
+                String formBody = "jData=" + jDataStr + "&jKey=" + userKey;
+
                 Mono<List<Candle>> rawRequest = webClient.post()
                     .uri("/NorenWClientAPI/TPSeries")
                     .header("Authorization", accessToken)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                    .body(BodyInserters.fromFormData("jData", jDataStr)
-                        .with("jKey", userKey))
+                    .body(BodyInserters.fromValue(formBody))
                     .retrieve()
                     .bodyToMono(String.class)
                     .map(responseBody -> parseCandleResponse(responseBody, symbol, timeframe, numCandles))

@@ -4,12 +4,18 @@ import com.tradingbot.backtest.BacktestEngine;
 import com.tradingbot.backtest.BacktestResult;
 import com.tradingbot.backtest.BacktestTrade;
 import com.tradingbot.model.Candle;
+import com.tradingbot.model.Signal;
+import com.tradingbot.model.Tick;
+import com.tradingbot.model.enums.SignalType;
+import com.tradingbot.strategy.ScheduledEvent;
+import com.tradingbot.strategy.StrategyContext;
 import org.junit.jupiter.api.Test;
 
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -185,9 +191,109 @@ class NiftyVwapMomentumReversalStrategyTest {
 
     // ========== Helpers ==========
 
-    private static Candle c(String sym, Instant ts, double o, double h, double l, double c, long v) {
+    private static Candle c(String sym, Instant ts, double o, double h, double l, double cl, long v) {
         return new Candle(sym, "5", ts,
             BigDecimal.valueOf(o), BigDecimal.valueOf(h),
-            BigDecimal.valueOf(l), BigDecimal.valueOf(c), v);
+            BigDecimal.valueOf(l), BigDecimal.valueOf(cl), v);
+    }
+
+    @Test
+    void testStopLossActiveAfterGracePeriodLegacy() throws Exception {
+        // Regression: the -20pt stop must fire even after the grace period (previously disabled).
+        NiftyVwapMomentumReversalStrategy strategy = new NiftyVwapMomentumReversalStrategy(
+            "VWAP_SL", "ACC", SYM
+        );
+        List<Signal> emitted = new ArrayList<>();
+        strategy.init(recordSignalContext(emitted));
+
+        Object daily = setInTrade(strategy, NiftyVwapMomentumReversalStrategy.Direction.LONG, false, 5);
+
+        // Tick below the stop (80) well after the grace period -> INITIAL_SL_HIT
+        strategy.onTick(Tick.builder().symbol(SYM).ltp(new BigDecimal("75")).timestamp(Instant.now()).build());
+
+        assertEquals(1, emitted.size());
+        assertEquals(SignalType.EXIT_LONG, emitted.get(0).signalType());
+        assertTrue(emitted.get(0).tag().contains("INITIAL_SL_HIT"), emitted.get(0).tag());
+    }
+
+    @Test
+    void testStopLossActiveAfterGracePeriodLiveLongPremium() throws Exception {
+        // Same regression for the live (bought-option, longPremium) branch.
+        NiftyVwapMomentumReversalStrategy strategy = new NiftyVwapMomentumReversalStrategy(
+            "VWAP_SL_LIVE", "ACC", SYM
+        );
+        List<Signal> emitted = new ArrayList<>();
+        strategy.init(recordSignalContext(emitted));
+
+        Object daily = setInTrade(strategy, NiftyVwapMomentumReversalStrategy.Direction.LONG, true, 5);
+
+        strategy.onTick(Tick.builder().symbol(SYM).ltp(new BigDecimal("75")).timestamp(Instant.now()).build());
+
+        assertEquals(1, emitted.size());
+        assertEquals(SignalType.EXIT_LONG, emitted.get(0).signalType());
+        assertTrue(emitted.get(0).tag().contains("INITIAL_SL_HIT"), emitted.get(0).tag());
+    }
+
+    @Test
+    void testBiasComputedFromHistoricalFallbackWhenLiveCandleMissing() throws Exception {
+        // Regression: if the 9:30/11:00 snapshot has no live candle (warmup late),
+        // the bias must still be computed via historical fallback rather than staying NEUTRAL forever.
+        NiftyVwapMomentumReversalStrategy strategy = new NiftyVwapMomentumReversalStrategy(
+            "VWAP_BIAS", "ACC", SYM
+        );
+
+        java.util.concurrent.atomic.AtomicInteger call = new java.util.concurrent.atomic.AtomicInteger(0);
+        StrategyContext ctx = new StrategyContext() {
+            @Override public String getStrategyId() { return "VWAP_BIAS"; }
+            @Override public String getAssignedAccountId() { return "ACC"; }
+            @Override public void emitSignal(Signal s) {}
+            @Override public Optional<Candle> getLastCandle(String s, String tf) { return Optional.empty(); }
+            @Override public List<Candle> getHistoricalCandles(String s, String tf, int n) {
+                // First snapshot -> 24500, second snapshot -> 24540 (simulate price rise)
+                double close = call.getAndIncrement() == 0 ? 24500 : 24540;
+                return List.of(c(SYM, Instant.now(), close - 5, close + 5, close - 10, close, 1000));
+            }
+            @Override public double[] getClosePrices(String s, String tf) { return new double[0]; }
+            @Override public Instant now() { return Instant.now(); }
+        };
+        strategy.init(ctx);
+
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.VWAP_BASELINE_930));
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.VWAP_BIAS_CHECK_1100));
+
+        assertEquals(NiftyVwapMomentumReversalStrategy.Bias.BULLISH, strategy.getBias());
+    }
+
+    private static StrategyContext recordSignalContext(List<Signal> sink) {
+        return new StrategyContext() {
+            @Override public String getStrategyId() { return "VWAP"; }
+            @Override public String getAssignedAccountId() { return "ACC"; }
+            @Override public void emitSignal(Signal s) { sink.add(s); }
+            @Override public Optional<Candle> getLastCandle(String s, String tf) { return Optional.empty(); }
+            @Override public List<Candle> getHistoricalCandles(String s, String tf, int n) { return List.of(); }
+            @Override public double[] getClosePrices(String s, String tf) { return new double[0]; }
+            @Override public Instant now() { return Instant.now(); }
+        };
+    }
+
+    private static Object setInTrade(NiftyVwapMomentumReversalStrategy strategy,
+                                     NiftyVwapMomentumReversalStrategy.Direction dir,
+                                     boolean longPremium, int candlesSinceEntry) throws Exception {
+        java.lang.reflect.Field f = NiftyVwapMomentumReversalStrategy.class.getDeclaredField("daily");
+        f.setAccessible(true);
+        Object daily = f.get(strategy);
+        setField(daily, "position", NiftyVwapMomentumReversalStrategy.Position.IN_TRADE);
+        setField(daily, "tradeDirection", dir);
+        setField(daily, "entryPremium", 100.0);
+        setField(daily, "currentSlPremium", 80.0);
+        setField(daily, "longPremium", longPremium);
+        setField(daily, "candlesSinceEntry", candlesSinceEntry);
+        return daily;
+    }
+
+    private static void setField(Object obj, String name, Object value) throws Exception {
+        java.lang.reflect.Field f = obj.getClass().getDeclaredField(name);
+        f.setAccessible(true);
+        f.set(obj, value);
     }
 }

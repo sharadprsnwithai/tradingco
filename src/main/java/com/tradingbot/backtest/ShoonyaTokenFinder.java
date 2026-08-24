@@ -96,28 +96,36 @@ public class ShoonyaTokenFinder {
         String quickAuthBody = "jData=" + mapper.writeValueAsString(quickAuthPayload);
         String quickAuthResponse = postForm("https://api.shoonya.com/NorenWClientAPI/QuickAuth", quickAuthBody);
 
-        JsonNode quickAuthJson = mapper.readTree(quickAuthResponse);
-        if (!"Ok".equalsIgnoreCase(quickAuthJson.path("stat").asText())) {
-            throw new IllegalStateException("QuickAuth failed: " + quickAuthJson.path("emsg").asText());
-        }
-
-        String authCode = quickAuthJson.path("code").asText(null);
-        System.out.println("QuickAuth OK, auth code acquired");
-
-        String checksum = DigestUtils.sha256Hex(SHOONYA_CLIENT_ID + SHOONYA_SECRET_KEY + authCode);
-        Map<String, String> genAcsPayload = Map.of("code", authCode, "checksum", checksum);
-        String genAcsBody = "jData=" + mapper.writeValueAsString(genAcsPayload);
-
-        String genAcsResponse = postForm("https://api.shoonya.com/NorenWClientAPI/GenAcsTok", genAcsBody);
-        JsonNode genAcsJson = mapper.readTree(genAcsResponse);
-        if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
-            throw new IllegalStateException("GenAcsTok failed: " + genAcsJson.path("emsg").asText());
-        }
-
-        accessToken = genAcsJson.path("access_token").asText(genAcsJson.path("susertoken").asText());
-        sUserToken = genAcsJson.path("susertoken").asText(accessToken);
-        System.out.println("GenAcsTok OK, session acquired");
+    JsonNode quickAuthJson = mapper.readTree(quickAuthResponse);
+    if (!"Ok".equalsIgnoreCase(quickAuthJson.path("stat").asText())) {
+        throw new IllegalStateException("QuickAuth failed: " + quickAuthJson.path("emsg").asText());
     }
+
+    String directUserToken = quickAuthJson.path("susertoken").asText(null);
+    if (directUserToken != null && !directUserToken.isBlank()) {
+        accessToken = directUserToken;
+        sUserToken = directUserToken;
+        System.out.println("QuickAuth OK with direct session token, session acquired");
+        return;
+    }
+
+    String authCode = quickAuthJson.path("code").asText(null);
+    System.out.println("QuickAuth OK, auth code acquired");
+
+    String checksum = DigestUtils.sha256Hex(SHOONYA_CLIENT_ID + SHOONYA_SECRET_KEY + authCode);
+    Map<String, String> genAcsPayload = Map.of("code", authCode, "checksum", checksum);
+    String genAcsBody = "jData=" + mapper.writeValueAsString(genAcsPayload);
+
+    String genAcsResponse = postForm("https://api.shoonya.com/NorenWClientAPI/GenAcsTok", genAcsBody);
+    JsonNode genAcsJson = mapper.readTree(genAcsResponse);
+    if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
+        throw new IllegalStateException("GenAcsTok failed: " + genAcsJson.path("emsg").asText());
+    }
+
+    accessToken = genAcsJson.path("access_token").asText(genAcsJson.path("susertoken").asText());
+    sUserToken = genAcsJson.path("susertoken").asText(accessToken);
+    System.out.println("GenAcsTok OK, session acquired");
+}
 
     private static String postForm(String urlStr, String formData) throws Exception {
         HttpURLConnection conn = (HttpURLConnection) new URI(urlStr).toURL().openConnection();

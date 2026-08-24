@@ -159,6 +159,24 @@ public class ShoonyaBacktestRunner {
 
     // ========== Shoonya Authentication ==========
 
+    private static void saveDiskSession(String token, String userToken) {
+        try {
+            java.io.File sessionFile = new java.io.File("data/shoonya_session.json");
+            java.io.File parent = sessionFile.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+
+            Map<String, Object> sessionData = new HashMap<>();
+            sessionData.put("accessToken", token);
+            sessionData.put("susertoken", userToken);
+            sessionData.put("createdAt", Instant.now().toString());
+
+            mapper.writeValue(sessionFile, sessionData);
+            System.out.println("  -> Saved Shoonya session to data/shoonya_session.json");
+        } catch (Exception e) {
+            System.out.println("  -> Warning: Could not cache Shoonya session: " + e.getMessage());
+        }
+    }
+
     private static boolean authenticateWithExistingSession() {
         try {
             java.io.File sessionFile = new java.io.File("data/shoonya_session.json");
@@ -210,19 +228,25 @@ public class ShoonyaBacktestRunner {
         quickAuthPayload.put("vc", "NOREN_API");
         quickAuthPayload.put("app_key", SHOONYA_CLIENT_ID);
         String quickAuthBody = "jData=" + mapper.writeValueAsString(quickAuthPayload);
-        System.out.println("  -> QuickAuth payload: " + quickAuthBody.substring(0, Math.min(200, quickAuthBody.length())));
 
         String quickAuthResponse = postForm("https://api.shoonya.com/NorenWClientAPI/QuickAuth", quickAuthBody);
-        System.out.println("  -> QuickAuth response: " + quickAuthResponse.substring(0, Math.min(200, quickAuthResponse.length())));
-
         JsonNode quickAuthJson = mapper.readTree(quickAuthResponse);
         if (!"Ok".equalsIgnoreCase(quickAuthJson.path("stat").asText())) {
             throw new IllegalStateException("Shoonya QuickAuth failed: " + quickAuthJson.path("emsg").asText());
         }
 
+        String directUserToken = quickAuthJson.path("susertoken").asText(null);
+        if (directUserToken != null && !directUserToken.isBlank()) {
+            accessToken = directUserToken;
+            sUserToken = directUserToken;
+            saveDiskSession(directUserToken, directUserToken);
+            System.out.println("  -> Step 1: QuickAuth succeeded with direct session token, token cached");
+            return;
+        }
+
         String authCode = quickAuthJson.path("code").asText(null);
         if (authCode == null || authCode.isBlank()) {
-            throw new IllegalStateException("Shoonya QuickAuth did not return authorization code");
+            throw new IllegalStateException("Shoonya QuickAuth did not return authorization code or susertoken");
         }
         System.out.println("  -> Step 1: QuickAuth succeeded, auth code acquired");
 
@@ -232,8 +256,6 @@ public class ShoonyaBacktestRunner {
         String genAcsBody = "jData=" + mapper.writeValueAsString(genAcsPayload);
 
         String genAcsResponse = postForm("https://api.shoonya.com/NorenWClientAPI/GenAcsTok", genAcsBody);
-        System.out.println("  -> GenAcsTok response: " + genAcsResponse.substring(0, Math.min(200, genAcsResponse.length())));
-
         JsonNode genAcsJson = mapper.readTree(genAcsResponse);
         if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
             throw new IllegalStateException("Shoonya GenAcsTok failed: " + genAcsJson.path("emsg").asText());
@@ -241,6 +263,7 @@ public class ShoonyaBacktestRunner {
 
         accessToken = genAcsJson.path("access_token").asText(genAcsJson.path("susertoken").asText());
         sUserToken = genAcsJson.path("susertoken").asText(accessToken);
+        saveDiskSession(accessToken, sUserToken);
         System.out.println("  -> Step 2: GenAcsTok succeeded, session token acquired");
     }
 

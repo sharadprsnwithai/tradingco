@@ -20,6 +20,9 @@ import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -133,16 +136,19 @@ public class LowestVolumeReversalStrategy implements Strategy {
 
     @Override
     public void onTick(Tick tick) {
-        if (!enabled || tick == null || tick.symbol() == null) return;
+        if (!enabled || tick == null || tick.symbol() == null || tick.ltp() == null) return;
         SymbolState state = states.get(tick.symbol());
         if (state == null) return;
 
         synchronized (state) {
+            // Track last traded price for accurate EOD square-off pricing
+            state.lastLtp = tick.ltp();
+
             if (state.position == TradePosition.IN_TRADE) {
                 checkTickExits(state, tick.ltp());
-            } else if (state.position == TradePosition.FLAT 
-                && state.setupPhase == SetupPhase.WAITING_FOR_ENTRY 
-                && !entryLocked 
+            } else if (state.position == TradePosition.FLAT
+                && state.setupPhase == SetupPhase.WAITING_FOR_ENTRY
+                && !entryLocked
                 && dailyTradeCount < maxTradesPerDay) {
                 checkTickEntry(state, tick);
             }
@@ -192,6 +198,7 @@ public class LowestVolumeReversalStrategy implements Strategy {
                 this.entryLocked = true;
                 log.info("LowestVolumeReversalStrategy entry locked for the day");
             }
+            case ScheduledEvent.LVR_HARD_EXIT -> squareOffAllPositions();
             case ScheduledEvent.INTRADAY_SQUARE_OFF -> squareOffAllPositions();
             case ScheduledEvent.MARKET_CLOSE -> resetDailyStates();
         }
@@ -218,7 +225,9 @@ public class LowestVolumeReversalStrategy implements Strategy {
                     // Ensure symbol is in the subscribed list
                     if (!symbols.contains(symbol)) {
                         symbols.add(symbol);
-                        states.put(symbol, new SymbolState(symbol));
+                        SymbolState st = new SymbolState(symbol);
+                        states.put(symbol, st);
+                        seedFirstCandleOfDay(st, symbol);
                     }
                 }
 
@@ -228,7 +237,9 @@ public class LowestVolumeReversalStrategy implements Strategy {
                     // Ensure symbol is in the subscribed list
                     if (!symbols.contains(symbol)) {
                         symbols.add(symbol);
-                        states.put(symbol, new SymbolState(symbol));
+                        SymbolState st = new SymbolState(symbol);
+                        states.put(symbol, st);
+                        seedFirstCandleOfDay(st, symbol);
                     }
                 }
 
@@ -245,6 +256,49 @@ public class LowestVolumeReversalStrategy implements Strategy {
     }
 
     /**
+     * Seeds the first candle of the current trading day from historical data so the
+     * first-candle disqualification rule sees the real 09:15 open even though live
+     * subscription for this symbol only begins after the 09:26 stock-selection scan.
+     * Best-effort: if no historical candle for today is available yet, the rule will
+     * instead evaluate on the first live candle received.
+     */
+    private void seedFirstCandleOfDay(SymbolState state, String symbol) {
+        if (context == null) return;
+        try {
+            String today = ZonedDateTime.now(ZoneId.of("Asia/Kolkata")).format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+            List<Candle> hist = context.getHistoricalCandles(symbol, TIMEFRAME, 20);
+            if (hist == null) return;
+            Candle earliestToday = null;
+            for (Candle c : hist) {
+                if (c.timestamp() == null) continue;
+                String d = c.timestamp().atZone(ZoneId.of("Asia/Kolkata")).format(DateTimeFormatter.ofPattern("yyyy-MM-dd"));
+                if (today.equals(d)) {
+                    if (earliestToday == null || c.timestamp().isBefore(earliestToday.timestamp())) {
+                        earliestToday = c;
+                    }
+                }
+            }
+            if (earliestToday != null) {
+                state.firstCandleToday = earliestToday;
+                BigDecimal open = earliestToday.open();
+                BigDecimal close = earliestToday.close();
+                if (open.compareTo(BigDecimal.ZERO) > 0) {
+                    double movePercent = close.subtract(open).abs()
+                        .multiply(BigDecimal.valueOf(100))
+                        .divide(open, 2, java.math.RoundingMode.HALF_UP)
+                        .doubleValue();
+                    if (movePercent >= FIRST_CANDLE_DISQUALIFY_THRESHOLD) {
+                        log.info("[{}] DISQUALIFIED (seeded first candle) — moved {}%", symbol, movePercent);
+                        state.disqualified = true;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.debug("[{}] Could not seed first candle of day: {}", symbol, e.getMessage());
+        }
+    }
+
+    /**
      * Phase 1 & 2: Evaluates entry conditions on each closed 5m candle.
      * Detects momentum, identifies lowest-volume pullback, and triggers entry.
      */
@@ -252,8 +306,11 @@ public class LowestVolumeReversalStrategy implements Strategy {
         // Add candle to day's history
         state.dayCandles.add(candle);
 
-        // Phase 1: Disqualification — skip if first candle moves >5%
-        if (state.dayCandles.size() == 1) {
+        // Phase 1: Disqualification — skip if the first candle of the day moves >5%.
+        // Uses firstCandleToday (seeded historically at selection time or set on the first
+        // live candle) so the rule sees the real 09:15 open even though subscription starts late.
+        if (state.firstCandleToday == null) {
+            state.firstCandleToday = candle;
             BigDecimal open = candle.open();
             BigDecimal close = candle.close();
             if (open.compareTo(BigDecimal.ZERO) > 0) {
@@ -262,7 +319,7 @@ public class LowestVolumeReversalStrategy implements Strategy {
                     .divide(open, 2, java.math.RoundingMode.HALF_UP)
                     .doubleValue();
                 if (movePercent >= FIRST_CANDLE_DISQUALIFY_THRESHOLD) {
-                    log.info("[{}] DISQUALIFIED — First candle moved {:.1f}%", state.symbol, movePercent);
+                    log.info("[{}] DISQUALIFIED — First candle of day moved {}%", state.symbol, movePercent);
                     state.disqualified = true;
                     return;
                 }
@@ -469,6 +526,9 @@ public class LowestVolumeReversalStrategy implements Strategy {
                             .signalType(SignalType.EXIT_PARTIAL_LONG)
                             .quantity(partialQty)
                             .price(ltp)
+                            .orderType(OrderType.MARKET)
+                            .productType(ProductType.MIS)
+                            .bookType(BookType.INTRADAY)
                             .tag("LVR_PARTIAL_EXIT_1:2")
                             .build());
                         log.info("[{}] 50% PARTIAL PROFIT BOOKED at 1:2 RR @ {} — SL moved to breakeven", state.symbol, ltp);
@@ -502,6 +562,9 @@ public class LowestVolumeReversalStrategy implements Strategy {
                             .signalType(SignalType.EXIT_PARTIAL_SHORT)
                             .quantity(partialQty)
                             .price(ltp)
+                            .orderType(OrderType.MARKET)
+                            .productType(ProductType.MIS)
+                            .bookType(BookType.INTRADAY)
                             .tag("LVR_PARTIAL_EXIT_1:2")
                             .build());
                         log.info("[{}] 50% PARTIAL PROFIT BOOKED at 1:2 RR @ {} — SL moved to breakeven", state.symbol, ltp);
@@ -534,6 +597,9 @@ public class LowestVolumeReversalStrategy implements Strategy {
             .signalType(exitType)
             .quantity(state.remainingQuantity)
             .price(price)
+            .orderType(OrderType.MARKET)
+            .productType(ProductType.MIS)
+            .bookType(BookType.INTRADAY)
             .tag("LVR_EXIT_" + reason)
             .build());
 
@@ -543,16 +609,30 @@ public class LowestVolumeReversalStrategy implements Strategy {
 
     /**
      * Squares off all open positions at 15:00 IST hard exit.
+     * Uses the last traded price (tracked on each tick) so the exit fills at a
+     * realistic market price instead of the day's high.
      */
     private void squareOffAllPositions() {
         for (SymbolState state : states.values()) {
             synchronized (state) {
                 if (state.position == TradePosition.IN_TRADE) {
                     SignalType sig = (state.direction == Direction.LONG) ? SignalType.EXIT_LONG : SignalType.EXIT_SHORT;
-                    exitTrade(state, sig, state.highestPrice != null ? state.highestPrice : BigDecimal.ZERO, "HARD_EXIT_15:00");
+                    BigDecimal exitPrice = state.lastLtp != null ? state.lastLtp : lastCloseFor(state);
+                    exitTrade(state, sig, exitPrice, "HARD_EXIT_15:00");
                 }
             }
         }
+    }
+
+    /** Fallback exit price from the most recent candle close when no tick has arrived. */
+    private BigDecimal lastCloseFor(SymbolState state) {
+        if (context != null) {
+            var last = context.getLastCandle(state.symbol, TIMEFRAME);
+            if (last.isPresent()) return last.get().close();
+        }
+        return state.dayCandles.isEmpty()
+            ? BigDecimal.ZERO
+            : state.dayCandles.get(state.dayCandles.size() - 1).close();
     }
 
     /**
@@ -630,6 +710,11 @@ public class LowestVolumeReversalStrategy implements Strategy {
         public boolean partialExitBooked;
         public int remainingQuantity;
 
+        /** Last traded price seen on a tick — used for accurate EOD square-off. */
+        public BigDecimal lastLtp = null;
+        /** First candle of the current trading day (for first-candle disqualification). */
+        public Candle firstCandleToday = null;
+
         public SymbolState(String symbol) {
             this.symbol = symbol;
         }
@@ -668,6 +753,8 @@ public class LowestVolumeReversalStrategy implements Strategy {
             resetTrade();
             this.dayCandles.clear();
             this.disqualified = false;
+            this.firstCandleToday = null;
+            this.lastLtp = null;
         }
     }
 }

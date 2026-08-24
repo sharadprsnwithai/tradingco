@@ -99,7 +99,7 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         @Value("${st-intraday.risk.stop-loss-pct:30.0}") double stopLossPct,
         @Value("${st-intraday.risk.profit-target-pct:0.0}") double profitTargetPct,
         @Value("${st-intraday.lots:1}") int lots,
-        @Value("${st-intraday.eod-exit-time:15:20}") String eodExitTime,
+        @Value("${st-intraday.eod-exit-time:15:00}") String eodExitTime,
         @Value("${st-intraday.re-entry-cooldown-candles:3}") int reEntryCooldownCandles,
         @Value("${st-intraday.risk.max-trades-per-day:${st-intraday.max-trades-per-day:0}}") int maxTradesPerDay,
         @Value("${st-intraday.blackout-days:}") List<String> blackoutDays,
@@ -380,13 +380,10 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             strategyId, direction, bullishSuperTrend ? "BULLISH" : "BEARISH",
             Math.abs(lastSuperTrend), rsi1h);
 
-        // Check cooldown for re-entry
-        if (daily.position == Position.WAIT_FOR_REENTRY) {
-            if (daily.tradeDirection == direction && daily.candlesSinceExit < reEntryCooldownCandles) {
-                log.debug("[{}] In cooldown, skipping re-entry", strategyId);
-                return; // still in cooldown
-            }
-        }
+        // Note: re-entry after a stop-out is handled exclusively by checkReEntry()
+        // (Position.WAIT_FOR_REENTRY), which enforces its own cooldown + direction
+        // re-validation. evaluateEntry only runs when Position.FLAT, so it must not
+        // re-apply the re-entry guard here.
 
         // Check daily max trades limit (0 or negative means unlimited)
         if (maxTradesPerDay > 0 && daily.entriesToday >= maxTradesPerDay) {
@@ -775,7 +772,13 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             return;
         }
 
-        // Check if premium has dropped back to entry price
+        // Check if premium has dropped back to entry price. In live mode, refresh the
+        // last known premium from a fresh LTP quote so the re-entry SL isn't based on a
+        // stale post-exit price.
+        if (isLiveMode() && daily.activeShortSymbol != null && kitePcrProvider != null) {
+            double ltp = kitePcrProvider.fetchLtp(daily.activeShortSymbol);
+            if (ltp > 0) daily.lastPremiumLtp = ltp;
+        }
         double currentCheckPremium = isLiveMode() ? daily.lastPremiumLtp : daily.currentPremium;
         if (currentCheckPremium > 0 && currentCheckPremium <= daily.entryPremium * 1.02) {
             log.info("[{}] RE-ENTRY: {} @ ₹{} (was ₹{})",

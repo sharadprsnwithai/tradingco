@@ -99,3 +99,8 @@ tasks.register<JavaExec>("backtestStIntraday") {
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.tradingbot.backtest.IntradayTrendMomentumBacktestRunner")
 }
+
+tasks.register<JavaExec>("backtestAllIntraday") {
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.tradingbot.backtest.IntradayAllBacktestRunner")
+}
