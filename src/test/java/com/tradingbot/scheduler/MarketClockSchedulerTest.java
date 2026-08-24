@@ -4,6 +4,7 @@ import com.tradingbot.adapter.BrokerAdapterRegistry;
 import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.instrument.InstrumentSyncService;
 import com.tradingbot.marketdata.CandleAggregator;
+import com.tradingbot.marketdata.KiteHistoricalDataService;
 import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.marketdata.ShoonyaHistoricalDataService;
 import com.tradingbot.position.PositionManagerService;
@@ -32,6 +33,7 @@ class MarketClockSchedulerTest {
     private BrokerAdapterRegistry brokerRegistry;
     private MarketDataHub marketDataHub;
     private ShoonyaHistoricalDataService historicalDataService;
+    private KiteHistoricalDataService kiteHistoricalDataService;
     private InstrumentMasterService instrumentMaster;
     private InstrumentSyncService instrumentSyncService;
     private TelegramBotService telegramBot;
@@ -47,6 +49,7 @@ class MarketClockSchedulerTest {
         brokerRegistry = mock(BrokerAdapterRegistry.class);
         marketDataHub = mock(MarketDataHub.class);
         historicalDataService = mock(ShoonyaHistoricalDataService.class);
+        kiteHistoricalDataService = mock(KiteHistoricalDataService.class);
         instrumentMaster = mock(InstrumentMasterService.class);
         instrumentSyncService = mock(InstrumentSyncService.class);
         telegramBot = mock(TelegramBotService.class);
@@ -56,6 +59,7 @@ class MarketClockSchedulerTest {
         when(brokerRegistry.getAll()).thenReturn(Flux.empty());
         when(strategyEngine.getRegisteredStrategies()).thenReturn(List.of());
         when(historicalDataService.warmupSequentially(anyList())).thenReturn(Flux.empty());
+        when(kiteHistoricalDataService.warmupSequentially(anyList())).thenReturn(Flux.empty());
         when(marketDataHub.getCandleAggregator()).thenReturn(new CandleAggregator());
         when(positionManager.executeEodIntradaySquareOff()).thenReturn(Mono.empty());
         when(instrumentSyncService.syncFromKite()).thenReturn(Mono.just(0));
@@ -70,6 +74,7 @@ class MarketClockSchedulerTest {
             brokerRegistry,
             marketDataHub,
             historicalDataService,
+            kiteHistoricalDataService,
             instrumentMaster,
             instrumentSyncService,
             telegramBot,

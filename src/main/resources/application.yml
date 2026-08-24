@@ -5,6 +5,13 @@ server:
 logging:
   level:
     com.tradingbot: DEBUG
+  file:
+    name: ${LOGGING_FILE_NAME:${LOG_FILE:logs/trading-bot.log}}
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 10
+      total-size-cap: 100MB
 
 spring:
   application:
@@ -94,7 +101,8 @@ bot:
     silence-threshold-seconds: ${SILENCE_THRESHOLD_SECONDS:3}
   calendar:
     # NSE trading holidays (official 2026 list). Override via NSE_HOLIDAYS env.
-    holidays: ${NSE_HOLIDAYS:2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25}
+    holidays: >-
+      ${NSE_HOLIDAYS:2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25}
   strategies:
     lowest-volume-reversal:
       id: ${LVR_STRATEGY_ID:LOWEST_VOL_REV_01}

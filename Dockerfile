@@ -24,10 +24,10 @@ RUN apk add --no-cache curl tzdata && \
     cp /usr/share/zoneinfo/Asia/Kolkata /etc/localtime && \
     echo "Asia/Kolkata" > /etc/timezone
 
-# Create non-root system user (UID 10001) and allocate data directory for SQLite & sessions
+# Create non-root system user (UID 10001) and allocate data and log directories
 RUN addgroup -g 10001 -S appgroup && \
     adduser -u 10001 -S appuser -G appgroup && \
-    mkdir -p /app/data && \
+    mkdir -p /app/data /app/logs && \
     chown -R 10001:10001 /app
 
 # Copy executable jar from builder stage
@@ -42,7 +42,7 @@ EXPOSE 3000
 ENV JAVA_OPTS="-XX:+UseSerialGC -Xms256m -Xmx384m -XX:+ExitOnOutOfMemoryError -Duser.timezone=Asia/Kolkata -Djava.security.egd=file:/dev/./urandom"
 ENV SERVER_PORT=3000
 
-VOLUME ["/app/data"]
+VOLUME ["/app/data", "/app/logs"]
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
   CMD ["curl", "-f", "http://localhost:3000/actuator/health"]

@@ -11,11 +11,13 @@ services:
       - "${SERVER_PORT:-3000}:3000"
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
     env_file:
       - .env
     environment:
       - SERVER_PORT=3000
       - INSTRUMENT_DB_PATH=/app/data/instruments.db
+      - LOGGING_FILE_NAME=/app/logs/trading-bot.log
       - >-
         JAVA_OPTS=-Dserver.port=3000 -XX:+UseSerialGC -Xms256m -Xmx384m
         -XX:+ExitOnOutOfMemoryError -Duser.timezone=Asia/Kolkata
@@ -54,8 +56,14 @@ services:
     user: root
     volumes:
       - ./data:/app/data
-    command: ["sh", "-c", "chown -R 10001:10001 /app/data && chmod -R 777 /app/data"]
-
+      - ./logs:/app/logs
+    command:
+      - "sh"
+      - "-c"
+      - >-
+        mkdir -p /app/data /app/logs &&
+        chown -R 10001:10001 /app/data /app/logs &&
+        chmod -R 777 /app/data /app/logs
 
   ngrok:
     container_name: trading-bot-ngrok

@@ -4,6 +4,7 @@ import com.tradingbot.adapter.BrokerAdapter;
 import com.tradingbot.adapter.BrokerAdapterRegistry;
 import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.instrument.InstrumentSyncService;
+import com.tradingbot.marketdata.KiteHistoricalDataService;
 import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.marketdata.ShoonyaHistoricalDataService;
 import com.tradingbot.model.Instrument;
@@ -16,6 +17,7 @@ import com.tradingbot.strategy.ironfly.IronFlyService;
 import com.tradingbot.telegram.TelegramBotService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
@@ -46,6 +48,7 @@ public class MarketClockScheduler {
     private final BrokerAdapterRegistry brokerRegistry;
     private final MarketDataHub marketDataHub;
     private final ShoonyaHistoricalDataService historicalDataService;
+    private final KiteHistoricalDataService kiteHistoricalDataService;
     private final InstrumentMasterService instrumentMaster;
     private final InstrumentSyncService instrumentSyncService;
     private final TelegramBotService telegramBot;
@@ -65,6 +68,7 @@ public class MarketClockScheduler {
         BrokerAdapterRegistry brokerRegistry,
         MarketDataHub marketDataHub,
         ShoonyaHistoricalDataService historicalDataService,
+        @Autowired(required = false) KiteHistoricalDataService kiteHistoricalDataService,
         InstrumentMasterService instrumentMaster,
         InstrumentSyncService instrumentSyncService,
         TelegramBotService telegramBot,
@@ -77,6 +81,7 @@ public class MarketClockScheduler {
         this.brokerRegistry = brokerRegistry;
         this.marketDataHub = marketDataHub;
         this.historicalDataService = historicalDataService;
+        this.kiteHistoricalDataService = kiteHistoricalDataService;
         this.instrumentMaster = instrumentMaster;
         this.instrumentSyncService = instrumentSyncService;
         this.telegramBot = telegramBot;
@@ -169,8 +174,30 @@ public class MarketClockScheduler {
     @Scheduled(cron = "0 5 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onPreMarketWarmup() {
         if (!isTradingDay(clock.get())) return;
-        log.info("⏰ 09:05 IST: Triggering Historical Indicator Warm-Up (350ms Sequential Throttle)");
+        log.info("⏰ 09:05 IST: Triggering Multi-Timeframe Historical Warm-Up (Kite & Shoonya)");
 
+        // 1. Kite Multi-Timeframe Warmup (5m, 15m, 60m)
+        List<KiteHistoricalDataService.KiteWarmupRequest> kiteRequests = new ArrayList<>();
+        for (Strategy s : strategyEngine.getRegisteredStrategies()) {
+            if (s.isEnabled()) {
+                for (String sym : s.getSubscribedSymbols()) {
+                    kiteRequests.add(new KiteHistoricalDataService.KiteWarmupRequest(sym, "5", 50));
+                    kiteRequests.add(new KiteHistoricalDataService.KiteWarmupRequest(sym, "15", 50));
+                    kiteRequests.add(new KiteHistoricalDataService.KiteWarmupRequest(sym, "60", 30));
+                }
+            }
+        }
+        if (kiteHistoricalDataService != null && !kiteRequests.isEmpty()) {
+            kiteHistoricalDataService.warmupSequentially(kiteRequests)
+                .doOnNext(res -> {
+                    if (res.success()) {
+                        marketDataHub.getCandleAggregator().seedCandles(res.symbol(), res.timeframe(), res.candles());
+                    }
+                })
+                .subscribe();
+        }
+
+        // 2. Shoonya Warmup (if enabled)
         List<ShoonyaHistoricalDataService.HistoricalWarmupRequest> requests = new ArrayList<>();
         for (Strategy s : strategyEngine.getRegisteredStrategies()) {
             if (s.isEnabled()) {
@@ -181,8 +208,10 @@ public class MarketClockScheduler {
                     if (token != null && !token.isBlank()) {
                         String exchange = sym.startsWith("NSE:") ? "NSE" : "NFO";
                         requests.add(new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "5", 50));
+                        requests.add(new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "15", 50));
+                        requests.add(new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "60", 30));
                     } else {
-                        log.warn("No Shoonya token found for {}, skipping warmup", sym);
+                        log.warn("No Shoonya token found for {}, skipping Shoonya warmup", sym);
                     }
                 }
             }
@@ -196,12 +225,9 @@ public class MarketClockScheduler {
             })
             .subscribe();
 
-        telegramBot.sendAlert("📊 *Indicator Warm-Up Initiated (09:05 IST)*\n• Warming up " + requests.size() + " symbol historical buffers via Shoonya TPSeries").subscribe();
+        telegramBot.sendAlert("⏰ *Indicator Warm-Up Initiated (09:05 IST)*\n• Warming up multi-timeframe candle buffers (5m, 15m, 1h) for indicators (SuperTrend, RSI, VWAP)").subscribe();
     }
 
-    /**
-     * 09:15 AM IST: Market Open Trigger.
-     */
     @Scheduled(cron = "0 15 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onMarketOpen() {
         if (!isTradingDay(clock.get())) return;

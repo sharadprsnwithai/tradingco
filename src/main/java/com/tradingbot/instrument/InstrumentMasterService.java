@@ -18,6 +18,8 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.time.LocalDate;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -272,6 +274,42 @@ public class InstrumentMasterService {
     }
 
     /**
+     * Finds upcoming distinct expiry dates for an underlying and instrument type (sorted ascending).
+     *
+     * @param name           underlying name (e.g. "NIFTY")
+     * @param instrumentType "CE", "PE", or "FUT"
+     * @param limit          maximum number of upcoming expiry dates to return
+     * @return a Flux of distinct expiry date strings (YYYY-MM-DD)
+     */
+    public Flux<String> findUpcomingExpiries(String name, String instrumentType, int limit) {
+        return Mono.fromCallable(() -> {
+            List<String> expiries = new ArrayList<>();
+            String todayStr = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
+            String sql = """
+                SELECT DISTINCT expiry FROM instruments
+                WHERE name = ? AND instrument_type = ? AND expiry >= ?
+                ORDER BY expiry ASC LIMIT ?
+                """;
+            try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, name);
+                ps.setString(2, instrumentType);
+                ps.setString(3, todayStr);
+                ps.setInt(4, limit > 0 ? limit : 5);
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String exp = rs.getString("expiry");
+                        if (exp != null && !exp.isBlank()) {
+                            expiries.add(exp);
+                        }
+                    }
+                }
+            }
+            return expiries;
+        }).subscribeOn(Schedulers.boundedElastic())
+          .flatMapMany(Flux::fromIterable);
+    }
+
+    /**
      * Finds the nearest-expiry instrument of a given type for an underlying
      * (e.g. name="NIFTY", instrumentType="FUT" for the current NIFTY futures contract).
      * Only expiries on or after today (IST) are considered.
@@ -282,14 +320,16 @@ public class InstrumentMasterService {
      */
     public Mono<Instrument> findNearestExpiring(String name, String instrumentType) {
         return Mono.fromCallable(() -> {
+            String todayStr = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
             String sql = """
                 SELECT * FROM instruments
-                WHERE name = ? AND instrument_type = ? AND expiry >= date('now', 'localtime')
+                WHERE name = ? AND instrument_type = ? AND expiry >= ?
                 ORDER BY expiry ASC LIMIT 1
                 """;
             try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, name);
                 ps.setString(2, instrumentType);
+                ps.setString(3, todayStr);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
                         Instrument inst = mapRow(rs);
@@ -314,19 +354,22 @@ public class InstrumentMasterService {
      */
     public Mono<Instrument> findNearestAtmOption(String name, double refPrice, String optionType) {
         return Mono.fromCallable(() -> {
+            String todayStr = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
             String sql = """
                 SELECT * FROM instruments
-                WHERE name = ? AND instrument_type = ? AND expiry >= date('now', 'localtime')
+                WHERE name = ? AND instrument_type = ? AND expiry >= ?
                   AND expiry = (SELECT MIN(expiry) FROM instruments
-                                 WHERE name = ? AND instrument_type = ? AND expiry >= date('now', 'localtime'))
+                                 WHERE name = ? AND instrument_type = ? AND expiry >= ?)
                 ORDER BY ABS(strike - ?) ASC LIMIT 1
                 """;
             try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, name);
                 ps.setString(2, optionType);
-                ps.setString(3, name);
-                ps.setString(4, optionType);
-                ps.setDouble(5, refPrice);
+                ps.setString(3, todayStr);
+                ps.setString(4, name);
+                ps.setString(5, optionType);
+                ps.setString(6, todayStr);
+                ps.setDouble(7, refPrice);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
                         Instrument inst = mapRow(rs);

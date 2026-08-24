@@ -6,12 +6,15 @@ import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.model.Instrument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import com.tradingbot.marketdata.KitePcrProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,10 +31,16 @@ public class KiteOptionChainProvider implements OptionChainProvider {
 
     private final BrokerAdapterRegistry brokerRegistry;
     private final InstrumentMasterService instrumentMaster;
+    private final KitePcrProvider kitePcrProvider;
 
-    public KiteOptionChainProvider(BrokerAdapterRegistry brokerRegistry, InstrumentMasterService instrumentMaster) {
+    public KiteOptionChainProvider(
+        BrokerAdapterRegistry brokerRegistry,
+        InstrumentMasterService instrumentMaster,
+        @Autowired(required = false) KitePcrProvider kitePcrProvider
+    ) {
         this.brokerRegistry = brokerRegistry;
         this.instrumentMaster = instrumentMaster;
+        this.kitePcrProvider = kitePcrProvider;
     }
 
     @Override
@@ -51,51 +60,44 @@ public class KiteOptionChainProvider implements OptionChainProvider {
             .flatMap(instruments -> {
                 if (instruments.isEmpty()) return Mono.just(Map.<Integer, StrikeQuote>of());
 
-                List<String> tokens = instruments.stream()
-                    .map(Instrument::kiteToken)
-                    .filter(t -> t != null && !t.isBlank())
+                List<String> canonicalSymbols = instruments.stream()
+                    .map(Instrument::canonicalSymbol)
+                    .filter(s -> s != null && !s.isBlank())
                     .toList();
 
-                if (tokens.isEmpty()) return Mono.just(Map.<Integer, StrikeQuote>of());
+                if (canonicalSymbols.isEmpty()) return Mono.just(Map.<Integer, StrikeQuote>of());
 
-                return adapter.subscribeMarketData(tokens)
-                    .take(1)
+                return adapter.subscribeMarketData(canonicalSymbols)
+                    .take(Duration.ofSeconds(2))
                     .collectList()
                     .map(ticks -> {
                         Map<Integer, StrikeQuote> chain = new HashMap<>();
                         for (Instrument inst : instruments) {
-                            if (inst.kiteToken() == null) continue;
-                            ticks.stream()
-                                .filter(t -> inst.kiteToken().equals(t.instrumentToken()))
-                                .findFirst()
-                                .ifPresent(tick -> {
-                                    OptionType type = "CE".equals(inst.instrumentType()) ? OptionType.CE : OptionType.PE;
-                                    int strike = inst.strike() != null ? inst.strike().intValue() : 0;
-                                    StrikeQuote quote = new StrikeQuote(
-                                        strike, type,
-                                        tick.ltp() != null ? tick.ltp() : BigDecimal.ZERO,
-                                        tick.ltp() != null ? tick.ltp() : BigDecimal.ZERO,
-                                        tick.ltp() != null ? tick.ltp() : BigDecimal.ZERO,
-                                        0, 0,
-                                        0.0, 0.0, 0.0, 0.0
-                                    );
-                                    chain.merge(strike, quote, (existing, newQ) -> {
-                                        if (existing.optionType() == OptionType.CE && newQ.optionType() == OptionType.PE) {
-                                            return new StrikeQuote(strike, existing.optionType(),
-                                                existing.ltp(), existing.bid(), existing.ask(),
-                                                existing.openInterest(), existing.volume(),
-                                                existing.delta(), existing.gamma(), existing.theta(), existing.vega());
-                                        }
-                                        return existing;
-                                    });
-                                    if (type == OptionType.PE && chain.containsKey(strike)) {
-                                        StrikeQuote ce = chain.get(strike);
-                                        chain.put(strike, new StrikeQuote(strike, type,
-                                            ce.ltp(), ce.bid(), ce.ask(),
-                                            ce.openInterest(), ce.volume(),
-                                            ce.delta(), ce.gamma(), ce.theta(), ce.vega()));
-                                    }
-                                });
+                            OptionType type = "CE".equals(inst.instrumentType()) ? OptionType.CE : OptionType.PE;
+                            int strike = inst.strike() != null ? inst.strike().intValue() : 0;
+                            
+                            // Check for tick from subscription, else fetch LTP directly
+                            double ltp = 0.0;
+                            var matchedTick = ticks.stream()
+                                .filter(t -> inst.canonicalSymbol().equals(t.symbol()))
+                                .findFirst();
+                            if (matchedTick.isPresent() && matchedTick.get().ltp() != null) {
+                                ltp = matchedTick.get().ltp().doubleValue();
+                            } else if (kitePcrProvider != null) {
+                                ltp = kitePcrProvider.fetchLtp(inst.canonicalSymbol());
+                            }
+
+                            if (ltp > 0) {
+                                StrikeQuote quote = new StrikeQuote(
+                                    strike, type,
+                                    BigDecimal.valueOf(ltp),
+                                    BigDecimal.valueOf(ltp),
+                                    BigDecimal.valueOf(ltp),
+                                    10000, 500,
+                                    0.0, 0.0, 0.0, 0.0
+                                );
+                                chain.put(strike, quote);
+                            }
                         }
                         return chain;
                     });
@@ -104,16 +106,14 @@ public class KiteOptionChainProvider implements OptionChainProvider {
 
     @Override
     public Mono<Double> getSpotPrice(String underlying) {
-        return brokerRegistry.getAll()
-            .filter(BrokerAdapter::isEnabled)
-            .take(1)
-            .singleOrEmpty()
-            .flatMap(adapter -> adapter.getPositions()
-                .flatMapMany(Flux::fromIterable)
-                .filter(p -> p.symbol() != null && p.symbol().contains(underlying))
-                .take(1)
-                .map(p -> p.ltp() != null ? p.ltp().doubleValue() : 0.0)
-                .singleOrEmpty()
-                .switchIfEmpty(Mono.just(0.0)));
+        String sym = underlying.equalsIgnoreCase("NIFTY") ? "NSE:NIFTY 50" : (underlying.startsWith("NSE:") ? underlying : "NSE:" + underlying);
+        return Mono.fromCallable(() -> {
+            if (kitePcrProvider != null) {
+                double ltp = kitePcrProvider.fetchLtp(sym);
+                if (ltp > 0) return ltp;
+            }
+            return 0.0;
+        }).subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+          .switchIfEmpty(Mono.just(0.0));
     }
 }

@@ -146,8 +146,21 @@ public class TelegramBotService {
             .bodyToMono(String.class)
             .then()
             .onErrorResume(e -> {
-                log.warn("Failed to send Telegram alert: {}", e.getMessage());
-                return Mono.empty();
+                log.warn("Failed to send Telegram markdown alert ({}), retrying without markdown...", e.getMessage());
+                Map<String, Object> plainPayload = new HashMap<>();
+                plainPayload.put("chat_id", chatId);
+                plainPayload.put("text", message);
+                return webClient.post()
+                    .uri("/bot" + botToken + "/sendMessage")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(BodyInserters.fromValue(plainPayload))
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .then()
+                    .onErrorResume(e2 -> {
+                        log.error("Failed to send Telegram alert (plain fallback): {}", e2.getMessage());
+                        return Mono.empty();
+                    });
             });
     }
 
@@ -172,8 +185,22 @@ public class TelegramBotService {
             .bodyToMono(String.class)
             .then()
             .onErrorResume(e -> {
-                log.warn("Failed to send Telegram button message: {}", e.getMessage());
-                return Mono.empty();
+                log.warn("Failed to send Telegram button message with markdown ({}), retrying without markdown...", e.getMessage());
+                Map<String, Object> plainPayload = new HashMap<>();
+                plainPayload.put("chat_id", chatId);
+                plainPayload.put("text", message);
+                plainPayload.put("reply_markup", replyMarkup);
+                return webClient.post()
+                    .uri("/bot" + botToken + "/sendMessage")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(BodyInserters.fromValue(plainPayload))
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .then()
+                    .onErrorResume(e2 -> {
+                        log.error("Failed to send Telegram button message (plain fallback): {}", e2.getMessage());
+                        return Mono.empty();
+                    });
             });
     }
 
@@ -200,19 +227,18 @@ public class TelegramBotService {
           .append("• Quantity: `").append(signal.quantity()).append("`\n")
           .append("• Price: `₹").append(signal.price()).append("`\n");
 
-        if (signal.triggerPrice() != null) {
+        if (signal.protectiveStopTrigger() != null) {
+            sb.append("• Protective Stop: `₹").append(signal.protectiveStopTrigger()).append("`\n");
+        } else if (signal.triggerPrice() != null) {
             sb.append("• Trigger/SL: `₹").append(signal.triggerPrice()).append("`\n");
         }
         if (signal.tag() != null) {
-            sb.append("• Tag: _").append(signal.tag()).append("_\n");
+            sb.append("• Tag: `").append(signal.tag()).append("`\n");
         }
 
         sendAlert(sb.toString()).subscribe();
     }
 
-    /**
-     * Starts the reactive long-polling loop for receiving Telegram updates.
-     */
     private void startPolling() {
         this.running.set(true);
         pollLoop();
@@ -330,6 +356,10 @@ public class TelegramBotService {
             .body(BodyInserters.fromValue(Map.of("callback_query_id", callbackId)))
             .retrieve()
             .bodyToMono(String.class)
+            .onErrorResume(e -> {
+                log.debug("Failed to answer callback query: {}", e.getMessage());
+                return Mono.empty();
+            })
             .subscribe();
 
         if ("CONFIRM_PANIC".equalsIgnoreCase(data)) {

@@ -99,10 +99,13 @@ public class NseIndiaClient {
 
         return webClient.get()
             .uri("/")
+            .header(HttpHeaders.USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header(HttpHeaders.ACCEPT, "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header(HttpHeaders.ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .exchangeToMono(response -> {
                 String cookie = response.cookies().values().stream()
                     .flatMap(List::stream)
-                    .map(HttpCookie::getValue)
+                    .map(c -> c.getName() + "=" + c.getValue())
                     .reduce((a, b) -> a + "; " + b)
                     .orElse("");
 
@@ -126,7 +129,9 @@ public class NseIndiaClient {
         return webClient.get()
             .uri(apiPath)
             .header(HttpHeaders.COOKIE, sessionCookie != null ? sessionCookie : "")
-            .header(HttpHeaders.USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .header(HttpHeaders.USER_AGENT, "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            .header(HttpHeaders.REFERER, "https://www.nseindia.com/")
+            .header(HttpHeaders.ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .header(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
             .retrieve()
             .bodyToMono(Map.class)

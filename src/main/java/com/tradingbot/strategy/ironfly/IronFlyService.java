@@ -57,11 +57,11 @@ public class IronFlyService {
         @Lazy TelegramBotService telegramBot,
         IronFlyDbService dbService,
         @Value("${ironfly.underlyings:NIFTY,RELIANCE,HDFCBANK}") String underlyingsCsv,
-        @Value("${ironfly.maxConcurrent:3}") int maxConcurrent,
-        @Value("${ironfly.discoveryWindowMins:30}") int discoveryWindowMins,
-        @Value("${ironfly.minStraddlePctOfSpot:2.0}") double minStraddlePctOfSpot,
-        @Value("${ironfly.minOI:1000}") int minOI,
-        @Value("${ironfly.maxBidAskSpreadPct:1.5}") double maxBidAskSpreadPct
+        @Value("${ironfly.max-concurrent:${ironfly.maxConcurrent:3}}") int maxConcurrent,
+        @Value("${ironfly.discovery-window-mins:${ironfly.discoveryWindowMins:30}}") int discoveryWindowMins,
+        @Value("${ironfly.min-straddle-pct-of-spot:${ironfly.minStraddlePctOfSpot:2.0}}") double minStraddlePctOfSpot,
+        @Value("${ironfly.min-oi:${ironfly.minOI:1000}}") int minOI,
+        @Value("${ironfly.max-bid-ask-spread-pct:${ironfly.maxBidAskSpreadPct:1.5}}") double maxBidAskSpreadPct
     ) {
         this.optionChainProvider = optionChainProvider;
         this.dailyAnalyzer = dailyAnalyzer;

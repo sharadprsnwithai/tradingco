@@ -443,36 +443,33 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         }
     }
 
+    private record SelectedOptionTrade(
+        Instrument shortOption,
+        double shortPremium,
+        String expiry,
+        Optional<Instrument> hedgeOption,
+        double hedgePremium
+    ) {}
+
     private void enterLiveTrade(Direction direction, double spotPrice, Instant time) {
         String optionType = direction == Direction.BULLISH ? "PE" : "CE";
 
         try {
-            // Find OTM option with target delta
-            var option = findOtmOption(spotPrice, optionType, targetDelta);
-            if (option.isEmpty()) {
-                log.warn("[{}] No {} option found with delta ~{} near spot {}",
-                    strategyId, optionType, targetDelta, spotPrice);
+            // Select 0.20 delta option: if nearest expiry premium < minPremium (Rs 70), check next expiry
+            var tradeSelection = selectOptionForTrading(spotPrice, optionType);
+            if (tradeSelection.isEmpty()) {
+                log.warn("[{}] No {} option candidate found near spot {}", strategyId, optionType, spotPrice);
                 return;
             }
 
-            String optionSymbol = option.get().canonicalSymbol();
-            double premium = kitePcrProvider.fetchLtp(optionSymbol);
-            if (premium <= 0) {
-                log.warn("[{}] No premium quote for {}", strategyId, optionSymbol);
-                return;
-            }
-
-            // Check minimum premium constraint
-            if (premium < minPremium) {
-                log.info("[{}] Premium {} below minimum {} for {}, trying next expiry",
-                    strategyId, premium, minPremium, optionSymbol);
-                // Try next expiry - simplified: would need to fetch next week's chain
-                return;
-            }
+            SelectedOptionTrade selected = tradeSelection.get();
+            Instrument shortOpt = selected.shortOption();
+            String optionSymbol = shortOpt.canonicalSymbol();
+            double premium = selected.shortPremium();
 
             int qty = lotSizeService != null ? lotSizeService.getOrderQuantity("NIFTY") : 25 * lots;
 
-            // Subscribe to option symbol for tick data
+            // Subscribe to short option symbol for tick data
             if (!symbols.contains(optionSymbol)) {
                 symbols.add(optionSymbol);
                 if (context != null) context.requestSubscriptionSync();
@@ -492,7 +489,7 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             daily.position = Position.IN_TRADE;
             daily.entriesToday++;
 
-            // Emit entry signal for short leg
+            // Emit entry signal for short leg (dispatches alert to Telegram)
             String tag = "ST_" + optionType + "_SHORT";
             Signal entrySignal = Signal.builder()
                 .strategyId(strategyId)
@@ -509,65 +506,153 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
                 .build();
             context.emitSignal(entrySignal);
 
-            // Find and emit hedge leg
-            double hedgeDelta = 0.05;
-            var hedgeOption = findOtmOption(spotPrice, optionType, hedgeDelta);
-            if (hedgeOption.isPresent()) {
-                String hedgeSymbol = hedgeOption.get().canonicalSymbol();
+            // Emit hedge leg if available
+            if (selected.hedgeOption().isPresent() && selected.hedgePremium() > 0) {
+                Instrument hedgeOpt = selected.hedgeOption().get();
+                String hedgeSymbol = hedgeOpt.canonicalSymbol();
                 if (!hedgeSymbol.equals(optionSymbol)) {
-                    double hedgePremium = kitePcrProvider.fetchLtp(hedgeSymbol);
-                    if (hedgePremium > 0 && hedgePremium <= 20.0) {
-                        daily.activeHedgeSymbol = hedgeSymbol;
-                        daily.hedgePremium = hedgePremium;
+                    daily.activeHedgeSymbol = hedgeSymbol;
+                    daily.hedgePremium = selected.hedgePremium();
 
-                        if (!symbols.contains(hedgeSymbol)) {
-                            symbols.add(hedgeSymbol);
-                            if (context != null) context.requestSubscriptionSync();
-                        }
-
-                        String hedgeTag = "ST_" + optionType + "_HEDGE";
-                        Signal hedgeSignal = Signal.builder()
-                            .strategyId(strategyId)
-                            .targetAccountId(assignedAccountId)
-                            .symbol(hedgeSymbol)
-                            .signalType(SignalType.ENTRY_LONG)
-                            .quantity(qty)
-                            .price(BigDecimal.valueOf(hedgePremium))
-                            .orderType(OrderType.LIMIT)
-                            .productType(ProductType.MIS)
-                            .tag(hedgeTag)
-                            .timestamp(time)
-                            .build();
-                        context.emitSignal(hedgeSignal);
+                    if (!symbols.contains(hedgeSymbol)) {
+                        symbols.add(hedgeSymbol);
+                        if (context != null) context.requestSubscriptionSync();
                     }
+
+                    String hedgeTag = "ST_" + optionType + "_HEDGE";
+                    Signal hedgeSignal = Signal.builder()
+                        .strategyId(strategyId)
+                        .targetAccountId(assignedAccountId)
+                        .symbol(hedgeSymbol)
+                        .signalType(SignalType.ENTRY_LONG)
+                        .quantity(qty)
+                        .price(BigDecimal.valueOf(selected.hedgePremium()))
+                        .orderType(OrderType.LIMIT)
+                        .productType(ProductType.MIS)
+                        .tag(hedgeTag)
+                        .timestamp(time)
+                        .build();
+                    context.emitSignal(hedgeSignal);
                 }
             }
 
-            log.info("[{}] LIVE ENTRY: {} x {} @ ₹{} | SL: ₹{} | Hedge: {} | Direction: {}",
-                strategyId, optionSymbol, qty, premium, slPrice, daily.activeHedgeSymbol, direction);
+            log.info("[{}] LIVE ENTRY: {} x {} @ ₹{} (Expiry: {}) | SL: ₹{} | Hedge: {} @ ₹{} | Direction: {}",
+                strategyId, optionSymbol, qty, premium, selected.expiry(), slPrice, daily.activeHedgeSymbol, daily.hedgePremium, direction);
 
         } catch (Exception e) {
             log.error("[{}] Live entry failed: {}", strategyId, e.getMessage(), e);
         }
     }
 
-    private Optional<Instrument> findOtmOption(
-            double spotPrice, String optionType, double targetDelta) {
+    /**
+     * Selects the OTM option for trading based on delta ~0.20:
+     * 1. Checks the nearest expiry: if its 0.20 delta premium >= minPremium (Rs 70), selects it.
+     * 2. If nearest expiry premium < minPremium (Rs 70), checks the next expiry 0.20 delta premium and selects it.
+     */
+    private Optional<SelectedOptionTrade> selectOptionForTrading(double spotPrice, String optionType) {
         if (instrumentMaster == null) return Optional.empty();
 
         try {
-            var nearestOpt = instrumentMaster.findNearestExpiring("NIFTY", optionType).blockOptional();
-            if (nearestOpt.isEmpty()) {
+            List<String> expiries = instrumentMaster.findUpcomingExpiries("NIFTY", optionType, 3)
+                .collectList()
+                .block();
+
+            if (expiries == null || expiries.isEmpty()) {
+                var nearestOpt = instrumentMaster.findNearestExpiring("NIFTY", optionType).blockOptional();
+                if (nearestOpt.isPresent() && nearestOpt.get().expiry() != null) {
+                    expiries = List.of(nearestOpt.get().expiry());
+                } else {
+                    return Optional.empty();
+                }
+            }
+
+            Instrument chosenOption = null;
+            double chosenPremium = 0.0;
+            String chosenExpiry = null;
+
+            for (int i = 0; i < expiries.size(); i++) {
+                String expiry = expiries.get(i);
+                var candidateOpt = findOtmOptionForExpiry(spotPrice, optionType, targetDelta, expiry);
+                if (candidateOpt.isEmpty()) continue;
+
+                String sym = candidateOpt.get().canonicalSymbol();
+                double ltp = kitePcrProvider != null ? kitePcrProvider.fetchLtp(sym) : 0.0;
+                if (ltp <= 0) continue;
+
+                if (i == 0) {
+                    // Nearest expiry check
+                    if (minPremium <= 0 || ltp >= minPremium) {
+                        log.info("[{}] Selected nearest expiry {} 0.20Δ option {} @ ₹{} (>= ₹{})",
+                            strategyId, expiry, sym, ltp, minPremium);
+                        chosenOption = candidateOpt.get();
+                        chosenPremium = ltp;
+                        chosenExpiry = expiry;
+                        break;
+                    } else {
+                        log.info("[{}] Nearest expiry {} 0.20Δ option {} premium ₹{} < ₹{} threshold — checking next expiry",
+                            strategyId, expiry, sym, ltp, minPremium);
+                        // Save as fallback if no next expiry exists
+                        chosenOption = candidateOpt.get();
+                        chosenPremium = ltp;
+                        chosenExpiry = expiry;
+                    }
+                } else {
+                    // Next expiry check
+                    log.info("[{}] Selected next expiry {} 0.20Δ option {} @ ₹{}",
+                        strategyId, expiry, sym, ltp);
+                    chosenOption = candidateOpt.get();
+                    chosenPremium = ltp;
+                    chosenExpiry = expiry;
+                    break;
+                }
+            }
+
+            if (chosenOption == null || chosenPremium <= 0) {
                 return Optional.empty();
             }
 
-            String expiry = nearestOpt.get().expiry();
+            // Find hedge option (~0.05 delta) on the same chosen expiry
+            Optional<Instrument> hedgeOpt = findOtmOptionForExpiry(spotPrice, optionType, 0.05, chosenExpiry);
+            double hedgeLtp = 0.0;
+            if (hedgeOpt.isPresent()) {
+                String hedgeSym = hedgeOpt.get().canonicalSymbol();
+                if (!hedgeSym.equals(chosenOption.canonicalSymbol()) && kitePcrProvider != null) {
+                    hedgeLtp = kitePcrProvider.fetchLtp(hedgeSym);
+                }
+            }
+
+            return Optional.of(new SelectedOptionTrade(chosenOption, chosenPremium, chosenExpiry, hedgeOpt, hedgeLtp));
+
+        } catch (Exception e) {
+            log.error("[{}] Error selecting option for trading: {}", strategyId, e.getMessage(), e);
+            return Optional.empty();
+        }
+    }
+
+    private Optional<Instrument> findOtmOption(
+            double spotPrice, String optionType, double targetDelta) {
+        if (instrumentMaster == null) return Optional.empty();
+        try {
+            var nearestOpt = instrumentMaster.findNearestExpiring("NIFTY", optionType).blockOptional();
+            if (nearestOpt.isEmpty()) return Optional.empty();
+            return findOtmOptionForExpiry(spotPrice, optionType, targetDelta, nearestOpt.get().expiry());
+        } catch (Exception e) {
+            log.warn("[{}] Failed to find nearest OTM option: {}", strategyId, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    private Optional<Instrument> findOtmOptionForExpiry(
+            double spotPrice, String optionType, double targetDelta, String expiry) {
+        if (instrumentMaster == null || expiry == null) return Optional.empty();
+
+        try {
             List<Instrument> options = instrumentMaster.findOptionContracts("NIFTY", expiry, null, optionType)
                 .collectList()
                 .block();
 
             if (options == null || options.isEmpty()) {
-                return nearestOpt;
+                return Optional.empty();
             }
 
             double timeToExpiry = calculateTimeToExpiryYears(expiry);
@@ -584,11 +669,10 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
                     return Math.abs(delta - targetDelta);
                 }));
         } catch (Exception e) {
-            log.warn("[{}] Failed to find OTM option: {}", strategyId, e.getMessage());
+            log.warn("[{}] Failed to find OTM option for expiry {}: {}", strategyId, expiry, e.getMessage());
             return Optional.empty();
         }
     }
-
     private double calculateTimeToExpiryYears(String expiryStr) {
         if (expiryStr == null || expiryStr.isEmpty()) return 7.0 / 365.0;
         try {

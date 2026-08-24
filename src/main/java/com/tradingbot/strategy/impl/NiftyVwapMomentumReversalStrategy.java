@@ -306,12 +306,10 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         if (daily.bias == Bias.BULLISH && isGreen) {
             if (close > vwap && low < vwap) {
                 entryDir = Direction.LONG;
-                daily.enterTrade(Direction.LONG, close, vwap, candle.timestamp());
             }
         } else if (daily.bias == Bias.BEARISH && isRed) {
             if (close < vwap && high > vwap) {
                 entryDir = Direction.SHORT;
-                daily.enterTrade(Direction.SHORT, close, vwap, candle.timestamp());
             }
         }
 
@@ -320,6 +318,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
                 enterLiveTrade(entryDir, close, candle.timestamp());
             } else {
                 // Legacy/backtest mode: configured symbol doubles as the premium series
+                daily.enterTrade(entryDir, close, vwap, candle.timestamp());
                 String tag = "VWAP_" + entryDir + "_ENTRY";
                 Signal entrySignal = Signal.builder()
                     .strategyId(strategyId)
@@ -672,9 +671,11 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     private void evaluateBiasIfNeeded() {
         if (!daily.snapshot930Done || !daily.snapshot1100Done) return;
 
-        if (daily.nifty1100 > daily.nifty930 && daily.pcr1100 > daily.pcr930) {
+        // Bullish: Price up & PCR not declining (allowing small tolerance if flat)
+        // Bearish: Price down & PCR not expanding (allowing small tolerance if flat)
+        if (daily.nifty1100 > daily.nifty930 && daily.pcr1100 >= daily.pcr930 - 0.01) {
             daily.bias = Bias.BULLISH;
-        } else if (daily.nifty1100 < daily.nifty930 && daily.pcr1100 < daily.pcr930) {
+        } else if (daily.nifty1100 < daily.nifty930 && daily.pcr1100 <= daily.pcr930 + 0.01) {
             daily.bias = Bias.BEARISH;
         } else {
             daily.bias = Bias.NEUTRAL;

@@ -33,12 +33,12 @@ public class DailyAnalyzer {
     private final double hedgeProfitPct;
 
     public DailyAnalyzer(
-        @Value("${ironfly.profitTargetPct:4}") double profitTargetPct,
-        @Value("${ironfly.stopLossPct:8}") double stopLossPct,
-        @Value("${ironfly.expiryGuardDays:4}") int expiryGuardDays,
-        @Value("${ironfly.decayThresholdPct:70}") double decayThresholdPct,
-        @Value("${ironfly.shortLegLossPct:70}") double shortLegLossPct,
-        @Value("${ironfly.hedgeProfitPct:50}") double hedgeProfitPct
+        @Value("${ironfly.profit-target-pct:${ironfly.profitTargetPct:4}}") double profitTargetPct,
+        @Value("${ironfly.stop-loss-pct:${ironfly.stopLossPct:8}}") double stopLossPct,
+        @Value("${ironfly.expiry-guard-days:${ironfly.expiryGuardDays:4}}") int expiryGuardDays,
+        @Value("${ironfly.decay-threshold-pct:${ironfly.decayThresholdPct:70}}") double decayThresholdPct,
+        @Value("${ironfly.short-leg-loss-pct:${ironfly.shortLegLossPct:70}}") double shortLegLossPct,
+        @Value("${ironfly.hedge-profit-pct:${ironfly.hedgeProfitPct:50}}") double hedgeProfitPct
     ) {
         this.profitTargetPct = profitTargetPct;
         this.stopLossPct = stopLossPct;

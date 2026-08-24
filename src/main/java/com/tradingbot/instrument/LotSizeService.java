@@ -31,8 +31,9 @@ public class LotSizeService {
                           WebClient.Builder webClientBuilder) {
         this.config = config;
         this.authenticator = authenticator;
+        String baseUrl = config != null && config.getBaseUrl() != null ? config.getBaseUrl() : "https://api.kite.trade";
         this.webClient = webClientBuilder
-            .baseUrl(config.getBaseUrl())
+            .baseUrl(baseUrl)
             .defaultHeader("X-Kite-Version", "3")
             .build();
     }

@@ -140,6 +140,25 @@ public class LowestVolumeReversalStrategy implements Strategy {
         synchronized (state) {
             if (state.position == TradePosition.IN_TRADE) {
                 checkTickExits(state, tick.ltp());
+            } else if (state.position == TradePosition.FLAT 
+                && state.setupPhase == SetupPhase.WAITING_FOR_ENTRY 
+                && !entryLocked 
+                && dailyTradeCount < maxTradesPerDay) {
+                checkTickEntry(state, tick);
+            }
+        }
+    }
+
+    private void checkTickEntry(SymbolState state, Tick tick) {
+        if (state.pullbackCandle == null || tick.ltp() == null) return;
+
+        if (state.pendingDirection == Direction.LONG) {
+            if (tick.ltp().compareTo(state.pullbackCandle.high()) > 0) {
+                enterTrade(state, Direction.LONG, state.pullbackCandle.high(), state.pullbackCandle.low(), tick.ltp());
+            }
+        } else if (state.pendingDirection == Direction.SHORT) {
+            if (tick.ltp().compareTo(state.pullbackCandle.low()) < 0) {
+                enterTrade(state, Direction.SHORT, state.pullbackCandle.low(), state.pullbackCandle.high(), tick.ltp());
             }
         }
     }
@@ -332,9 +351,9 @@ public class LowestVolumeReversalStrategy implements Strategy {
             return;
         }
 
-        // Check if this pullback candle has the LOWEST volume of ALL candles today
-        if (!isLowestVolumeOfDay(state, candle)) {
-            log.info("[{}] Pullback candle volume {} is not the lowest of the day — waiting",
+        // Check if this pullback candle has the lowest volume relative to preceding momentum candles
+        if (!isLowestVolumeOfPreceding(state, candle)) {
+            log.info("[{}] Pullback candle volume {} is not the lowest of the recent swing — waiting",
                 state.symbol, candle.volume());
             return;
         }
@@ -342,15 +361,19 @@ public class LowestVolumeReversalStrategy implements Strategy {
         // Pullback with lowest volume found
         state.pullbackCandle = candle;
         state.setupPhase = SetupPhase.WAITING_FOR_ENTRY;
-        log.info("[{}] Pullback candle FOUND — Low: {}, High: {}, Volume: {} (lowest of day)",
+        log.info("[{}] Pullback candle FOUND — Low: {}, High: {}, Volume: {} (volume exhaustion)",
             state.symbol, candle.low(), candle.high(), candle.volume());
     }
 
     /**
-     * Checks if the given candle has the lowest volume among all candles seen today.
+     * Checks if the given candle has the lowest volume relative to the preceding momentum swing
+     * and recent candles of the day (reflecting volume exhaustion on pullback).
      */
-    private boolean isLowestVolumeOfDay(SymbolState state, Candle candidate) {
-        for (Candle c : state.dayCandles) {
+    private boolean isLowestVolumeOfPreceding(SymbolState state, Candle candidate) {
+        int lookback = Math.min(state.dayCandles.size(), Math.max(state.consecutiveMomentum + 2, 6));
+        int total = state.dayCandles.size();
+        for (int i = Math.max(0, total - lookback); i < total; i++) {
+            Candle c = state.dayCandles.get(i);
             if (c == candidate) continue;
             if (c.volume() < candidate.volume()) {
                 return false;
@@ -360,20 +383,22 @@ public class LowestVolumeReversalStrategy implements Strategy {
     }
 
     /**
-     * Checks if price breaks above/below pullback candle to trigger entry.
+     * Checks if price breaks above/below pullback candle to trigger entry on candle close/high/low.
      */
     private void checkEntryTrigger(SymbolState state, Candle candle) {
         if (state.pullbackCandle == null) return;
 
         if (state.pendingDirection == Direction.LONG) {
             // Entry when price breaks above pullback candle high
-            if (candle.close().compareTo(state.pullbackCandle.high()) > 0) {
-                enterTrade(state, Direction.LONG, state.pullbackCandle.high(), state.pullbackCandle.low(), candle.close());
+            if (candle.high().compareTo(state.pullbackCandle.high()) > 0 || candle.close().compareTo(state.pullbackCandle.high()) > 0) {
+                BigDecimal execPrice = candle.open().compareTo(state.pullbackCandle.high()) > 0 ? candle.open() : state.pullbackCandle.high();
+                enterTrade(state, Direction.LONG, state.pullbackCandle.high(), state.pullbackCandle.low(), execPrice);
             }
         } else if (state.pendingDirection == Direction.SHORT) {
             // Entry when price breaks below pullback candle low
-            if (candle.close().compareTo(state.pullbackCandle.low()) < 0) {
-                enterTrade(state, Direction.SHORT, state.pullbackCandle.low(), state.pullbackCandle.high(), candle.close());
+            if (candle.low().compareTo(state.pullbackCandle.low()) < 0 || candle.close().compareTo(state.pullbackCandle.low()) < 0) {
+                BigDecimal execPrice = candle.open().compareTo(state.pullbackCandle.low()) < 0 ? candle.open() : state.pullbackCandle.low();
+                enterTrade(state, Direction.SHORT, state.pullbackCandle.low(), state.pullbackCandle.high(), execPrice);
             }
         }
     }

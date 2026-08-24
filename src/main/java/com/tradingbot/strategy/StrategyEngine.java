@@ -152,6 +152,8 @@ public class StrategyEngine {
      * Synchronize MarketDataHub subscriptions with the union of all active strategy symbols.
      */
     public synchronized void syncSubscriptions() {
+        updateSymbolIndex();
+
         List<String> allSymbols = strategies.values().stream()
             .filter(Strategy::isEnabled)
             .flatMap(s -> s.getSubscribedSymbols().stream())

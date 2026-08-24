@@ -24,8 +24,8 @@ public class AdjustmentHandler {
     private final double hedgeCreditBuffer;
 
     public AdjustmentHandler(
-        @Value("${ironfly.targetDelta:0.25}") double targetDelta,
-        @Value("${ironfly.hedgeCreditBuffer:0.5}") double hedgeCreditBuffer
+        @Value("${ironfly.target-delta:${ironfly.targetDelta:0.25}}") double targetDelta,
+        @Value("${ironfly.hedge-credit-buffer:${ironfly.hedgeCreditBuffer:0.5}}") double hedgeCreditBuffer
     ) {
         this.targetDelta = targetDelta;
         this.hedgeCreditBuffer = hedgeCreditBuffer;

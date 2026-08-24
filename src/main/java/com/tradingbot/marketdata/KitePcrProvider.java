@@ -139,6 +139,9 @@ public class KitePcrProvider {
     /**
      * Gets the nearest expiry date from Kite instruments endpoint.
      */
+    /**
+     * Gets the nearest expiry date from Kite instruments endpoint (today or future only).
+     */
     private String getNearestExpiry(String token) {
         try {
             String response = webClient.get()
@@ -153,18 +156,21 @@ public class KitePcrProvider {
             // Parse CSV: instrument_token,exchange_token,tradingsymbol,name,expiry,strike,tick_size,lot_size,instrument_type,segment,exchange
             String[] lines = response.split("\n");
             String nearestExpiry = null;
+            String todayStr = java.time.LocalDate.now(java.time.ZoneId.of("Asia/Kolkata")).toString();
 
             for (int i = 1; i < lines.length; i++) {
                 String[] parts = lines[i].split(",");
                 if (parts.length < 6) continue;
 
-                String symbol = parts[2];
-                String expiry = parts[4];
+                String symbol = parts[2].replace("\"", "").trim();
+                String expiry = parts[4].replace("\"", "").trim();
 
                 if (symbol.startsWith("NIFTY") && !symbol.contains("NIFTY50")
                     && parts[9].contains("NFO") && parts[10].contains("NFO")) {
-                    if (nearestExpiry == null || expiry.compareTo(nearestExpiry) < 0) {
-                        nearestExpiry = expiry;
+                    if (expiry.compareTo(todayStr) >= 0) {
+                        if (nearestExpiry == null || expiry.compareTo(nearestExpiry) < 0) {
+                            nearestExpiry = expiry;
+                        }
                     }
                 }
             }
@@ -177,13 +183,22 @@ public class KitePcrProvider {
     }
 
     /**
-     * Formats expiry date from "2026-08-28" to "26AUG" format for Kite trading symbol.
+     * Formats expiry date from "2026-08-27" to "26AUG" (monthly) or "26820" (weekly) for Kite trading symbol.
      */
     private String formatExpiryForKite(String expiryDate) {
         try {
-            java.time.LocalDate date = java.time.LocalDate.parse(expiryDate);
-            java.time.format.DateTimeFormatter fmt = java.time.format.DateTimeFormatter.ofPattern("dMMM", java.util.Locale.ENGLISH);
-            return date.format(fmt).toUpperCase();
+            java.time.LocalDate date = java.time.LocalDate.parse(expiryDate.trim());
+            // Monthly expiry is the last expiry in the calendar month
+            boolean isMonthly = date.plusDays(7).getMonthValue() != date.getMonthValue();
+            if (isMonthly) {
+                return date.format(java.time.format.DateTimeFormatter.ofPattern("yyMMM", java.util.Locale.ENGLISH)).toUpperCase();
+            } else {
+                int yy = date.getYear() % 100;
+                int m = date.getMonthValue();
+                String mStr = (m == 10) ? "O" : (m == 11) ? "N" : (m == 12) ? "D" : String.valueOf(m);
+                int dd = date.getDayOfMonth();
+                return String.format("%02d%s%02d", yy, mStr, dd);
+            }
         } catch (Exception e) {
             return "";
         }
