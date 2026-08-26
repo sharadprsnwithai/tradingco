@@ -2,6 +2,8 @@ package com.tradingbot.backtest;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tradingbot.adapter.shoonya.ShoonyaAuthenticator;
+import com.tradingbot.adapter.shoonya.ShoonyaConfig;
 import com.tradingbot.model.Candle;
 import com.tradingbot.nse.NseIndiaClient;
 import com.tradingbot.strategy.impl.LowestVolumeReversalStrategy;
@@ -206,65 +208,29 @@ public class ShoonyaBacktestRunner {
     }
 
     private static void authenticateShoonya() throws Exception {
-        // Step 1: QuickAuth
-        StringBuilder keyBuilder = new StringBuilder(SHOONYA_USER_ID).append("|");
-        for (int p = 0; p < KEY_OFFSETS.length; p++) {
-            keyBuilder.append((char) (KEY_OFFSETS[p] + p));
+        ShoonyaConfig cfg = new ShoonyaConfig();
+        cfg.setEnabled(true);
+        cfg.setClientId(SHOONYA_CLIENT_ID);
+        cfg.setSecretKey(SHOONYA_SECRET_KEY);
+        cfg.setUserId(SHOONYA_USER_ID);
+        cfg.setAccountId(SHOONYA_ACCOUNT_ID);
+        cfg.setPassword(SHOONYA_PASSWORD);
+        cfg.setTotpSecret(SHOONYA_TOTP_SECRET);
+        cfg.setVendorCode(SHOONYA_VENDOR_CODE);
+        cfg.setApiKey(SHOONYA_API_KEY);
+
+        ShoonyaAuthenticator auth = new ShoonyaAuthenticator(
+            cfg,
+            org.springframework.web.reactive.function.client.WebClient.builder(),
+            mapper
+        );
+        String token = auth.authenticate().block();
+        if (token == null || token.isBlank()) {
+            throw new IllegalStateException("Shoonya authentication failed to return a session token");
         }
-        String appkey = DigestUtils.sha256Hex(keyBuilder.toString());
-        String pwdSha = DigestUtils.sha256Hex(SHOONYA_PASSWORD);
-        String totp = generateTotpManual(SHOONYA_TOTP_SECRET);
-        System.out.println("  -> Generated TOTP: " + totp);
-
-        Map<String, Object> quickAuthPayload = new HashMap<>();
-        quickAuthPayload.put("apkversion", "W2_20250926");
-        quickAuthPayload.put("uid", SHOONYA_USER_ID);
-        quickAuthPayload.put("pwd", pwdSha);
-        quickAuthPayload.put("factor2", totp);
-        quickAuthPayload.put("appkey", appkey);
-        quickAuthPayload.put("imei", "12345678-1234-1234-1234-123456789abc");
-        quickAuthPayload.put("addldivinf", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-        quickAuthPayload.put("source", "API");
-        quickAuthPayload.put("vc", "NOREN_API");
-        quickAuthPayload.put("app_key", SHOONYA_CLIENT_ID);
-        String quickAuthBody = "jData=" + mapper.writeValueAsString(quickAuthPayload);
-
-        String quickAuthResponse = postForm("https://api.shoonya.com/NorenWClientAPI/QuickAuth", quickAuthBody);
-        JsonNode quickAuthJson = mapper.readTree(quickAuthResponse);
-        if (!"Ok".equalsIgnoreCase(quickAuthJson.path("stat").asText())) {
-            throw new IllegalStateException("Shoonya QuickAuth failed: " + quickAuthJson.path("emsg").asText());
-        }
-
-        String directUserToken = quickAuthJson.path("susertoken").asText(null);
-        if (directUserToken != null && !directUserToken.isBlank()) {
-            accessToken = directUserToken;
-            sUserToken = directUserToken;
-            saveDiskSession(directUserToken, directUserToken);
-            System.out.println("  -> Step 1: QuickAuth succeeded with direct session token, token cached");
-            return;
-        }
-
-        String authCode = quickAuthJson.path("code").asText(null);
-        if (authCode == null || authCode.isBlank()) {
-            throw new IllegalStateException("Shoonya QuickAuth did not return authorization code or susertoken");
-        }
-        System.out.println("  -> Step 1: QuickAuth succeeded, auth code acquired");
-
-        // Step 2: GenAcsTok
-        String checksum = DigestUtils.sha256Hex(SHOONYA_CLIENT_ID + SHOONYA_SECRET_KEY + authCode);
-        Map<String, String> genAcsPayload = Map.of("code", authCode, "checksum", checksum);
-        String genAcsBody = "jData=" + mapper.writeValueAsString(genAcsPayload);
-
-        String genAcsResponse = postForm("https://api.shoonya.com/NorenWClientAPI/GenAcsTok", genAcsBody);
-        JsonNode genAcsJson = mapper.readTree(genAcsResponse);
-        if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
-            throw new IllegalStateException("Shoonya GenAcsTok failed: " + genAcsJson.path("emsg").asText());
-        }
-
-        accessToken = genAcsJson.path("access_token").asText(genAcsJson.path("susertoken").asText());
-        sUserToken = genAcsJson.path("susertoken").asText(accessToken);
-        saveDiskSession(accessToken, sUserToken);
-        System.out.println("  -> Step 2: GenAcsTok succeeded, session token acquired");
+        accessToken = token;
+        sUserToken = auth.getSUserToken() != null ? auth.getSUserToken() : token;
+        System.out.println("  -> Shoonya authenticated successfully via ShoonyaAuthenticator");
     }
 
     // ========== Shoonya Token Discovery ==========

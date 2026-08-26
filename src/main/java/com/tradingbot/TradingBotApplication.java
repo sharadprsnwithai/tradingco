@@ -3,6 +3,7 @@ package com.tradingbot;
 import com.tradingbot.adapter.kite.KiteBrokerAdapter;
 import com.tradingbot.adapter.shoonya.ShoonyaBrokerAdapter;
 import com.tradingbot.instrument.InstrumentSyncService;
+import com.tradingbot.instrument.ShoonyaInstrumentSyncService;
 import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.oms.OrderManagerService;
 import com.tradingbot.position.PositionManagerService;
@@ -85,7 +86,8 @@ public class TradingBotApplication {
         MarketDataHub marketDataHub,
         StrategyEngine strategyEngine,
         TelegramBotService telegramBot,
-        InstrumentSyncService instrumentSyncService
+        InstrumentSyncService instrumentSyncService,
+        ShoonyaInstrumentSyncService shoonyaInstrumentSyncService
     ) {
         return args -> {
             log.info("==================================================================");
@@ -107,6 +109,19 @@ public class TradingBotApplication {
                 .doOnError(ex -> log.error("Failed to connect or fetch positions from Kite: {}", ex.getMessage()))
                 .onErrorResume(e -> Mono.empty())
                 .block();
+
+            // 1b. Sync Shoonya instrument master so shoonya_token is populated for the
+            //     cross-broker failover feed and the Shoonya LVR selection backup. This used
+            //     to run only on the 08:30 cron; running it at boot too makes a post-08:30
+            //     container restart still wire up the Shoonya failover feed.
+            if (shoonyaAdapter.isEnabled()) {
+                try {
+                    Integer shoonyaMapped = shoonyaInstrumentSyncService.syncFromShoonya().block();
+                    log.info(">>> SHOONYA INSTRUMENT MASTER SYNCED (tokens mapped: {}) <<<", shoonyaMapped);
+                } catch (Exception ex) {
+                    log.error("Shoonya instrument master sync failed: {}", ex.getMessage());
+                }
+            }
 
             // 2. Verify Shoonya (skip if disabled)
             if (shoonyaAdapter.isEnabled()) {

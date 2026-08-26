@@ -2,6 +2,8 @@ package com.tradingbot.backtest;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.tradingbot.adapter.shoonya.ShoonyaAuthenticator;
+import com.tradingbot.adapter.shoonya.ShoonyaConfig;
 import org.apache.commons.codec.digest.DigestUtils;
 
 import java.io.BufferedReader;
@@ -24,11 +26,13 @@ public class ShoonyaTokenFinder {
     private static final int[] KEY_OFFSETS = {83, 50, 97, 114, 110, 46, 27, 93};
 
     private static String SHOONYA_USER_ID;
+    private static String SHOONYA_ACCOUNT_ID;
     private static String SHOONYA_CLIENT_ID;
     private static String SHOONYA_SECRET_KEY;
     private static String SHOONYA_PASSWORD;
     private static String SHOONYA_TOTP_SECRET;
     private static String SHOONYA_API_KEY;
+    private static String SHOONYA_VENDOR_CODE;
 
     private static String accessToken;
     private static String sUserToken;
@@ -37,10 +41,60 @@ public class ShoonyaTokenFinder {
         loadEnv();
         authenticate();
 
-        String[] symbols = {"RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"};
-        for (String sym : symbols) {
-            searchScrip(sym, "NSE");
-            Thread.sleep(400);
+        String[][] testSymbols = {
+            {"NSE", "2885", "RELIANCE"},
+            {"NSE", "11536", "TCS"},
+            {"NSE", "1594", "INFY"},
+            {"NSE", "1333", "HDFCBANK"},
+            {"NSE", "4963", "ICICIBANK"},
+            {"NSE", "26000", "NIFTY50_INDEX"},
+            {"NSE", "256265", "NIFTY_FALLBACK"}
+        };
+
+        for (String[] sym : testSymbols) {
+            testTpseries(sym[0], sym[1], "5", sym[2]);
+            Thread.sleep(350);
+        }
+    }
+
+    private static void testTpseries(String exch, String token, String intrv, String label) throws Exception {
+        long now = Instant.now().getEpochSecond();
+        long start = now - (30L * 24 * 3600); // 30 days
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("uid", SHOONYA_USER_ID);
+        payload.put("exch", exch);
+        payload.put("token", token);
+        payload.put("st", String.valueOf(start));
+        payload.put("et", String.valueOf(now));
+        payload.put("intrv", intrv);
+
+        String jDataStr = mapper.writeValueAsString(payload);
+        String formBody = "jData=" + jDataStr + "&jKey=" + sUserToken;
+
+        org.springframework.web.reactive.function.client.ExchangeStrategies strategies =
+            org.springframework.web.reactive.function.client.ExchangeStrategies.builder()
+                .codecs(codecs -> codecs.defaultCodecs().maxInMemorySize(32 * 1024 * 1024))
+                .build();
+
+        org.springframework.web.reactive.function.client.WebClient wc = org.springframework.web.reactive.function.client.WebClient.builder()
+            .baseUrl("https://api.shoonya.com")
+            .exchangeStrategies(strategies)
+            .build();
+
+        String response = wc.post()
+            .uri("/NorenWClientAPI/TPSeries")
+            .contentType(org.springframework.http.MediaType.APPLICATION_FORM_URLENCODED)
+            .bodyValue(formBody)
+            .retrieve()
+            .bodyToMono(String.class)
+            .block();
+
+        JsonNode root = mapper.readTree(response);
+        if (root.isArray()) {
+            System.out.printf("  [OK] %-15s (token=%s): %d candles fetched%n", label, token, root.size());
+        } else {
+            System.out.printf("  [ERR] %-15s (token=%s): %s%n", label, token, root.path("emsg").asText(response));
         }
     }
 
@@ -72,59 +126,27 @@ public class ShoonyaTokenFinder {
         }
     }
 
-    private static void authenticate() throws Exception {
-        StringBuilder keyBuilder = new StringBuilder(SHOONYA_USER_ID).append("|");
-        for (int p = 0; p < KEY_OFFSETS.length; p++) {
-            keyBuilder.append((char) (KEY_OFFSETS[p] + p));
-        }
-        String appkey = DigestUtils.sha256Hex(keyBuilder.toString());
-        String pwdSha = DigestUtils.sha256Hex(SHOONYA_PASSWORD);
-        String totp = generateTotpManual(SHOONYA_TOTP_SECRET);
+private static void authenticate() throws Exception {
+ShoonyaConfig cfg = new ShoonyaConfig();
+cfg.setEnabled(true);
+cfg.setClientId(SHOONYA_CLIENT_ID);
+cfg.setSecretKey(SHOONYA_SECRET_KEY);
+cfg.setUserId(SHOONYA_USER_ID);
+cfg.setAccountId(SHOONYA_ACCOUNT_ID);
+cfg.setPassword(SHOONYA_PASSWORD);
+cfg.setTotpSecret(SHOONYA_TOTP_SECRET);
+cfg.setVendorCode(SHOONYA_VENDOR_CODE);
+cfg.setApiKey(SHOONYA_API_KEY);
 
-        Map<String, Object> quickAuthPayload = new HashMap<>();
-        quickAuthPayload.put("apkversion", "W2_20250926");
-        quickAuthPayload.put("uid", SHOONYA_USER_ID);
-        quickAuthPayload.put("pwd", pwdSha);
-        quickAuthPayload.put("factor2", totp);
-        quickAuthPayload.put("appkey", appkey);
-        quickAuthPayload.put("imei", "12345678-1234-1234-1234-123456789abc");
-        quickAuthPayload.put("addldivinf", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
-        quickAuthPayload.put("source", "API");
-        quickAuthPayload.put("vc", "NOREN_API");
-        quickAuthPayload.put("app_key", SHOONYA_CLIENT_ID);
-
-        String quickAuthBody = "jData=" + mapper.writeValueAsString(quickAuthPayload);
-        String quickAuthResponse = postForm("https://api.shoonya.com/NorenWClientAPI/QuickAuth", quickAuthBody);
-
-    JsonNode quickAuthJson = mapper.readTree(quickAuthResponse);
-    if (!"Ok".equalsIgnoreCase(quickAuthJson.path("stat").asText())) {
-        throw new IllegalStateException("QuickAuth failed: " + quickAuthJson.path("emsg").asText());
-    }
-
-    String directUserToken = quickAuthJson.path("susertoken").asText(null);
-    if (directUserToken != null && !directUserToken.isBlank()) {
-        accessToken = directUserToken;
-        sUserToken = directUserToken;
-        System.out.println("QuickAuth OK with direct session token, session acquired");
-        return;
-    }
-
-    String authCode = quickAuthJson.path("code").asText(null);
-    System.out.println("QuickAuth OK, auth code acquired");
-
-    String checksum = DigestUtils.sha256Hex(SHOONYA_CLIENT_ID + SHOONYA_SECRET_KEY + authCode);
-    Map<String, String> genAcsPayload = Map.of("code", authCode, "checksum", checksum);
-    String genAcsBody = "jData=" + mapper.writeValueAsString(genAcsPayload);
-
-    String genAcsResponse = postForm("https://api.shoonya.com/NorenWClientAPI/GenAcsTok", genAcsBody);
-    JsonNode genAcsJson = mapper.readTree(genAcsResponse);
-    if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
-        throw new IllegalStateException("GenAcsTok failed: " + genAcsJson.path("emsg").asText());
-    }
-
-    accessToken = genAcsJson.path("access_token").asText(genAcsJson.path("susertoken").asText());
-    sUserToken = genAcsJson.path("susertoken").asText(accessToken);
-    System.out.println("GenAcsTok OK, session acquired");
+ShoonyaAuthenticator auth = new ShoonyaAuthenticator(
+cfg,
+org.springframework.web.reactive.function.client.WebClient.builder(),
+mapper
+);
+String token = auth.authenticate().block();
+accessToken = token;
+sUserToken = auth.getSUserToken() != null ? auth.getSUserToken() : token;
+System.out.println("GenAcsTok OK, session token: " + (sUserToken != null ? sUserToken.substring(0, 8) + "..." : "null"));
 }
 
     private static String postForm(String urlStr, String formData) throws Exception {
@@ -190,11 +212,13 @@ public class ShoonyaTokenFinder {
                     String value = line.substring(idx + 1).trim();
                     switch (key) {
                         case "SHOONYA_USER_ID" -> SHOONYA_USER_ID = value;
+                        case "SHOONYA_ACCOUNT_ID" -> SHOONYA_ACCOUNT_ID = value;
                         case "SHOONYA_CLIENT_ID" -> SHOONYA_CLIENT_ID = value;
                         case "SHOONYA_SECRET_KEY" -> SHOONYA_SECRET_KEY = value;
                         case "SHOONYA_PASSWORD" -> SHOONYA_PASSWORD = value;
                         case "SHOONYA_TOTP_SECRET" -> SHOONYA_TOTP_SECRET = value;
                         case "SHOONYA_API_KEY" -> SHOONYA_API_KEY = value;
+                        case "SHOONYA_VENDOR_CODE" -> SHOONYA_VENDOR_CODE = value;
                     }
                 }
             }

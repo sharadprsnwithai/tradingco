@@ -161,7 +161,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
                 return webClient.post()
                     .uri("/NorenWClientAPI/PlaceOrder")
-                    .header(HttpHeaders.AUTHORIZATION, token)
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromValue(formBody))
                     .retrieve()
@@ -212,7 +212,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
                 return webClient.post()
                     .uri("/NorenWClientAPI/ModifyOrder")
-                    .header(HttpHeaders.AUTHORIZATION, token)
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                     .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                     .body(BodyInserters.fromValue(formBody))
                     .retrieve()
@@ -245,7 +245,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
             return webClient.post()
                 .uri("/NorenWClientAPI/CancelOrder")
-                .header(HttpHeaders.AUTHORIZATION, token)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .body(BodyInserters.fromValue(formBody))
                 .retrieve()
@@ -267,14 +267,18 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
             return webClient.post()
                 .uri("/NorenWClientAPI/OrderBook")
-                .header(HttpHeaders.AUTHORIZATION, token)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .body(BodyInserters.fromValue(formBody))
                 .retrieve()
                 .bodyToMono(String.class)
                 .map(this::parseOrderBook);
         }).onErrorResume(ex -> {
-            log.error("Failed to fetch Shoonya order book: {}", ex.getMessage());
+            String detail = ex.getMessage();
+            if (ex instanceof org.springframework.web.reactive.function.client.WebClientResponseException wcre) {
+                detail = wcre.getStatusCode() + " - " + wcre.getResponseBodyAsString();
+            }
+            log.error("Failed to fetch Shoonya order book: {}", detail);
             return Mono.just(List.of());
         });
     }
@@ -291,7 +295,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
             log.info("Fetching Shoonya positions for user: {}", config.getUserId());
             return webClient.post()
                 .uri("/NorenWClientAPI/PositionBook")
-                .header(HttpHeaders.AUTHORIZATION, token)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .body(BodyInserters.fromValue(formBody))
                 .retrieve()
@@ -314,7 +318,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
             return webClient.post()
                 .uri("/NorenWClientAPI/Limits")
-                .header(HttpHeaders.AUTHORIZATION, token)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .body(BodyInserters.fromValue(formBody))
                 .retrieve()
@@ -360,7 +364,8 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                         log.warn("No Shoonya tokens resolved for {} symbols - feed NOT started", symbols.size());
                         return Flux.empty();
                     }
-                    ensureWsConnected(token, newKeys);
+                    // WebSocket session handshake requires the susertoken (NOT the REST access_token)
+                    ensureWsConnected(authenticator.getSUserToken(), newKeys);
                     return tickSink.asFlux();
                 }));
     }
@@ -579,9 +584,9 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      */
     private String buildFormBody(Map<String, Object> payload, String token) {
         try {
-            return "jData=" + objectMapper.writeValueAsString(payload) + "&jKey=" + token;
+            return "jData=" + objectMapper.writeValueAsString(payload);
         } catch (Exception e) {
-            return "jData={}&jKey=" + token;
+            return "jData={}";
         }
     }
 

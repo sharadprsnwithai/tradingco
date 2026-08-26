@@ -4,7 +4,7 @@ server:
 
 logging:
   level:
-    com.tradingbot: DEBUG
+    com.tradingbot: INFO
   file:
     name: ${LOGGING_FILE_NAME:${LOG_FILE:logs/trading-bot.log}}
   logback:

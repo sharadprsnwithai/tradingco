@@ -62,7 +62,9 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
                                      ShoonyaGainersLosersProvider shoonyaBackup) {
         this.config = config;
         this.authenticator = authenticator;
-        this.webClient = webClientBuilder.baseUrl(KITE_REST).build();
+        this.webClient = webClientBuilder.baseUrl(KITE_REST)
+            .codecs(c -> c.defaultCodecs().maxInMemorySize(64 * 1024 * 1024))
+            .build();
         this.objectMapper = objectMapper;
         this.fallback = fallback;
         this.shoonyaBackup = shoonyaBackup;

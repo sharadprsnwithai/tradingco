@@ -155,52 +155,41 @@ public class ShoonyaAuthenticator {
         throw new IllegalStateException("Shoonya Step 1 QuickAuth failed: " + quickAuthJson.path("emsg").asText());
     }
 
-    // The QuickAuth susertoken is NOT valid for REST calls. Always exchange the
-    // authorization code via GenAcsTok to obtain the real session token (susertoken).
     String authCode = quickAuthJson.path("code").asText(null);
     if (authCode == null || authCode.isBlank()) {
         throw new IllegalStateException("Shoonya QuickAuth did not return an authorization code needed for GenAcsTok");
     }
     log.info("Shoonya Step 1 QuickAuth succeeded, auth code acquired");
 
-    // Step 2: GenAcsTok (only when code exchange required)
+    // Step 2: GenAcsTok exchanges the OAuth code for the real NorenWClientAPI session token.
+    // Per Shoonya's current auth model the QuickAuth susertoken is deprecated and is NOT a valid
+    // session for NorenWClientAPI REST/WS - the activated session token comes from GenAcsTok
+    // (its "susertoken" field, which equals "access_token"). That token is used as the REST
+    // body jKey and as the WebSocket handshake token. No Authorization header is sent.
     String checksum = DigestUtils.sha256Hex(config.getClientId() + config.getSecretKey() + authCode);
-    Map<String, String> genAcsPayload = Map.of(
-        "code", authCode,
-        "checksum", checksum
-    );
-
+    Map<String, String> genAcsPayload = Map.of("code", authCode, "checksum", checksum);
     String genAcsBody = "jData=" + objectMapper.writeValueAsString(genAcsPayload);
-
-    String genAcsResponse;
-    try {
-        genAcsResponse = webClient.post()
-            .uri("/NorenWClientAPI/GenAcsTok")
-            .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-            .body(BodyInserters.fromValue(genAcsBody))
-            .retrieve()
-            .bodyToMono(String.class)
-            .block();
-    } catch (WebClientResponseException e) {
-        log.error("Shoonya GenAcsTok HTTP {}: {}", e.getStatusCode(), e.getResponseBodyAsString());
-        throw new IllegalStateException("Shoonya GenAcsTok HTTP error: " + e.getStatusCode() + " - " + e.getResponseBodyAsString());
-    }
-
+    String genAcsResponse = webClient.post()
+        .uri("/NorenWClientAPI/GenAcsTok")
+        .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+        .body(BodyInserters.fromValue(genAcsBody))
+        .retrieve()
+        .bodyToMono(String.class)
+        .block();
     log.info("Shoonya GenAcsTok response: {}", genAcsResponse);
     JsonNode genAcsJson = objectMapper.readTree(genAcsResponse);
     if (!"Ok".equalsIgnoreCase(genAcsJson.path("stat").asText())) {
         throw new IllegalStateException("Shoonya Step 2 GenAcsTok failed: " + genAcsJson.path("emsg").asText());
     }
-
-    String userToken = genAcsJson.path("susertoken").asText(genAcsJson.path("access_token").asText());
-    String token = genAcsJson.path("access_token").asText(userToken);
-    // NorenAPI REST calls authenticate with the session token (susertoken) as jKey.
-    // Prefer the susertoken for both the access token and the WebSocket session token.
-    accessToken.set(userToken);
-    sUserToken.set(userToken);
-    saveDiskSession(token, userToken);
-    log.info("Shoonya Step 2 GenAcsTok succeeded. Session token cached.");
-    return token;
+    String sessionToken = genAcsJson.path("susertoken").asText(genAcsJson.path("access_token").asText());
+    if (sessionToken == null || sessionToken.isBlank()) {
+        throw new IllegalStateException("Shoonya GenAcsTok did not return a session token");
+    }
+    log.info("Shoonya Step 2 GenAcsTok succeeded; using GenAcsTok session token for NorenWClientAPI (REST jKey + WS)");
+    accessToken.set(sessionToken);
+    sUserToken.set(sessionToken);
+    saveDiskSession(sessionToken, sessionToken);
+    return sessionToken;
 }
 
     /**

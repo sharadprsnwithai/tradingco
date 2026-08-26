@@ -49,6 +49,7 @@ public class MarketDataHub {
     private final AtomicReference<Disposable> watchdogSubscription = new AtomicReference<>();
     private final AtomicBoolean failoverRefusedLogged = new AtomicBoolean(false);
     private final AtomicBoolean silenceWarned = new AtomicBoolean(false);
+    private final AtomicBoolean primaryOnly = new AtomicBoolean(false);
 
     /**
      * Constructs a MarketDataHub with the given dependencies.
@@ -114,8 +115,16 @@ public class MarketDataHub {
                         candleAggregator.onTick(tick);
                     })
                     .doOnError(err -> {
-                        log.error("Error on {} feed stream: {}. Triggering failover.", brokerId, err.getMessage());
-                        triggerFailover("Feed stream error: " + err.getMessage());
+                        if (SECONDARY_BROKER.equals(brokerId)) {
+                            log.error("Error on {} feed stream: {}. Reverting to primary (failover abandoned).",
+                                brokerId, err.getMessage());
+                            failedOver.set(false);
+                            primaryOnly.set(true);
+                            connectFeed(PRIMARY_BROKER).subscribe();
+                        } else {
+                            log.error("Error on {} feed stream: {}. Triggering failover.", brokerId, err.getMessage());
+                            triggerFailover("Feed stream error: " + err.getMessage());
+                        }
                     })
                     .subscribe(
                         v -> {},
@@ -148,7 +157,7 @@ public class MarketDataHub {
      * expected when the exchange is closed, so silence then is not an alarm.
      */
     public void checkSilence() {
-        if (activeSymbols.isEmpty() || failedOver.get()) {
+        if (activeSymbols.isEmpty() || primaryOnly.get()) {
             return;
         }
         if (!isMarketHours()) {
@@ -156,14 +165,27 @@ public class MarketDataHub {
         }
 
         Instant last = lastTickTime.get();
-        if (last != null && Duration.between(last, Instant.now()).compareTo(silenceThreshold) > 0) {
-            String msg = String.format("Feed silence detected on %s (> %ds without ticks). Triggering sticky failover to %s.",
-                activeBrokerId.get(), silenceThreshold.toSeconds(), SECONDARY_BROKER);
-            if (silenceWarned.compareAndSet(false, true)) {
-                log.warn(msg); // once per silence episode; reset on next tick
-            }
-            triggerFailover(msg);
+        if (last == null || Duration.between(last, Instant.now()).compareTo(silenceThreshold) <= 0) {
+            return;
         }
+
+        if (failedOver.get()) {
+            // Secondary has been silent since failover -> revert to primary (one-shot) so the
+            // hub is never parked on a dead feed. Primary's own SDK auto-reconnect is the recovery path.
+            log.error("Secondary feed {} silent (>{}s) after failover - reverting to primary {}",
+                activeBrokerId.get(), silenceThreshold.toSeconds(), PRIMARY_BROKER);
+            failedOver.set(false);
+            primaryOnly.set(true);
+            connectFeed(PRIMARY_BROKER).subscribe();
+            return;
+        }
+
+        String msg = String.format("Feed silence detected on %s (> %ds without ticks). Triggering failover to %s.",
+            activeBrokerId.get(), silenceThreshold.toSeconds(), SECONDARY_BROKER);
+        if (silenceWarned.compareAndSet(false, true)) {
+            log.warn(msg); // once per silence episode; reset on next tick
+        }
+        triggerFailover(msg);
     }
 
     /**
@@ -184,7 +206,7 @@ public class MarketDataHub {
      * the watchdog stays armed (the latch is NOT set on refusal).
      */
     public synchronized void triggerFailover(String reason) {
-        if (failedOver.get()) return;
+        if (failedOver.get() || primaryOnly.get()) return;
 
         // Synchronous registry lookup — this method is called from the watchdog's
         // interval thread where blocking a Mono is not permitted

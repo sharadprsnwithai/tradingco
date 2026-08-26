@@ -41,6 +41,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicLong;
 
 @Component
 public class KiteBrokerAdapter implements BrokerAdapter {
@@ -429,7 +430,12 @@ public class KiteBrokerAdapter implements BrokerAdapter {
                 ticker.setMode(all, KiteTicker.modeQuote);
             }
         });
+        AtomicLong tickCounter = new AtomicLong();
         ticker.setOnTickerArrivalListener(sdkTicks -> {
+            long count = tickCounter.addAndGet(sdkTicks != null ? sdkTicks.size() : 0);
+            if (count == 1 || count % 2000 == 0) {
+                log.debug("Kite ticker arrivals: {} ticks received so far", count);
+            }
             for (com.zerodhatech.models.Tick sdkTick : sdkTicks) {
                 Set<String> syms = tokenToSymbols.get(sdkTick.getInstrumentToken());
                 if (syms == null) continue;
