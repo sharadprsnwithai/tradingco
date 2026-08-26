@@ -245,6 +245,30 @@ public class ShoonyaAuthenticator {
     }
 
     /**
+     * Invalidates the current session, forcing the next {@link #getAccessToken()}
+     * call to re-authenticate. Used when Shoonya rejects the session token
+     * (HTTP 401/403), which happens when the overnight session has been killed
+     * or the cached/disk token has expired.
+     *
+     * <p>Both the in-memory token and the on-disk session cache are cleared so a
+     * stale disk session (still within its 12h window but dead at Shoonya) is not
+     * reloaded on the next auth attempt.</p>
+     */
+    public void invalidateToken() {
+        accessToken.set(null);
+        sUserToken.set(null);
+        try {
+            if (SESSION_FILE.exists() && !SESSION_FILE.delete()) {
+                log.warn("Could not delete stale Shoonya session file: {}", SESSION_FILE.getAbsolutePath());
+            } else {
+                log.info("Invalidated Shoonya session (in-memory + disk cache cleared)");
+            }
+        } catch (Exception e) {
+            log.warn("Failed to delete Shoonya session file on invalidate: {}", e.getMessage());
+        }
+    }
+
+    /**
      * Loads a fresh session from the disk cache if it exists and is less than 12 hours old.
      *
      * @return the cached access token if valid, or null if expired or not found

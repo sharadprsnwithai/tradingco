@@ -135,8 +135,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<OrderResult> placeOrder(OrderRequest request) {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
+        return withTokenRetry(token -> {
                 Map<String, Object> payload = new HashMap<>();
                 payload.put("uid", config.getUserId());
                 payload.put("actid", config.getAccountId());
@@ -181,11 +180,11 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                         } catch (Exception e) {
                             return OrderResult.failure(request.tag(), "Parse error: " + e.getMessage());
                         }
-                    })
-                    .onErrorResume(ex -> {
-                        log.error("Shoonya placeOrder failed: {}", ex.getMessage());
-                        return Mono.just(OrderResult.failure(request.tag(), ex.getMessage()));
                     });
+            })
+            .onErrorResume(ex -> {
+                log.error("Shoonya placeOrder failed: {}", ex.getMessage());
+                return Mono.just(OrderResult.failure(request.tag(), ex.getMessage()));
             });
     }
 
@@ -194,8 +193,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<OrderResult> modifyOrder(String orderId, OrderModifyRequest request) {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
+        return withTokenRetry(token -> {
                 Map<String, Object> payload = new HashMap<>();
                 payload.put("uid", config.getUserId());
                 payload.put("actid", config.getAccountId());
@@ -231,9 +229,9 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                         } catch (Exception e) {
                             return OrderResult.failure(request.orderId(), "Parse error: " + e.getMessage());
                         }
-                    })
-                    .onErrorResume(ex -> Mono.just(OrderResult.failure(request.orderId(), ex.getMessage())));
-            });
+                    });
+            })
+            .onErrorResume(ex -> Mono.just(OrderResult.failure(request.orderId(), ex.getMessage())));
     }
 
     /**
@@ -241,23 +239,21 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<Void> cancelOrder(String orderId) {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
-                Map<String, Object> payload = Map.of("uid", config.getUserId(), "norenordno", orderId);
-                String formBody = buildFormBody(payload, token);
+        return withTokenRetry(token -> {
+            Map<String, Object> payload = Map.of("uid", config.getUserId(), "norenordno", orderId);
+            String formBody = buildFormBody(payload, token);
 
-                return webClient.post()
-                    .uri("/NorenWClientAPI/CancelOrder")
-                    .header(HttpHeaders.AUTHORIZATION, token)
-                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                    .body(BodyInserters.fromValue(formBody))
-                    .retrieve()
-                    .bodyToMono(Void.class)
-                    .onErrorResume(ex -> {
-                        log.error("Failed to cancel Shoonya order {}: {}", orderId, ex.getMessage());
-                        return Mono.empty();
-                    });
-            });
+            return webClient.post()
+                .uri("/NorenWClientAPI/CancelOrder")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(BodyInserters.fromValue(formBody))
+                .retrieve()
+                .bodyToMono(Void.class);
+        }).onErrorResume(ex -> {
+            log.error("Failed to cancel Shoonya order {}: {}", orderId, ex.getMessage());
+            return Mono.empty();
+        });
     }
 
     /**
@@ -265,24 +261,22 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<List<Order>> getOrderBook() {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
-                Map<String, Object> payload = Map.of("uid", config.getUserId());
-                String formBody = buildFormBody(payload, token);
+        return withTokenRetry(token -> {
+            Map<String, Object> payload = Map.of("uid", config.getUserId());
+            String formBody = buildFormBody(payload, token);
 
-                return webClient.post()
-                    .uri("/NorenWClientAPI/OrderBook")
-                    .header(HttpHeaders.AUTHORIZATION, token)
-                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                    .body(BodyInserters.fromValue(formBody))
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .map(this::parseOrderBook)
-                    .onErrorResume(ex -> {
-                        log.error("Failed to fetch Shoonya order book: {}", ex.getMessage());
-                        return Mono.just(List.of());
-                    });
-            });
+            return webClient.post()
+                .uri("/NorenWClientAPI/OrderBook")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(BodyInserters.fromValue(formBody))
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(this::parseOrderBook);
+        }).onErrorResume(ex -> {
+            log.error("Failed to fetch Shoonya order book: {}", ex.getMessage());
+            return Mono.just(List.of());
+        });
     }
 
     /**
@@ -290,25 +284,23 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<List<Position>> getPositions() {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
-                Map<String, Object> payload = Map.of("uid", config.getUserId(), "actid", config.getAccountId());
-                String formBody = buildFormBody(payload, token);
+        return withTokenRetry(token -> {
+            Map<String, Object> payload = Map.of("uid", config.getUserId(), "actid", config.getAccountId());
+            String formBody = buildFormBody(payload, token);
 
-                log.info("Fetching Shoonya positions for user: {}", config.getUserId());
-                return webClient.post()
-                    .uri("/NorenWClientAPI/PositionBook")
-                    .header(HttpHeaders.AUTHORIZATION, token)
-                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                    .body(BodyInserters.fromValue(formBody))
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .map(this::parsePositions)
-                    .onErrorResume(ex -> {
-                        log.error("Failed to fetch Shoonya positions: {}", ex.getMessage());
-                        return Mono.just(List.of());
-                    });
-            });
+            log.info("Fetching Shoonya positions for user: {}", config.getUserId());
+            return webClient.post()
+                .uri("/NorenWClientAPI/PositionBook")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(BodyInserters.fromValue(formBody))
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(this::parsePositions);
+        }).onErrorResume(ex -> {
+            log.error("Failed to fetch Shoonya positions: {}", ex.getMessage());
+            return Mono.just(List.of());
+        });
     }
 
     /**
@@ -316,33 +308,31 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      */
     @Override
     public Mono<MarginInfo> getMargins() {
-        return authenticator.getAccessToken()
-            .flatMap(token -> {
-                Map<String, Object> payload = Map.of("uid", config.getUserId(), "actid", config.getAccountId());
-                String formBody = buildFormBody(payload, token);
+        return withTokenRetry(token -> {
+            Map<String, Object> payload = Map.of("uid", config.getUserId(), "actid", config.getAccountId());
+            String formBody = buildFormBody(payload, token);
 
-                return webClient.post()
-                    .uri("/NorenWClientAPI/Limits")
-                    .header(HttpHeaders.AUTHORIZATION, token)
-                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                    .body(BodyInserters.fromValue(formBody))
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .map(json -> {
-                        try {
-                            JsonNode root = objectMapper.readTree(json);
-                            BigDecimal cash = BigDecimal.valueOf(root.path("cash").asDouble(0.0));
-                            BigDecimal marginUsed = BigDecimal.valueOf(root.path("marginused").asDouble(0.0));
-                            BigDecimal payin = BigDecimal.valueOf(root.path("payin").asDouble(0.0));
-                            BigDecimal available = cash.add(payin).subtract(marginUsed);
-                            BigDecimal total = cash.add(payin);
-                            return MarginInfo.of(config.getAccountId(), BROKER_ID, available, marginUsed, total, cash);
-                        } catch (Exception e) {
-                            return MarginInfo.of(config.getAccountId(), BROKER_ID, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
-                        }
-                    })
-                    .onErrorResume(ex -> Mono.just(MarginInfo.of(config.getAccountId(), BROKER_ID, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO)));
-            });
+            return webClient.post()
+                .uri("/NorenWClientAPI/Limits")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(BodyInserters.fromValue(formBody))
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(json -> {
+                    try {
+                        JsonNode root = objectMapper.readTree(json);
+                        BigDecimal cash = BigDecimal.valueOf(root.path("cash").asDouble(0.0));
+                        BigDecimal marginUsed = BigDecimal.valueOf(root.path("marginused").asDouble(0.0));
+                        BigDecimal payin = BigDecimal.valueOf(root.path("payin").asDouble(0.0));
+                        BigDecimal available = cash.add(payin).subtract(marginUsed);
+                        BigDecimal total = cash.add(payin);
+                        return MarginInfo.of(config.getAccountId(), BROKER_ID, available, marginUsed, total, cash);
+                    } catch (Exception e) {
+                        return MarginInfo.of(config.getAccountId(), BROKER_ID, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO);
+                    }
+                });
+        }).onErrorResume(ex -> Mono.just(MarginInfo.of(config.getAccountId(), BROKER_ID, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO)));
     }
 
     /**
@@ -749,5 +739,42 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
             case "OPEN" -> OrderStatus.OPEN;
             default -> OrderStatus.PENDING;
         };
+    }
+
+    /**
+     * Executes an authenticated Shoonya REST call, transparently re-authenticating
+     * and retrying exactly once when Shoonya rejects the session token
+     * (HTTP 401/403). Shoonya kills sessions overnight / on expiry, so a cached
+     * or on-disk token that is still "fresh" locally can be dead at the server —
+     * without this retry, every subsequent call fails until a manual restart.
+     *
+     * @param apiCall the API call to execute with a valid session token
+     * @param <T>     the response type
+     * @return a reactive Mono containing the API response
+     */
+    private <T> Mono<T> withTokenRetry(java.util.function.Function<String, Mono<T>> apiCall) {
+        return authenticator.getAccessToken()
+            .flatMap(apiCall)
+            .onErrorResume(ShoonyaBrokerAdapter::isTokenError, ex -> {
+                log.warn("Shoonya rejected session token (401/403) - re-authenticating and retrying once");
+                authenticator.invalidateToken();
+                return authenticator.getAccessToken().flatMap(apiCall);
+            });
+    }
+
+    /**
+     * Determines whether an error indicates an invalid/expired Shoonya session
+     * token (HTTP 401 Unauthorized or 403 Forbidden).
+     *
+     * @param ex the error to inspect
+     * @return true if the error is an authentication/token failure
+     */
+    private static boolean isTokenError(Throwable ex) {
+        if (ex instanceof org.springframework.web.reactive.function.client.WebClientResponseException wcre) {
+            int status = wcre.getStatusCode().value();
+            return status == 401 || status == 403;
+        }
+        String msg = ex.getMessage();
+        return msg != null && (msg.contains("401") || msg.contains("403") || msg.toLowerCase().contains("unauthorized"));
     }
 }
