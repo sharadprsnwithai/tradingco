@@ -61,6 +61,8 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
     private final double superTrendMultiplier;
     private final int rsiPeriod;
     private final double rsiThreshold;
+    private final double rsiUpperThreshold;
+    private final double rsiLowerThreshold;
     private final double targetDelta;
     private final double minPremium;
     private final double stopLossPct;
@@ -94,10 +96,12 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         @Value("${st-intraday.super-trend.multiplier:3.0}") double superTrendMultiplier,
         @Value("${st-intraday.rsi.period:14}") int rsiPeriod,
         @Value("${st-intraday.rsi.threshold:50.0}") double rsiThreshold,
+        @Value("${st-intraday.rsi.upper-threshold:55.0}") double rsiUpperThreshold,
+        @Value("${st-intraday.rsi.lower-threshold:45.0}") double rsiLowerThreshold,
         @Value("${st-intraday.option-selection.target-delta:0.20}") double targetDelta,
         @Value("${st-intraday.option-selection.min-premium:70.0}") double minPremium,
-        @Value("${st-intraday.risk.stop-loss-pct:30.0}") double stopLossPct,
-        @Value("${st-intraday.risk.profit-target-pct:0.0}") double profitTargetPct,
+        @Value("${st-intraday.risk.stop-loss-pct:60.0}") double stopLossPct,
+        @Value("${st-intraday.risk.profit-target-pct:50.0}") double profitTargetPct,
         @Value("${st-intraday.lots:1}") int lots,
         @Value("${st-intraday.eod-exit-time:15:00}") String eodExitTime,
         @Value("${st-intraday.re-entry-cooldown-candles:3}") int reEntryCooldownCandles,
@@ -115,6 +119,8 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         this.superTrendMultiplier = superTrendMultiplier;
         this.rsiPeriod = rsiPeriod;
         this.rsiThreshold = rsiThreshold;
+        this.rsiUpperThreshold = rsiUpperThreshold;
+        this.rsiLowerThreshold = rsiLowerThreshold;
         this.targetDelta = targetDelta;
         this.minPremium = minPremium;
         this.stopLossPct = stopLossPct;
@@ -133,6 +139,35 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         this.symbols.add(symbol);
     }
 
+    public IntradayTrendMomentumOptionSellingStrategy(
+        String strategyId,
+        String assignedAccountId,
+        String symbol,
+        int superTrendAtrLength,
+        double superTrendMultiplier,
+        int rsiPeriod,
+        double rsiThreshold,
+        double targetDelta,
+        double minPremium,
+        double stopLossPct,
+        double profitTargetPct,
+        int lots,
+        String eodExitTime,
+        int reEntryCooldownCandles,
+        int maxTradesPerDay,
+        List<String> blackoutDays,
+        KitePcrProvider kitePcrProvider,
+        InstrumentMasterService instrumentMaster,
+        LotSizeService lotSizeService,
+        CandleAggregator candleAggregator
+    ) {
+        this(strategyId, assignedAccountId, symbol, superTrendAtrLength, superTrendMultiplier,
+            rsiPeriod, rsiThreshold, rsiThreshold + 5.0, rsiThreshold - 5.0,
+            targetDelta, minPremium, stopLossPct, profitTargetPct, lots, eodExitTime,
+            reEntryCooldownCandles, maxTradesPerDay, blackoutDays,
+            kitePcrProvider, instrumentMaster, lotSizeService, candleAggregator);
+    }
+
     public IntradayTrendMomentumOptionSellingStrategy(String strategyId, String assignedAccountId, String symbol) {
         this.strategyId = strategyId;
         this.assignedAccountId = assignedAccountId;
@@ -141,10 +176,12 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         this.superTrendMultiplier = 3.0;
         this.rsiPeriod = 14;
         this.rsiThreshold = 50.0;
+        this.rsiUpperThreshold = 55.0;
+        this.rsiLowerThreshold = 45.0;
         this.targetDelta = 0.20;
         this.minPremium = 70.0;
-        this.stopLossPct = 30.0;
-        this.profitTargetPct = 0.0;
+        this.stopLossPct = 60.0;
+        this.profitTargetPct = 50.0;
         this.lots = 1;
         this.eodExitTime = "15:00";
         this.parsedEodExitTime = parseEodExitTime(eodExitTime);
@@ -360,12 +397,12 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         boolean bullishSuperTrend = lastSuperTrend > 0;
         boolean bearishSuperTrend = lastSuperTrend < 0;
 
-        // Calculate RSI on 1h
+        // Calculate RSI on 1h with deadband (>= 55 for Bullish, <= 45 for Bearish)
         double rsi1h = TechnicalIndicators.calculateRsi(closes1h, rsiPeriod);
         if (Double.isNaN(rsi1h)) return;
 
-        boolean bullishRsi = rsi1h > rsiThreshold;
-        boolean bearishRsi = rsi1h < rsiThreshold;
+        boolean bullishRsi = rsi1h >= rsiUpperThreshold;
+        boolean bearishRsi = rsi1h <= rsiLowerThreshold;
 
         // Determine direction
         Direction direction = null;
@@ -690,8 +727,46 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
     // ========== Exit Logic ==========
 
     private void checkCandleExits(Candle candle) {
-        // EOD exit is handled by onSchedule
-        // Candle-based exits are for position monitoring
+        // 1. Cut position immediately if 15m SuperTrend flips against active trade
+        if (context != null && daily.tradeDirection != null) {
+            List<Candle> candles15m = context.getHistoricalCandles(underlyingSymbol, TIMEFRAME_15M, 100);
+            if (candles15m != null && candles15m.size() >= superTrendAtrLength + 2) {
+                int len = candles15m.size();
+                double[] highs = new double[len];
+                double[] lows = new double[len];
+                double[] closes = new double[len];
+                for (int i = 0; i < len; i++) {
+                    highs[i] = candles15m.get(i).high().doubleValue();
+                    lows[i] = candles15m.get(i).low().doubleValue();
+                    closes[i] = candles15m.get(i).close().doubleValue();
+                }
+                double[] st = TechnicalIndicators.calculateSuperTrend(highs, lows, closes, superTrendAtrLength, superTrendMultiplier);
+                double lastSt = st[st.length - 1];
+                if (!Double.isNaN(lastSt)) {
+                    if (daily.tradeDirection == Direction.BULLISH && lastSt < 0) {
+                        double currentPremium = isLiveMode()
+                            ? (daily.lastPremiumLtp > 0 ? daily.lastPremiumLtp : daily.entryPremium)
+                            : daily.currentPremium;
+                        exitTrade(currentPremium, "SUPERTREND_FLIP_EXIT", candle.timestamp());
+                        return;
+                    } else if (daily.tradeDirection == Direction.BEARISH && lastSt > 0) {
+                        double currentPremium = isLiveMode()
+                            ? (daily.lastPremiumLtp > 0 ? daily.lastPremiumLtp : daily.entryPremium)
+                            : daily.currentPremium;
+                        exitTrade(currentPremium, "SUPERTREND_FLIP_EXIT", candle.timestamp());
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 2. Check EOD exit
+        if (isEodTime()) {
+            double currentPremium = isLiveMode()
+                ? (daily.lastPremiumLtp > 0 ? daily.lastPremiumLtp : daily.entryPremium)
+                : daily.currentPremium;
+            exitTrade(currentPremium, "EOD_EXIT", candle.timestamp());
+        }
     }
 
     private void checkTickExits(Tick tick) {
@@ -763,9 +838,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         double close15m = closes15m[closes15m.length - 1];
         boolean conditionStillValid = false;
         if (daily.tradeDirection == Direction.BULLISH) {
-            conditionStillValid = lastSuperTrend > 0 && rsi1h > rsiThreshold;
+            conditionStillValid = lastSuperTrend > 0 && rsi1h >= rsiUpperThreshold;
         } else if (daily.tradeDirection == Direction.BEARISH) {
-            conditionStillValid = lastSuperTrend < 0 && rsi1h < rsiThreshold;
+            conditionStillValid = lastSuperTrend < 0 && rsi1h <= rsiLowerThreshold;
         }
 
         if (!conditionStillValid) {
