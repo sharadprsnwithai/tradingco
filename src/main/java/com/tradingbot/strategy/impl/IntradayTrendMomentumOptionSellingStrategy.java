@@ -146,7 +146,7 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         this.stopLossPct = 30.0;
         this.profitTargetPct = 0.0;
         this.lots = 1;
-        this.eodExitTime = "15:20";
+        this.eodExitTime = "15:00";
         this.parsedEodExitTime = parseEodExitTime(eodExitTime);
         this.reEntryCooldownCandles = 3;
         this.maxTradesPerDay = 0;
@@ -229,6 +229,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         ZonedDateTime candleTime = candle.timestamp().atZone(IST_ZONE);
         String candleDate = candleTime.format(DATE_FMT);
         if (!candleDate.equals(daily.currentDate)) {
+            if (daily.position == Position.IN_TRADE) {
+                squareOffAll("EOD_SQUARE_OFF");
+            }
             daily.currentDate = candleDate;
             synchronized (daily) {
                 daily.reset();

@@ -2,49 +2,62 @@ package com.tradingbot.backtest;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.tradingbot.adapter.shoonya.ShoonyaAuthenticator;
-import com.tradingbot.adapter.shoonya.ShoonyaConfig;
 import com.tradingbot.model.Candle;
 import com.tradingbot.nse.NseIndiaClient;
+import com.tradingbot.strategy.impl.IntradayTrendMomentumOptionSellingStrategy;
 import com.tradingbot.strategy.impl.LowestVolumeReversalStrategy;
+import com.tradingbot.strategy.impl.NiftyVwapMomentumReversalStrategy;
 import org.apache.commons.codec.digest.DigestUtils;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileReader;
-import java.io.InputStreamReader;
 import java.math.BigDecimal;
-import java.net.HttpURLConnection;
+import java.math.RoundingMode;
+import java.net.CookieManager;
+import java.net.CookiePolicy;
 import java.net.URI;
-import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 /**
- * Standalone backtest runner that fetches real historical data from Shoonya (Finvasia NorenAPI)
- * and runs LowestVolumeReversalStrategy through the BacktestEngine.
+ * Consolidated 1-Month Backtest Runner for ALL THREE Intraday Strategies
+ * using real historical market data from Shoonya (Finvasia NorenAPI).
  *
- * Authentication flow:
- *   1. QuickAuth with derived appkey + SHA-256(password) + TOTP
- *   2. GenAcsTok with SHA-256(clientId + secretKey + authCode)
- *   3. TPSeries POST with jData JSON + jKey session token
+ * Strategies evaluated:
+ *   1. Lowest Volume Reversal Strategy (F&O Stock basket: RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN - 5m)
+ *   2. Nifty VWAP Momentum Reversal Strategy (NIFTY 50 - 5m with daily VWAP, 9:30 & 11:00 snapshots + PCR)
+ *   3. Intraday Trend & Momentum Option Selling Strategy (NIFTY 50 - 15m & 60m with SuperTrend + RSI + MACD / live premium refresh)
+ *
+ * Run with: ./gradlew shoonyaBacktest
  */
 public class ShoonyaBacktestRunner {
 
     private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
     private static final ObjectMapper mapper = new ObjectMapper();
     private static final int[] KEY_OFFSETS = {83, 50, 97, 114, 110, 46, 27, 93};
+    private static final double VWAP_TRIGGER_TOLERANCE = 3.0;
+
+    private static final CookieManager cookieManager = new CookieManager(null, CookiePolicy.ACCEPT_ALL);
+    private static final HttpClient httpClient = HttpClient.newBuilder()
+        .cookieHandler(cookieManager)
+        .connectTimeout(Duration.ofSeconds(20))
+        .build();
 
     // Shoonya credentials from .env
     private static String SHOONYA_USER_ID;
@@ -56,329 +69,546 @@ public class ShoonyaBacktestRunner {
     private static String SHOONYA_API_KEY;
     private static String SHOONYA_VENDOR_CODE;
 
-    private static String accessToken;
     private static String sUserToken;
+
+    // F&O Stock Basket for Lowest Volume Reversal
+    private static final String[][] STOCK_BASKET = {
+        {"NSE:RELIANCE", "2885", "RELIANCE"},
+        {"NSE:TCS", "11536", "TCS"},
+        {"NSE:INFY", "1594", "INFY"},
+        {"NSE:HDFCBANK", "1333", "HDFCBANK"},
+        {"NSE:ICICIBANK", "4963", "ICICIBANK"},
+        {"NSE:SBIN", "3045", "SBIN"}
+    };
+
+    private static final String NIFTY_TOKEN = "26000";
+    private static final String NIFTY_SYMBOL = "NSE:NIFTY";
 
     public static void main(String[] args) throws Exception {
         loadEnv();
-        System.out.println("=".repeat(80));
-        System.out.println("  SHOONYA BACKTEST RUNNER - REAL NorenAPI DATA");
-        System.out.println("=".repeat(80));
+
+        System.out.println("=".repeat(92));
+        System.out.println("   SHOONYA (FINVASIA NorenAPI) 1-MONTH BACKTEST - 3 INTRADAY STRATEGIES");
+        System.out.println("=".repeat(92));
 
         // Step 1: Authenticate with Shoonya
-        System.out.println("\n[1/5] Authenticating with Shoonya (Finvasia NorenAPI)...");
-        if (!authenticateWithExistingSession()) {
-            authenticateShoonya();
-        }
-        System.out.println("  -> Shoonya authentication successful");
+        System.out.println("\n[1/5] Authenticating with Shoonya API...");
+        authenticateShoonya();
+        System.out.println("  -> Shoonya authentication successful (Session Token: " + sUserToken.substring(0, 8) + "...)");
 
-        // Step 2: Fetch scripmasters to discover tokens
-        System.out.println("\n[2/5] Fetching Shoonya scripmasters for instrument tokens...");
-        Map<String, String> symbolToToken = discoverShoonyaTokens();
+        // Step 2: Date window setup (last 30 calendar days)
+        int daysBack = args.length > 0 ? Integer.parseInt(args[0]) : 30;
+        LocalDate toDate = LocalDate.now(IST);
+        LocalDate fromDate = toDate.minusDays(daysBack);
+        long endEpoch = Instant.now().getEpochSecond();
+        long startEpoch = endEpoch - (long) daysBack * 24 * 3600;
 
-        if (symbolToToken.isEmpty()) {
-            System.err.println("ERROR: No instrument tokens discovered. Cannot run backtest.");
-            return;
-        }
+        System.out.printf("%n[2/5] Fetching 1-Month Historical Data from Shoonya (%s to %s, %d days)...%n",
+            fromDate, toDate, daysBack);
 
-        // Step 3: Fetch 1 month of 5m historical candles via TPSeries
-        System.out.println("\n[3/5] Fetching 1-month historical 5m candles from Shoonya TPSeries...");
-        Map<String, List<Candle>> allCandles = new HashMap<>();
+        // Fetch NIFTY data (5m, 15m) and aggregate 60m
+        System.out.println("  -> Fetching NIFTY 50 Index candles from Shoonya...");
+        List<Candle> nifty5m = fetchShoonyaTPSeries("NSE", NIFTY_TOKEN, startEpoch, endEpoch, "5", NIFTY_SYMBOL);
+        Thread.sleep(400);
+        List<Candle> nifty15m = fetchShoonyaTPSeries("NSE", NIFTY_TOKEN, startEpoch, endEpoch, "15", NIFTY_SYMBOL);
+        Thread.sleep(400);
+        List<Candle> nifty60m = aggregateTo60m(nifty15m);
 
-        long nowEpoch = Instant.now().getEpochSecond();
-        long startEpoch = nowEpoch - (30L * 24 * 60 * 60); // 30 days ago
+        System.out.printf("     NIFTY 50: 5m = %d candles, 15m = %d candles, 60m (aggregated) = %d candles%n",
+            nifty5m.size(), nifty15m.size(), nifty60m.size());
 
-        for (Map.Entry<String, String> entry : symbolToToken.entrySet()) {
-            String symbol = entry.getKey();
-            String token = entry.getValue();
-            String exchange = symbol.startsWith("NSE:") ? "NSE" : "NFO";
-
-            List<Candle> candles = fetchShoonyaTPSeries(exchange, token, startEpoch, nowEpoch, "5", symbol);
+        // Fetch Stock Basket 5m data
+        System.out.println("  -> Fetching F&O Stock Basket 5m candles...");
+        Map<String, List<Candle>> stockCandles = new LinkedHashMap<>();
+        for (String[] stock : STOCK_BASKET) {
+            String canonical = stock[0];
+            String token = stock[1];
+            List<Candle> candles = fetchShoonyaTPSeries("NSE", token, startEpoch, endEpoch, "5", canonical);
             if (!candles.isEmpty()) {
-                allCandles.put(symbol, candles);
+                stockCandles.put(canonical, candles);
                 LocalDateTime first = LocalDateTime.ofInstant(candles.get(0).timestamp(), IST);
                 LocalDateTime last = LocalDateTime.ofInstant(candles.get(candles.size() - 1).timestamp(), IST);
-                System.out.printf("  -> %s: %d candles (%s to %s)%n", symbol, candles.size(),
+                System.out.printf("     %-16s (token=%-5s): %4d candles (%s to %s)%n",
+                    canonical, token, candles.size(),
                     first.format(DateTimeFormatter.ofPattern("dd-MM HH:mm")),
                     last.format(DateTimeFormatter.ofPattern("dd-MM HH:mm")));
             } else {
-                System.out.printf("  -> %s: NO DATA%n", symbol);
+                System.out.printf("     %-16s (token=%-5s): NO DATA%n", canonical, token);
             }
-            Thread.sleep(400); // Rate limiting (Shoonya: ~3 req/sec)
+            Thread.sleep(400);
         }
 
-        if (allCandles.isEmpty()) {
-            System.err.println("ERROR: No historical data fetched. Cannot run backtest.");
-            return;
-        }
-
-        // Step 4: Run backtests
-        System.out.println("\n[4/5] Running backtests...");
+        // Step 3: Run Strategy 1 - Lowest Volume Reversal Strategy
+        System.out.println("\n[3/5] Executing Strategy 1: Lowest Volume Reversal...");
         BacktestEngine engine = new BacktestEngine();
-        BigDecimal initialCapital = BigDecimal.valueOf(100000);
+        BigDecimal stockCapital = BigDecimal.valueOf(100000);
+        List<BacktestResult> lvrResults = runLowestVolumeReversal(engine, stockCapital, stockCandles);
 
-        // --- Backtest: LowestVolumeReversalStrategy ---
-        System.out.println("\n" + "=".repeat(80));
-        System.out.println("  BACKTEST: LOWEST VOLUME REVERSAL STRATEGY (Shoonya Data)");
-        System.out.println("=".repeat(80));
+        // Step 4: Run Strategy 2 - Nifty VWAP Momentum Reversal Strategy
+        System.out.println("\n[4/5] Executing Strategy 2: Nifty VWAP Momentum Reversal...");
+        BigDecimal vwapCapital = BigDecimal.valueOf(100000);
+        BacktestResult vwapSummary = runNiftyVwapStrategy(engine, vwapCapital, nifty5m);
+
+        // Step 5: Run Strategy 3 - Intraday Trend & Momentum Option Selling Strategy
+        System.out.println("\n[5/5] Executing Strategy 3: Intraday Trend & Momentum Option Selling...");
+        BigDecimal trendCapital = BigDecimal.valueOf(100000);
+        BacktestResult trendResult = runIntradayTrendMomentum(engine, trendCapital, nifty15m, nifty60m);
+
+        // Final Consolidated Portfolio Report
+        printConsolidatedReport(lvrResults, vwapSummary, trendResult);
+    }
+
+    // =========================================================================
+    // Strategy 1: Lowest Volume Reversal
+    // =========================================================================
+
+    private static List<BacktestResult> runLowestVolumeReversal(BacktestEngine engine,
+                                                               BigDecimal capital,
+                                                               Map<String, List<Candle>> stockCandles) {
+        System.out.println("=".repeat(92));
+        System.out.println("  STRATEGY 1: LOWEST VOLUME REVERSAL (F&O Stock Basket, 5m Timeframe)");
+        System.out.println("=".repeat(92));
 
         NseIndiaClient noOpNseClient = new NseIndiaClient(
-            org.springframework.web.reactive.function.client.WebClient.builder(),
-            new com.fasterxml.jackson.databind.ObjectMapper()
+            org.springframework.web.reactive.function.client.WebClient.builder(), mapper
         );
 
         com.tradingbot.instrument.LotSizeService mockLotSizeService = new com.tradingbot.instrument.LotSizeService(
             null, null, org.springframework.web.reactive.function.client.WebClient.builder()
         ) {
             @Override public int getLotSize(String s) { return 250; }
-            @Override public int getOrderQuantity(String s) { return 500; }
+            @Override public int getOrderQuantity(String s) { return 250; }
         };
 
-        for (Map.Entry<String, List<Candle>> entry : allCandles.entrySet()) {
+        List<BacktestResult> results = new ArrayList<>();
+        BigDecimal totalPnl = BigDecimal.ZERO;
+        int totalTrades = 0, totalWins = 0, totalLosses = 0;
+        BigDecimal grossProfit = BigDecimal.ZERO, grossLoss = BigDecimal.ZERO;
+
+        for (Map.Entry<String, List<Candle>> entry : stockCandles.entrySet()) {
             String symbol = entry.getKey();
             List<Candle> candles = entry.getValue();
 
-            if (symbol.equals("NSE:NIFTY") || symbol.equals("NSE:BANKNIFTY")) continue;
-
-            LowestVolumeReversalStrategy lvrStrategy = new LowestVolumeReversalStrategy(
-                "LVR_SHOONYA", "SHOONYA_ACCOUNT", symbol, 2, 2.0, 2, noOpNseClient, mockLotSizeService
+            LowestVolumeReversalStrategy strategy = new LowestVolumeReversalStrategy(
+                "LVR_" + symbol.replace("NSE:", ""), "SHOONYA_ACCOUNT", symbol, 2, 2.0, 2, noOpNseClient, mockLotSizeService
             );
 
             try {
-                BacktestResult result = engine.run(lvrStrategy, candles, initialCapital);
-                printResult("Lowest Volume Reversal", symbol, result);
+                BacktestResult result = engine.run(strategy, candles, capital);
+                results.add(result);
+                totalPnl = totalPnl.add(result.netPnL());
+                totalTrades += result.totalTrades();
+                totalWins += result.winningTrades();
+                totalLosses += result.losingTrades();
+                grossProfit = grossProfit.add(result.grossProfit());
+                grossLoss = grossLoss.add(result.grossLoss());
+
+                printResultRow(symbol, result);
             } catch (Exception e) {
                 System.out.printf("  ERROR backtesting %s: %s%n", symbol, e.getMessage());
             }
         }
 
-        // Step 5: Summary
-        System.out.println("\n[5/5] Backtest complete.");
-        System.out.println("\n" + "=".repeat(80));
-        System.out.println("  SHOONYA BACKTEST COMPLETE");
-        System.out.println("=".repeat(80));
+        double winRate = totalTrades > 0 ? (totalWins * 100.0 / totalTrades) : 0.0;
+        double profitFactor = grossLoss.compareTo(BigDecimal.ZERO) > 0
+            ? grossProfit.divide(grossLoss, 2, RoundingMode.HALF_UP).doubleValue()
+            : (grossProfit.compareTo(BigDecimal.ZERO) > 0 ? 99.9 : 1.0);
+
+        System.out.println("  " + "-".repeat(88));
+        System.out.printf("  %-16s | Trades: %3d | Win Rate: %5.1f%% (W:%2d L:%2d) | Gross Profit: %+10.2f | Gross Loss: %10.2f | Net P&L: %+10.2f%n",
+            "LVR BASKET TOTAL", totalTrades, winRate, totalWins, totalLosses, grossProfit, grossLoss, totalPnl);
+        System.out.printf("  Basket Profit Factor: %.2f%n", profitFactor);
+
+        return results;
     }
 
-    // ========== Shoonya Authentication ==========
+    // =========================================================================
+    // Strategy 2: Nifty VWAP Momentum Reversal
+    // =========================================================================
 
-    private static void saveDiskSession(String token, String userToken) {
-        try {
-            java.io.File sessionFile = new java.io.File("data/shoonya_session.json");
-            java.io.File parent = sessionFile.getParentFile();
-            if (parent != null && !parent.exists()) parent.mkdirs();
+    private static BacktestResult runNiftyVwapStrategy(BacktestEngine engine,
+                                                      BigDecimal capital,
+                                                      List<Candle> nifty5m) {
+        System.out.println("=".repeat(92));
+        System.out.println("  STRATEGY 2: NIFTY VWAP MOMENTUM REVERSAL (5m Timeframe, Daily Reset & Snapshots)");
+        System.out.println("=".repeat(92));
 
-            Map<String, Object> sessionData = new HashMap<>();
-            sessionData.put("accessToken", token);
-            sessionData.put("susertoken", userToken);
-            sessionData.put("createdAt", Instant.now().toString());
-
-            mapper.writeValue(sessionFile, sessionData);
-            System.out.println("  -> Saved Shoonya session to data/shoonya_session.json");
-        } catch (Exception e) {
-            System.out.println("  -> Warning: Could not cache Shoonya session: " + e.getMessage());
+        if (nifty5m.isEmpty()) {
+            System.out.println("  No NIFTY 5m candles available for backtest.");
+            return new BacktestResult("VWAP_NIFTY", capital, capital, BigDecimal.ZERO,
+                0, 0, 0, 0.0, BigDecimal.ZERO, BigDecimal.ZERO, 1.0, BigDecimal.ZERO, 0.0, List.of());
         }
-    }
 
-    private static boolean authenticateWithExistingSession() {
-        try {
-            java.io.File sessionFile = new java.io.File("data/shoonya_session.json");
-            if (!sessionFile.exists()) return false;
+        Map<LocalDate, List<Candle>> candlesByDay = splitIntoTradingDays(nifty5m);
+        System.out.printf("  Trading Days: %d | Total 5m Candles: %d%n%n", candlesByDay.size(), nifty5m.size());
 
-            JsonNode root = mapper.readTree(sessionFile);
-            String token = root.path("accessToken").asText(null);
-            String userToken = root.path("susertoken").asText(null);
-            String createdAtStr = root.path("createdAt").asText(null);
+        BigDecimal totalPnl = BigDecimal.ZERO;
+        int totalTrades = 0, totalWins = 0, totalLosses = 0;
+        BigDecimal grossProfit = BigDecimal.ZERO, grossLoss = BigDecimal.ZERO;
+        BigDecimal maxDrawdown = BigDecimal.ZERO;
+        List<BacktestTrade> allTrades = new ArrayList<>();
 
-            if (token == null || createdAtStr == null) return false;
+        System.out.printf("  %-12s | %-6s | %-6s | %-6s | %-8s | %-12s | %-12s%n",
+            "Date", "Trades", "Wins", "Losses", "WinRate", "Day P&L (Rs)", "Cum P&L (Rs)");
+        System.out.println("  " + "-".repeat(78));
 
-            Instant createdAt = Instant.parse(createdAtStr);
-            if (createdAt.plus(Duration.ofHours(12)).isBefore(Instant.now())) {
-                System.out.println("  -> Cached session expired, needs fresh login");
-                return false;
+        for (Map.Entry<LocalDate, List<Candle>> entry : candlesByDay.entrySet()) {
+            LocalDate day = entry.getKey();
+            List<Candle> dayCandles = entry.getValue();
+
+            NiftyVwapMomentumReversalStrategy strategy = new NiftyVwapMomentumReversalStrategy(
+                "VWAP_" + day, "BACKTEST_ACCOUNT", NIFTY_SYMBOL, VWAP_TRIGGER_TOLERANCE
+            );
+
+            simulateSnapshotsAndPcr(strategy, dayCandles, day);
+
+            BacktestResult dayResult = engine.run(strategy, dayCandles, capital);
+            totalPnl = totalPnl.add(dayResult.netPnL());
+            totalTrades += dayResult.totalTrades();
+            totalWins += dayResult.winningTrades();
+            totalLosses += dayResult.losingTrades();
+            grossProfit = grossProfit.add(dayResult.grossProfit());
+            grossLoss = grossLoss.add(dayResult.grossLoss());
+            if (dayResult.maxDrawdown().compareTo(maxDrawdown) > 0) {
+                maxDrawdown = dayResult.maxDrawdown();
             }
+            allTrades.addAll(dayResult.trades());
 
-            accessToken = token;
-            sUserToken = userToken;
-            System.out.println("  -> Using cached session from " + createdAtStr);
-            return true;
-        } catch (Exception e) {
-            System.out.println("  -> Could not load cached session: " + e.getMessage());
-            return false;
+            double dayWinRate = dayResult.totalTrades() > 0
+                ? (dayResult.winningTrades() * 100.0 / dayResult.totalTrades()) : 0.0;
+
+            System.out.printf("  %-12s | %6d | %6d | %6d | %7.1f%% | %+12.2f | %+12.2f%n",
+                day, dayResult.totalTrades(), dayResult.winningTrades(), dayResult.losingTrades(),
+                dayWinRate, dayResult.netPnL(), totalPnl);
         }
+
+        double winRate = totalTrades > 0 ? (totalWins * 100.0 / totalTrades) : 0.0;
+        double profitFactor = grossLoss.compareTo(BigDecimal.ZERO) > 0
+            ? grossProfit.divide(grossLoss, 2, RoundingMode.HALF_UP).doubleValue()
+            : (grossProfit.compareTo(BigDecimal.ZERO) > 0 ? 99.9 : 1.0);
+
+        System.out.println("  " + "-".repeat(78));
+        System.out.printf("  %-12s | %6d | %6d | %6d | %7.1f%% | %+12.2f | Gross Profit: %.2f | Gross Loss: %.2f%n",
+            "VWAP TOTAL", totalTrades, totalWins, totalLosses, winRate, totalPnl, grossProfit, grossLoss);
+        System.out.printf("  Profit Factor: %.2f | Max Drawdown: Rs.%.2f%n", profitFactor, maxDrawdown);
+
+        double maxDdPct = capital.compareTo(BigDecimal.ZERO) > 0
+            ? maxDrawdown.multiply(BigDecimal.valueOf(100)).divide(capital, 2, RoundingMode.HALF_UP).doubleValue()
+            : 0.0;
+
+        return new BacktestResult("VWAP_NIFTY_SUMMARY", capital, capital.add(totalPnl), totalPnl,
+            totalTrades, totalWins, totalLosses, winRate, grossProfit, grossLoss, profitFactor,
+            maxDrawdown, maxDdPct, allTrades);
     }
 
-    private static void authenticateShoonya() throws Exception {
-        ShoonyaConfig cfg = new ShoonyaConfig();
-        cfg.setEnabled(true);
-        cfg.setClientId(SHOONYA_CLIENT_ID);
-        cfg.setSecretKey(SHOONYA_SECRET_KEY);
-        cfg.setUserId(SHOONYA_USER_ID);
-        cfg.setAccountId(SHOONYA_ACCOUNT_ID);
-        cfg.setPassword(SHOONYA_PASSWORD);
-        cfg.setTotpSecret(SHOONYA_TOTP_SECRET);
-        cfg.setVendorCode(SHOONYA_VENDOR_CODE);
-        cfg.setApiKey(SHOONYA_API_KEY);
+    private static double nseBasePcr = 1.0;
 
-        ShoonyaAuthenticator auth = new ShoonyaAuthenticator(
-            cfg,
-            org.springframework.web.reactive.function.client.WebClient.builder(),
-            mapper
-        );
-        String token = auth.authenticate().block();
-        if (token == null || token.isBlank()) {
-            throw new IllegalStateException("Shoonya authentication failed to return a session token");
-        }
-        accessToken = token;
-        sUserToken = auth.getSUserToken() != null ? auth.getSUserToken() : token;
-        System.out.println("  -> Shoonya authenticated successfully via ShoonyaAuthenticator");
-    }
+    private static void simulateSnapshotsAndPcr(NiftyVwapMomentumReversalStrategy strategy,
+                                                List<Candle> dayCandles, LocalDate day) {
+        Instant nineThirty = day.atTime(9, 30).atZone(IST).toInstant();
+        Instant eleven = day.atTime(11, 0).atZone(IST).toInstant();
 
-    // ========== Shoonya Token Discovery ==========
+        double nifty930 = 0, nifty1100 = 0;
+        double pcr930 = nseBasePcr, pcr1100 = nseBasePcr;
 
-    private static Map<String, String> discoverShoonyaTokens() throws Exception {
-        Map<String, String> symbolToToken = new HashMap<>();
+        for (Candle c : dayCandles) {
+            Instant ts = c.timestamp();
+            double close = c.close().doubleValue();
 
-        // Shoonya scripmasters endpoint - returns CSV
-        HttpRequest request = HttpRequest.newBuilder()
-            .uri(URI.create("https://api.shoonya.com/ScripMaster.csv"))
-            .header("Authorization", accessToken)
-            .GET()
-            .build();
-
-        java.net.http.HttpClient httpClient = java.net.http.HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(15))
-            .build();
-
-        java.net.http.HttpResponse<String> response = httpClient.send(request,
-            java.net.http.HttpResponse.BodyHandlers.ofString());
-        String csv = response.body();
-
-        if (csv == null || csv.isBlank()) {
-            System.out.println("  -> WARNING: Empty scripmaster response, using known tokens");
-            return getKnownTokens();
-        }
-
-        System.out.println("  -> Received scripmaster data (" + csv.length() + " bytes)");
-
-        // Parse CSV - find NSE EQ instruments for our target symbols
-        String[] lines = csv.split("\n");
-        if (lines.length < 2) {
-            System.out.println("  -> WARNING: Scripmaster has no data rows, using known tokens");
-            return getKnownTokens();
-        }
-
-        String[] headers = lines[0].split(",");
-        int idxToken = -1, idxExchange = -1, idxName = -1, idxTradingSymbol = -1, idxInstrumentType = -1;
-        for (int i = 0; i < headers.length; i++) {
-            String h = headers[i].trim().toLowerCase();
-            if (h.equals("token")) idxToken = i;
-            else if (h.equals("exch")) idxExchange = i;
-            else if (h.equals("name")) idxName = i;
-            else if (h.equals("tsym")) idxTradingSymbol = i;
-            else if (h.equals("instname")) idxInstrumentType = i;
-        }
-
-        // Target symbols to find
-        String[][] targets = {
-            {"NIFTY", "NSE", "Index"},
-            {"BANKNIFTY", "NSE", "Index"},
-            {"RELIANCE", "NSE", "EQ"},
-            {"TCS", "NSE", "EQ"},
-            {"INFY", "NSE", "EQ"},
-            {"HDFCBANK", "NSE", "EQ"},
-            {"ICICIBANK", "NSE", "EQ"}
-        };
-
-        String[] canonicalNames = {"NSE:NIFTY", "NSE:BANKNIFTY", "NSE:RELIANCE", "NSE:TCS", "NSE:INFY", "NSE:HDFCBANK", "NSE:ICICIBANK"};
-
-        for (int i = 1; i < lines.length; i++) {
-            String[] cols = lines[i].split(",");
-            if (cols.length <= Math.max(idxToken, idxExchange)) continue;
-
-            String exchange = idxExchange >= 0 && cols.length > idxExchange ? cols[idxExchange].trim() : "";
-            String name = idxName >= 0 && cols.length > idxName ? cols[idxName].trim() : "";
-            String tradingSymbol = idxTradingSymbol >= 0 && cols.length > idxTradingSymbol ? cols[idxTradingSymbol].trim() : "";
-            String instrumentType = idxInstrumentType >= 0 && cols.length > idxInstrumentType ? cols[idxInstrumentType].trim() : "";
-            String token = idxToken >= 0 && cols.length > idxToken ? cols[idxToken].trim() : "";
-
-            if (!"NSE".equals(exchange) || token.isEmpty()) continue;
-
-            for (int j = 0; j < targets.length; j++) {
-                String targetName = targets[j][0];
-                String targetType = targets[j][2];
-                String canonical = canonicalNames[j];
-
-                if (symbolToToken.containsKey(canonical)) continue;
-
-                boolean nameMatch = targetName.equalsIgnoreCase(name);
-                boolean symbolMatch = targetName.equalsIgnoreCase(tradingSymbol);
-
-                if (nameMatch || symbolMatch) {
-                    if ("Index".equals(targetType) && instrumentType.isEmpty()) {
-                        symbolToToken.put(canonical, token);
-                        System.out.printf("  -> %s: shoonya_token=%s (from scripmaster)%n", canonical, token);
-                    } else if ("EQ".equals(targetType) && "EQ".equals(instrumentType)) {
-                        symbolToToken.put(canonical, token);
-                        System.out.printf("  -> %s: shoonya_token=%s (from scripmaster)%n", canonical, token);
-                    }
+            if (nifty930 == 0 && !ts.isBefore(nineThirty) && !ts.isAfter(nineThirty.plusSeconds(300))) {
+                nifty930 = close;
+            }
+            if (nifty1100 == 0 && !ts.isBefore(eleven) && !ts.isAfter(eleven.plusSeconds(300))) {
+                nifty1100 = close;
+                if (nifty930 > 0) {
+                    double priceMove = (close - nifty930) / nifty930;
+                    pcr930 = nseBasePcr;
+                    pcr1100 = nseBasePcr * (1 + priceMove * 3);
                 }
             }
         }
 
-        // Fallback to known tokens if scripmaster didn't have all
-        if (symbolToToken.size() < targets.length) {
-            System.out.println("  -> Some tokens missing from scripmaster, using fallback known tokens");
-            Map<String, String> known = getKnownTokens();
-            for (Map.Entry<String, String> e : known.entrySet()) {
-                symbolToToken.putIfAbsent(e.getKey(), e.getValue());
+        if (nifty930 == 0 && !dayCandles.isEmpty()) {
+            nifty930 = dayCandles.get(0).close().doubleValue();
+        }
+        if (nifty1100 == 0 && dayCandles.size() > 6) {
+            nifty1100 = dayCandles.get(Math.min(6, dayCandles.size() - 1)).close().doubleValue();
+        }
+
+        strategy.setBaseline930(nifty930, pcr930);
+        strategy.setBaseline1100(nifty1100, pcr1100);
+    }
+
+    private static List<Candle> aggregateTo60m(List<Candle> candles15m) {
+        if (candles15m == null || candles15m.isEmpty()) return Collections.emptyList();
+
+        List<Candle> candles60m = new ArrayList<>();
+        Map<LocalDate, List<Candle>> byDay = splitIntoTradingDays(candles15m);
+
+        for (List<Candle> dayCandles : byDay.values()) {
+            for (int i = 0; i < dayCandles.size(); i += 4) {
+                int endIdx = Math.min(i + 4, dayCandles.size());
+                List<Candle> block = dayCandles.subList(i, endIdx);
+                if (block.isEmpty()) continue;
+
+                Candle first = block.get(0);
+                Candle last = block.get(block.size() - 1);
+
+                BigDecimal high = first.high();
+                BigDecimal low = first.low();
+                long totalVolume = 0;
+
+                for (Candle c : block) {
+                    if (c.high().compareTo(high) > 0) high = c.high();
+                    if (c.low().compareTo(low) < 0) low = c.low();
+                    totalVolume += c.volume();
+                }
+
+                candles60m.add(new Candle(
+                    first.symbol(),
+                    "60",
+                    first.timestamp(),
+                    first.open(),
+                    high,
+                    low,
+                    last.close(),
+                    totalVolume
+                ));
+            }
+        }
+        return candles60m;
+    }
+
+    private static Map<LocalDate, List<Candle>> splitIntoTradingDays(List<Candle> candles) {
+        Map<LocalDate, List<Candle>> byDay = new TreeMap<>();
+        for (Candle c : candles) {
+            LocalDate day = c.timestamp().atZone(IST).toLocalDate();
+            if (day.getDayOfWeek().getValue() >= 6) continue; // Skip weekends
+            byDay.computeIfAbsent(day, k -> new ArrayList<>()).add(c);
+        }
+        return byDay;
+    }
+
+    // =========================================================================
+    // Strategy 3: Intraday Trend & Momentum Option Selling
+    // =========================================================================
+
+    private static BacktestResult runIntradayTrendMomentum(BacktestEngine engine,
+                                                           BigDecimal capital,
+                                                           List<Candle> nifty15m,
+                                                           List<Candle> nifty60m) {
+        System.out.println("=".repeat(92));
+        System.out.println("  STRATEGY 3: INTRADAY TREND & MOMENTUM OPTION SELLING (15m + 60m Multi-Timeframe)");
+        System.out.println("=".repeat(92));
+
+        if (nifty15m.isEmpty()) {
+            System.out.println("  No NIFTY 15m candles available for backtest.");
+            return new BacktestResult("ST_INTRADAY", capital, capital, BigDecimal.ZERO,
+                0, 0, 0, 0.0, BigDecimal.ZERO, BigDecimal.ZERO, 1.0, BigDecimal.ZERO, 0.0, List.of());
+        }
+
+        // Sort 60m candles slightly before 15m candles if same timestamp so 1h buffer is populated first
+        List<Candle> combined = new ArrayList<>();
+        for (Candle c : nifty60m) {
+            combined.add(new Candle(c.symbol(), c.timeframe(), c.timestamp().minusMillis(50), c.open(), c.high(), c.low(), c.close(), c.volume()));
+        }
+        combined.addAll(nifty15m);
+        combined.sort(Comparator.comparing(Candle::timestamp));
+
+        System.out.printf("  Multi-Timeframe Feed: %d candles (15m: %d, 60m: %d)%n",
+            combined.size(), nifty15m.size(), nifty60m.size());
+
+        // Diagnostic: compute ST & RSI directly on the Shoonya feeds
+        double[] highs15m = nifty15m.stream().mapToDouble(c -> c.high().doubleValue()).toArray();
+        double[] lows15m = nifty15m.stream().mapToDouble(c -> c.low().doubleValue()).toArray();
+        double[] closes15m = nifty15m.stream().mapToDouble(c -> c.close().doubleValue()).toArray();
+        double[] closes60m = nifty60m.stream().mapToDouble(c -> c.close().doubleValue()).toArray();
+
+        double[] st = com.tradingbot.strategy.TechnicalIndicators.calculateSuperTrend(highs15m, lows15m, closes15m, 7, 3.0);
+        double rsi = com.tradingbot.strategy.TechnicalIndicators.calculateRsi(closes60m, 14);
+        System.out.printf("  [Diagnostic] 15m candles: %d, 60m candles: %d | Last ST: %.2f | Last 60m RSI: %.2f%n",
+            highs15m.length, closes60m.length, st[st.length - 1], rsi);
+
+        IntradayTrendMomentumOptionSellingStrategy strategy = new IntradayTrendMomentumOptionSellingStrategy(
+            "ST_INTRADAY_SHOONYA", "BACKTEST_ACCOUNT", NIFTY_SYMBOL
+        );
+
+        BacktestResult result = engine.run(strategy, combined, capital);
+        printSingleResult("Intraday Trend Option Selling (NIFTY)", result);
+        if (result.trades() != null && !result.trades().isEmpty()) {
+            for (BacktestTrade t : result.trades()) {
+                System.out.printf("    %s | %-5s %s | Entry: ₹%-8.2f -> Exit: ₹%-8.2f | P&L: %+9.2f (%s -> %s)%n",
+                    t.entryTime().atZone(IST).toLocalDate(), t.direction(), t.symbol(),
+                    t.entryPrice(), t.exitPrice(), t.pnl(), t.entryTag(), t.exitTag());
             }
         }
 
-        return symbolToToken;
+        return result;
     }
 
-    private static Map<String, String> getKnownTokens() {
-        // Correct Shoonya NSE tokens (discovered via SearchScrip API)
-        Map<String, String> tokens = new HashMap<>();
-        tokens.put("NSE:NIFTY", "256265");
-        tokens.put("NSE:BANKNIFTY", "260105");
-        tokens.put("NSE:RELIANCE", "2885");
-        tokens.put("NSE:TCS", "11536");
-        tokens.put("NSE:INFY", "1594");
-        tokens.put("NSE:HDFCBANK", "1333");
-        tokens.put("NSE:ICICIBANK", "4963");
+    // =========================================================================
+    // Consolidated Performance Reporting
+    // =========================================================================
 
-        for (Map.Entry<String, String> e : tokens.entrySet()) {
-            System.out.printf("  -> %s: shoonya_token=%s (known fallback)%n", e.getKey(), e.getValue());
+    private static void printResultRow(String symbol, BacktestResult r) {
+        String sign = r.netPnL().compareTo(BigDecimal.ZERO) >= 0 ? "+" : "";
+        System.out.printf("  %-16s | Trades: %3d | Win Rate: %5.1f%% (W:%2d L:%2d) | Profit Factor: %5.2f | Max DD: %8.2f | Net P&L: %s%10.2f%n",
+            symbol, r.totalTrades(), r.winRatePercent(), r.winningTrades(), r.losingTrades(),
+            r.profitFactor(), r.maxDrawdown(), sign, r.netPnL());
+    }
+
+    private static void printSingleResult(String label, BacktestResult r) {
+        String sign = r.netPnL().compareTo(BigDecimal.ZERO) >= 0 ? "+" : "";
+        System.out.println("  " + "-".repeat(88));
+        System.out.printf("  %-38s | Trades: %3d | Win Rate: %5.1f%% (W:%2d L:%2d)%n",
+            label, r.totalTrades(), r.winRatePercent(), r.winningTrades(), r.losingTrades());
+        System.out.printf("  Gross Profit: Rs.%-12.2f | Gross Loss: Rs.%-12.2f | Profit Factor: %.2f%n",
+            r.grossProfit(), r.grossLoss(), r.profitFactor());
+        System.out.printf("  Max Drawdown: Rs.%-12.2f (%.2f%%) | Net P&L: %sRs.%.2f%n",
+            r.maxDrawdown(), r.maxDrawdownPercent(), sign, r.netPnL());
+        System.out.println("  " + "-".repeat(88));
+    }
+
+    private static void printConsolidatedReport(List<BacktestResult> lvrResults,
+                                                BacktestResult vwapResult,
+                                                BacktestResult trendResult) {
+        System.out.println("\n" + "=".repeat(92));
+        System.out.println("   CONSOLIDATED 1-MONTH INTRADAY PERFORMANCE SUMMARY (SHOONYA DATA)");
+        System.out.println("=".repeat(92));
+
+        BigDecimal lvrPnl = BigDecimal.ZERO, lvrProfit = BigDecimal.ZERO, lvrLoss = BigDecimal.ZERO;
+        int lvrTrades = 0, lvrWins = 0, lvrLosses = 0;
+        BigDecimal lvrMaxDd = BigDecimal.ZERO;
+        for (BacktestResult r : lvrResults) {
+            lvrPnl = lvrPnl.add(r.netPnL());
+            lvrProfit = lvrProfit.add(r.grossProfit());
+            lvrLoss = lvrLoss.add(r.grossLoss());
+            lvrTrades += r.totalTrades();
+            lvrWins += r.winningTrades();
+            lvrLosses += r.losingTrades();
+            if (r.maxDrawdown().compareTo(lvrMaxDd) > 0) lvrMaxDd = r.maxDrawdown();
         }
-        return tokens;
+        double lvrWinRate = lvrTrades > 0 ? (lvrWins * 100.0 / lvrTrades) : 0.0;
+        double lvrPf = lvrLoss.compareTo(BigDecimal.ZERO) > 0
+            ? lvrProfit.divide(lvrLoss, 2, RoundingMode.HALF_UP).doubleValue()
+            : (lvrProfit.compareTo(BigDecimal.ZERO) > 0 ? 99.9 : 1.0);
+
+        System.out.printf("  %-42s | Trades: %3d | Win Rate: %5.1f%% | PF: %5.2f | Max DD: Rs.%8.2f | P&L: %+12.2f%n",
+            "1. Lowest Volume Reversal (Stocks)", lvrTrades, lvrWinRate, lvrPf, lvrMaxDd, lvrPnl);
+
+        System.out.printf("  %-42s | Trades: %3d | Win Rate: %5.1f%% | PF: %5.2f | Max DD: Rs.%8.2f | P&L: %+12.2f%n",
+            "2. Nifty VWAP Momentum Reversal", vwapResult.totalTrades(), vwapResult.winRatePercent(),
+            vwapResult.profitFactor(), vwapResult.maxDrawdown(), vwapResult.netPnL());
+
+        System.out.printf("  %-42s | Trades: %3d | Win Rate: %5.1f%% | PF: %5.2f | Max DD: Rs.%8.2f | P&L: %+12.2f%n",
+            "3. Intraday Trend & Momentum Option Selling", trendResult.totalTrades(), trendResult.winRatePercent(),
+            trendResult.profitFactor(), trendResult.maxDrawdown(), trendResult.netPnL());
+
+        int grandTrades = lvrTrades + vwapResult.totalTrades() + trendResult.totalTrades();
+        int grandWins = lvrWins + vwapResult.winningTrades() + trendResult.winningTrades();
+        int grandLosses = lvrLosses + vwapResult.losingTrades() + trendResult.losingTrades();
+        double grandWinRate = grandTrades > 0 ? (grandWins * 100.0 / grandTrades) : 0.0;
+        BigDecimal grandProfit = lvrProfit.add(vwapResult.grossProfit()).add(trendResult.grossProfit());
+        BigDecimal grandLoss = lvrLoss.add(vwapResult.grossLoss()).add(trendResult.grossLoss());
+        BigDecimal grandPnl = lvrPnl.add(vwapResult.netPnL()).add(trendResult.netPnL());
+        double grandPf = grandLoss.compareTo(BigDecimal.ZERO) > 0
+            ? grandProfit.divide(grandLoss, 2, RoundingMode.HALF_UP).doubleValue()
+            : (grandProfit.compareTo(BigDecimal.ZERO) > 0 ? 99.9 : 1.0);
+        BigDecimal grandMaxDd = lvrMaxDd.add(vwapResult.maxDrawdown()).add(trendResult.maxDrawdown());
+
+        System.out.println("  " + "=".repeat(88));
+        System.out.printf("  %-42s | Trades: %3d | Win Rate: %5.1f%% (W:%2d L:%2d)%n",
+            "PORTFOLIO TOTAL", grandTrades, grandWinRate, grandWins, grandLosses);
+        System.out.printf("  Gross Profit: Rs.%+14.2f | Gross Loss: Rs.%14.2f | Profit Factor: %.2f%n",
+            grandProfit, grandLoss, grandPf);
+        System.out.printf("  Portfolio Max DD: Rs.%11.2f | NET PORTFOLIO P&L: %+15.2f%n",
+            grandMaxDd, grandPnl);
+        System.out.println("=".repeat(92));
     }
 
-    // ========== Shoonya TPSeries ==========
+    // =========================================================================
+    // Shoonya Authentication Flow (Headless QuickAuth + GenAcsTok)
+    // =========================================================================
+
+    private static void authenticateShoonya() throws Exception {
+        // Step 1: Compute derived appkey
+        StringBuilder keyBuilder = new StringBuilder(SHOONYA_USER_ID).append("|");
+        for (int p = 0; p < KEY_OFFSETS.length; p++) {
+            keyBuilder.append((char) (KEY_OFFSETS[p] + p));
+        }
+        String appkey = DigestUtils.sha256Hex(keyBuilder.toString());
+        String pwdSha = DigestUtils.sha256Hex(SHOONYA_PASSWORD);
+        String totp = generateTotp(SHOONYA_TOTP_SECRET);
+        String vc = (SHOONYA_VENDOR_CODE != null && !SHOONYA_VENDOR_CODE.isBlank()) ? SHOONYA_VENDOR_CODE : "NOREN_API";
+
+        Map<String, Object> quickAuthPayload = new LinkedHashMap<>();
+        quickAuthPayload.put("apkversion", "W2_20250926");
+        quickAuthPayload.put("uid", SHOONYA_USER_ID);
+        quickAuthPayload.put("pwd", pwdSha);
+        quickAuthPayload.put("factor2", totp);
+        quickAuthPayload.put("appkey", appkey);
+        quickAuthPayload.put("imei", "12345678-1234-1234-1234-123456789abc");
+        quickAuthPayload.put("addldivinf", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+        quickAuthPayload.put("source", "API");
+        quickAuthPayload.put("vc", vc);
+        quickAuthPayload.put("app_key", SHOONYA_CLIENT_ID);
+
+        String quickAuthBody = "jData=" + mapper.writeValueAsString(quickAuthPayload);
+        String quickAuthResp = postForm("https://api.shoonya.com/NorenWClientAPI/QuickAuth", quickAuthBody);
+        JsonNode qj = mapper.readTree(quickAuthResp);
+        if (!"Ok".equalsIgnoreCase(qj.path("stat").asText())) {
+            throw new IllegalStateException("Shoonya QuickAuth failed: " + qj.path("emsg").asText(quickAuthResp));
+        }
+        String code = qj.path("code").asText();
+
+        // Step 2: GenAcsTok
+        String checksum = DigestUtils.sha256Hex(SHOONYA_CLIENT_ID + SHOONYA_SECRET_KEY + code);
+        Map<String, Object> genAcsPayload = new LinkedHashMap<>();
+        genAcsPayload.put("client_id", SHOONYA_CLIENT_ID);
+        genAcsPayload.put("code", code);
+        genAcsPayload.put("checksum", checksum);
+
+        String genAcsBody = "jData=" + mapper.writeValueAsString(genAcsPayload);
+        String genAcsResp = postForm("https://api.shoonya.com/NorenWClientAPI/GenAcsTok", genAcsBody);
+        JsonNode gj = mapper.readTree(genAcsResp);
+        if (!"Ok".equalsIgnoreCase(gj.path("stat").asText())) {
+            throw new IllegalStateException("Shoonya GenAcsTok failed: " + gj.path("emsg").asText(genAcsResp));
+        }
+        sUserToken = gj.path("susertoken").asText(gj.path("access_token").asText());
+    }
+
+    // =========================================================================
+    // Shoonya TPSeries Historical Data Fetching & Parsing
+    // =========================================================================
 
     private static List<Candle> fetchShoonyaTPSeries(String exchange, String token,
-                                                       long startEpoch, long endEpoch,
-                                                       String interval, String canonicalSymbol) {
-        try {
-            Map<String, Object> payload = new HashMap<>();
-            payload.put("uid", SHOONYA_USER_ID);
-            payload.put("exch", exchange);
-            payload.put("token", token);
-            payload.put("st", String.valueOf(startEpoch));
-            payload.put("et", String.valueOf(endEpoch));
-            payload.put("intrv", interval);
+                                                     long startEpoch, long endEpoch,
+                                                     String interval, String canonicalSymbol) {
+        for (int retry = 0; retry < 2; retry++) {
+            try {
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("uid", SHOONYA_USER_ID);
+                payload.put("exch", exchange);
+                payload.put("token", token);
+                payload.put("st", String.valueOf(startEpoch));
+                payload.put("et", String.valueOf(endEpoch));
+                payload.put("intrv", interval);
 
-            String jDataStr = mapper.writeValueAsString(payload);
-            // Shoonya expects raw JSON in jData field, not URL-encoded
-            String formBody = "jData=" + jDataStr
-                + "&jKey=" + sUserToken;
+                String jDataStr = mapper.writeValueAsString(payload);
+                String formBody = "jData=" + jDataStr + "&jKey=" + sUserToken;
 
-            String response = postForm("https://api.shoonya.com/NorenWClientAPI/TPSeries", formBody);
-            return parseShoonyaCandles(response, canonicalSymbol, interval);
-        } catch (Exception e) {
-            System.out.printf("    WARNING: Failed to fetch Shoonya TPSeries for %s: %s%n", canonicalSymbol, e.getMessage());
-            return List.of();
+                String response = postForm("https://api.shoonya.com/NorenWClientAPI/TPSeries", formBody);
+                if (response.contains("Session Expired") || response.contains("Invalid Session Key")) {
+                    System.out.println("    [Shoonya] Session expired during fetch, re-authenticating...");
+                    authenticateShoonya();
+                    continue;
+                }
+                return parseShoonyaCandles(response, canonicalSymbol, interval);
+            } catch (Exception e) {
+                System.out.printf("    WARNING: Failed to fetch Shoonya TPSeries for %s: %s%n", canonicalSymbol, e.getMessage());
+            }
         }
+        return Collections.emptyList();
     }
 
     private static List<Candle> parseShoonyaCandles(String responseBody, String symbol, String interval) {
@@ -393,7 +623,14 @@ public class ShoonyaBacktestRunner {
                         BigDecimal high = new BigDecimal(node.path("inth").asText("0"));
                         BigDecimal low = new BigDecimal(node.path("intl").asText("0"));
                         BigDecimal close = new BigDecimal(node.path("intc").asText("0"));
-                        long volume = node.path("v").asLong(0);
+
+                        // Extract interval/candle volume (intv) with fallback to day cumulative volume (v)
+                        long volume = 0;
+                        if (node.has("intv") && !node.path("intv").asText().isEmpty()) {
+                            volume = node.path("intv").asLong(0);
+                        } else if (node.has("v") && !node.path("v").asText().isEmpty()) {
+                            volume = node.path("v").asLong(0);
+                        }
 
                         Instant timestamp = parseShoonyaTimestamp(node);
                         candles.add(new Candle(symbol, interval, timestamp, open, high, low, close, volume));
@@ -404,196 +641,118 @@ public class ShoonyaBacktestRunner {
             }
         } catch (Exception e) {
             System.out.printf("    WARNING: Failed to parse Shoonya TPSeries response: %s%n", e.getMessage());
-            System.out.println("    Response preview: " + responseBody.substring(0, Math.min(300, responseBody.length())));
         }
 
         // Sort chronologically ascending
         candles.sort(Comparator.comparing(Candle::timestamp));
-
-        // Limit to max candles (keep most recent)
-        int maxCandles = 2000;
-        if (candles.size() > maxCandles) {
-            return candles.subList(candles.size() - maxCandles, candles.size());
-        }
         return candles;
     }
 
-    /**
-     * Parse Shoonya timestamp. Tries:
-     * 1. "ssboe" field (epoch seconds) - preferred
-     * 2. "time" field as "dd/MM/yyyy HH:mm:ss" - fallback
-     * 3. Instant.now() - last resort
-     */
     private static Instant parseShoonyaTimestamp(JsonNode node) {
-        // Try epoch seconds first
         if (node.has("ssboe")) {
             long epochSeconds = node.path("ssboe").asLong();
             if (epochSeconds > 0) {
                 return Instant.ofEpochSecond(epochSeconds);
             }
         }
-        // Try time string - Shoonya uses "dd/MM/yyyy HH:mm:ss"
         String timeStr = node.path("time").asText("");
         if (!timeStr.isEmpty()) {
             try {
                 DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm:ss");
                 LocalDateTime ldt = LocalDateTime.parse(timeStr, formatter);
                 return ldt.atZone(IST).toInstant();
-            } catch (Exception e) {
-                // Try alternate format with dashes
+            } catch (Exception ignored) {
                 try {
-                    DateTimeFormatter altFormatter = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss");
-                    LocalDateTime ldt = LocalDateTime.parse(timeStr, altFormatter);
+                    DateTimeFormatter formatter2 = DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm:ss");
+                    LocalDateTime ldt = LocalDateTime.parse(timeStr, formatter2);
                     return ldt.atZone(IST).toInstant();
-                } catch (Exception e2) {
-                    System.out.println("    WARNING: Could not parse timestamp: " + timeStr);
-                }
+                } catch (Exception ignored2) {}
             }
         }
         return Instant.now();
     }
 
-    // ========== HTTP Helper ==========
-
     private static String postForm(String urlStr, String formData) throws Exception {
-        URI uri = new URI(urlStr);
-        HttpURLConnection conn = (HttpURLConnection) uri.toURL().openConnection();
-        conn.setRequestMethod("POST");
-        conn.setDoOutput(true);
-        conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
-        conn.setRequestProperty("User-Agent", "Mozilla/5.0");
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(30000);
-
-        byte[] bytes = formData.getBytes(StandardCharsets.UTF_8);
-        conn.setRequestProperty("Content-Length", String.valueOf(bytes.length));
-
-        try (var os = conn.getOutputStream()) {
-            os.write(bytes);
-            os.flush();
-        }
-
-        int code = conn.getResponseCode();
-        try (var br = new BufferedReader(new InputStreamReader(
-            code >= 200 && code < 300 ? conn.getInputStream() : conn.getErrorStream(), StandardCharsets.UTF_8))) {
-            StringBuilder sb = new StringBuilder();
-            String line;
-            while ((line = br.readLine()) != null) {
-                sb.append(line);
-            }
-            return sb.toString();
-        } finally {
-            conn.disconnect();
-        }
+        HttpRequest req = HttpRequest.newBuilder()
+            .uri(URI.create(urlStr))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .POST(HttpRequest.BodyPublishers.ofString(formData, StandardCharsets.UTF_8))
+            .build();
+        HttpResponse<String> resp = httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+        return resp.body();
     }
 
-    // ========== TOTP Generation ==========
+    // =========================================================================
+    // Helpers: Env loader & TOTP Generator
+    // =========================================================================
 
-    private static String generateTotpManual(String secret) throws Exception {
+    private static void loadEnv() {
+        File envFile = new File(".env");
+        if (!envFile.exists()) {
+            System.err.println("WARNING: .env file not found, checking system properties / env vars");
+        } else {
+            try (BufferedReader reader = new BufferedReader(new FileReader(envFile))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.startsWith("#") || !line.contains("=")) continue;
+                    int eqIdx = line.indexOf('=');
+                    String key = line.substring(0, eqIdx).trim();
+                    String val = line.substring(eqIdx + 1).trim().replace("\"", "").replace("'", "");
+                    System.setProperty(key, val);
+                }
+            } catch (Exception e) {
+                System.err.println("WARNING: Failed to read .env: " + e.getMessage());
+            }
+        }
+
+        SHOONYA_USER_ID = getProp("SHOONYA_USER_ID");
+        SHOONYA_ACCOUNT_ID = getProp("SHOONYA_ACCOUNT_ID");
+        SHOONYA_CLIENT_ID = getProp("SHOONYA_CLIENT_ID");
+        SHOONYA_SECRET_KEY = getProp("SHOONYA_SECRET_KEY");
+        SHOONYA_PASSWORD = getProp("SHOONYA_PASSWORD");
+        SHOONYA_TOTP_SECRET = getProp("SHOONYA_TOTP_SECRET");
+        SHOONYA_API_KEY = getProp("SHOONYA_API_KEY");
+        SHOONYA_VENDOR_CODE = getProp("SHOONYA_VENDOR_CODE");
+    }
+
+    private static String getProp(String key) {
+        String val = System.getProperty(key);
+        if (val == null || val.isBlank()) val = System.getenv(key);
+        return val != null ? val.trim() : "";
+    }
+
+    private static String generateTotp(String secret) throws Exception {
         byte[] key = base32Decode(secret);
         long time = System.currentTimeMillis() / 1000L / 30L;
         byte[] timeBytes = new byte[8];
         long t = time;
-        for (int i = 7; i >= 0; i--) {
-            timeBytes[i] = (byte) (t & 0xFF);
-            t >>= 8;
-        }
+        for (int i = 7; i >= 0; i--) { timeBytes[i] = (byte) (t & 0xFF); t >>= 8; }
         javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA1");
         mac.init(new javax.crypto.spec.SecretKeySpec(key, "HmacSHA1"));
         byte[] hash = mac.doFinal(timeBytes);
         int offset = hash[hash.length - 1] & 0x0F;
-        int binary = ((hash[offset] & 0x7F) << 24) |
-                     ((hash[offset + 1] & 0xFF) << 16) |
-                     ((hash[offset + 2] & 0xFF) << 8) |
-                     (hash[offset + 3] & 0xFF);
+        int binary = ((hash[offset] & 0x7F) << 24) | ((hash[offset + 1] & 0xFF) << 16) | ((hash[offset + 2] & 0xFF) << 8) | (hash[offset + 3] & 0xFF);
         int otp = binary % 1000000;
         return String.format("%06d", otp);
     }
 
-    private static byte[] base32Decode(String encoded) {
-        String alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-        encoded = encoded.toUpperCase().replaceAll("[^A-Z2-7]", "");
-        byte[] decoded = new byte[encoded.length() * 5 / 8];
-        int buffer = 0, bitsLeft = 0, count = 0;
-        for (char c : encoded.toCharArray()) {
-            int val = alphabet.indexOf(c);
+    private static byte[] base32Decode(String base32) {
+        String base32Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        String clean = base32.toUpperCase().replaceAll("[^A-Z2-7]", "");
+        java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
+        int buffer = 0, bitsLeft = 0;
+        for (char c : clean.toCharArray()) {
+            int val = base32Chars.indexOf(c);
             if (val < 0) continue;
             buffer = (buffer << 5) | val;
             bitsLeft += 5;
             if (bitsLeft >= 8) {
-                decoded[count++] = (byte) (buffer >> (bitsLeft - 8));
+                bytes.write((buffer >> (bitsLeft - 8)) & 0xFF);
                 bitsLeft -= 8;
             }
         }
-        if (count < decoded.length) {
-            byte[] result = new byte[count];
-            System.arraycopy(decoded, 0, result, 0, count);
-            return result;
-        }
-        return decoded;
-    }
-
-    // ========== Print Results ==========
-
-    private static void printResult(String strategyName, String symbol, BacktestResult result) {
-        System.out.printf("%n  --- %s on %s ---%n", strategyName, symbol);
-        System.out.printf("  Initial Capital:    Rs.%,.2f%n", result.initialCapital());
-        System.out.printf("  Final Capital:      Rs.%,.2f%n", result.finalCapital());
-        System.out.printf("  Net P&L:            Rs.%,.2f%n", result.netPnL());
-        System.out.printf("  Total Trades:       %d%n", result.totalTrades());
-        System.out.printf("  Winning Trades:     %d%n", result.winningTrades());
-        System.out.printf("  Losing Trades:      %d%n", result.losingTrades());
-        System.out.printf("  Win Rate:           %.1f%%%n", result.winRatePercent());
-        System.out.printf("  Gross Profit:       Rs.%,.2f%n", result.grossProfit());
-        System.out.printf("  Gross Loss:         Rs.%,.2f%n", result.grossLoss());
-        System.out.printf("  Profit Factor:      %.2f%n", result.profitFactor());
-        System.out.printf("  Max Drawdown:       Rs.%,.2f (%.1f%%)%n", result.maxDrawdown(), result.maxDrawdownPercent());
-
-        if (!result.trades().isEmpty()) {
-            System.out.println("  Trades:");
-            for (int i = 0; i < Math.min(result.trades().size(), 10); i++) {
-                var t = result.trades().get(i);
-                System.out.printf("    %d. %s %s | Entry: Rs.%.2f -> Exit: Rs.%.2f | Qty: %d | P&L: Rs.%.2f (%.2f%%) | %s -> %s%n",
-                    i + 1, t.symbol(), t.direction(), t.entryPrice(), t.exitPrice(),
-                    t.quantity(), t.pnl(), t.pnlPercent(),
-                    LocalDateTime.ofInstant(t.entryTime(), IST).format(DateTimeFormatter.ofPattern("MM-dd HH:mm")),
-                    LocalDateTime.ofInstant(t.exitTime(), IST).format(DateTimeFormatter.ofPattern("MM-dd HH:mm"))
-                );
-            }
-            if (result.trades().size() > 10) {
-                System.out.printf("    ... and %d more trades%n", result.trades().size() - 10);
-            }
-        } else {
-            System.out.println("  No trades executed.");
-        }
-    }
-
-    // ========== .env Loader ==========
-
-    private static void loadEnv() {
-        try (var reader = new BufferedReader(new FileReader(".env", StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                line = line.trim();
-                if (!line.isEmpty() && !line.startsWith("#") && line.contains("=")) {
-                    int idx = line.indexOf('=');
-                    String key = line.substring(0, idx).trim();
-                    String value = line.substring(idx + 1).trim();
-                    switch (key) {
-                        case "SHOONYA_USER_ID" -> SHOONYA_USER_ID = value;
-                        case "SHOONYA_ACCOUNT_ID" -> SHOONYA_ACCOUNT_ID = value;
-                        case "SHOONYA_CLIENT_ID" -> SHOONYA_CLIENT_ID = value;
-                        case "SHOONYA_SECRET_KEY" -> SHOONYA_SECRET_KEY = value;
-                        case "SHOONYA_PASSWORD" -> SHOONYA_PASSWORD = value;
-                        case "SHOONYA_TOTP_SECRET" -> SHOONYA_TOTP_SECRET = value;
-                        case "SHOONYA_API_KEY" -> SHOONYA_API_KEY = value;
-                        case "SHOONYA_VENDOR_CODE" -> SHOONYA_VENDOR_CODE = value;
-                    }
-                }
-            }
-            System.out.println("  -> Loaded .env configuration");
-        } catch (Exception e) {
-            System.err.println("WARNING: Could not load .env file: " + e.getMessage());
-        }
+        return bytes.toByteArray();
     }
 }

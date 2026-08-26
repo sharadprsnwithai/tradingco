@@ -63,8 +63,10 @@ public class IronFlyBacktestRunner {
 
     public static void main(String[] args) throws Exception {
         loadEnv();
+        int monthsBack = args.length > 0 ? Integer.parseInt(args[0]) : 24;
+
         System.out.println("=".repeat(90));
-        System.out.println("  IRON FLY BACKTEST - LAST 13 MONTHS - 1 LOT");
+        System.out.printf("  IRON FLY BACKTEST - LAST %d MONTHS (2 YEARS) - 1 LOT%n", monthsBack);
         System.out.println("  Underlyings: NIFTY, RELIANCE, HDFCBANK");
         System.out.println("  Comparing: Mode A (roll losing short) vs Mode B (roll profitable hedge)");
         System.out.println("=".repeat(90));
@@ -87,9 +89,9 @@ public class IronFlyBacktestRunner {
             }
         }
 
-        System.out.println("\n[3/3] Fetching 13-month daily candles...");
+        System.out.printf("%n[3/3] Fetching %d-month daily candles...%n", monthsBack);
         LocalDate toDate = LocalDate.now(IST);
-        LocalDate fromDate = toDate.minusMonths(13);
+        LocalDate fromDate = toDate.minusMonths(monthsBack);
 
         Map<String, List<Candle>> allCandles = new HashMap<>();
         for (Map.Entry<String, String> entry : symbolToToken.entrySet()) {
@@ -329,17 +331,26 @@ public class IronFlyBacktestRunner {
         List<LocalDate> expiries = new ArrayList<>();
         if (candles.isEmpty()) return expiries;
 
+        java.util.Set<LocalDate> candleDates = new java.util.HashSet<>();
+        for (Candle c : candles) {
+            candleDates.add(c.timestamp().atZone(IST).toLocalDate());
+        }
+
         LocalDate start = candles.get(0).timestamp().atZone(IST).toLocalDate();
         LocalDate end = candles.get(candles.size() - 1).timestamp().atZone(IST).toLocalDate();
 
         LocalDate current = start.withDayOfMonth(1);
         while (!current.isAfter(end)) {
-            LocalDate lastThursday = current.withDayOfMonth(current.lengthOfMonth());
-            while (lastThursday.getDayOfWeek() != java.time.DayOfWeek.THURSDAY) {
-                lastThursday = lastThursday.minusDays(1);
+            LocalDate targetDate = current.withDayOfMonth(current.lengthOfMonth());
+            while (targetDate.getDayOfWeek() != java.time.DayOfWeek.THURSDAY) {
+                targetDate = targetDate.minusDays(1);
             }
-            if (!lastThursday.isBefore(start) && !lastThursday.isAfter(end)) {
-                expiries.add(lastThursday);
+            // If Thursday was a holiday, fall back to Wednesday / Tuesday
+            while (!candleDates.contains(targetDate) && targetDate.isAfter(current)) {
+                targetDate = targetDate.minusDays(1);
+            }
+            if (candleDates.contains(targetDate) && !targetDate.isBefore(start) && !targetDate.isAfter(end)) {
+                expiries.add(targetDate);
             }
             current = current.plusMonths(1);
         }
@@ -627,6 +638,36 @@ public class IronFlyBacktestRunner {
             System.out.printf("  Win Rate:      %.1f%%%n", result.winningTrades() * 100.0 / result.totalTrades());
             System.out.printf("  Avg P&L/Trade: Rs.%,.2f%n", result.netPnL().doubleValue() / result.totalTrades());
         }
+    }
+
+    private static void printComparisonTable(Map<String, BacktestResult> resultsA, Map<String, BacktestResult> resultsB, double[] grandA, double[] grandB) {
+        System.out.println("\n" + "=".repeat(102));
+        System.out.println("   24-MONTH MONTHLY IRON FLY PERFORMANCE BREAKDOWN (AUG 2024 - AUG 2026)");
+        System.out.println("=".repeat(102));
+        System.out.printf("  %-16s | %-28s | %-28s | %-16s%n", "Underlying", "Mode A (Roll Losing Short)", "Mode B (Roll Profit Hedge)", "Winning Mode");
+        System.out.printf("  %-16s | %-28s | %-28s | %-16s%n", "----------------", "----------------------------", "----------------------------", "----------------");
+
+        for (String sym : resultsA.keySet()) {
+            BacktestResult a = resultsA.get(sym);
+            BacktestResult b = resultsB.get(sym);
+            double diff = a.netPnL().subtract(b.netPnL()).doubleValue();
+            String better = diff >= 0 ? "Mode A (+₹" + String.format("%.0f", diff) + ")" : "Mode B (+₹" + String.format("%.0f", -diff) + ")";
+
+            double winRateA = a.totalTrades() > 0 ? a.winningTrades() * 100.0 / a.totalTrades() : 0;
+            double winRateB = b.totalTrades() > 0 ? b.winningTrades() * 100.0 / b.totalTrades() : 0;
+
+            System.out.printf("  %-16s | ₹%,10.2f (%2d/%2d, %4.1f%%) | ₹%,10.2f (%2d/%2d, %4.1f%%) | %-16s%n",
+                sym, a.netPnL(), a.winningTrades(), a.totalTrades(), winRateA,
+                b.netPnL(), b.winningTrades(), b.totalTrades(), winRateB, better);
+        }
+
+        System.out.println("  " + "-".repeat(98));
+        double grandDiff = grandA[0] - grandB[0];
+        String grandBetter = grandDiff >= 0 ? "Mode A (+₹" + String.format("%.0f", grandDiff) + ")" : "Mode B (+₹" + String.format("%.0f", -grandDiff) + ")";
+        System.out.printf("  %-16s | ₹%,10.2f (%2d/%2d, %4.1f%%) | ₹%,10.2f (%2d/%2d, %4.1f%%) | %-16s%n",
+            "GRAND TOTAL", grandA[0], (int)grandA[2], (int)grandA[1], grandA[2]*100.0/grandA[1],
+            grandB[0], (int)grandB[2], (int)grandB[1], grandB[2]*100.0/grandB[1], grandBetter);
+        System.out.println("=".repeat(102));
     }
 
     private static void loadEnv() {

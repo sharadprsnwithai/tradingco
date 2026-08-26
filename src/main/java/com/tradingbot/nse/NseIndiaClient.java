@@ -27,8 +27,8 @@ public class NseIndiaClient implements GainersLosersSource {
 
     private static final Logger log = LoggerFactory.getLogger(NseIndiaClient.class);
     private static final String NSE_BASE_URL = "https://www.nseindia.com";
-    private static final String GAINERS_API = "/api/live-analysis-variations?index=gainers";
-    private static final String LOSERS_API = "/api/live-analysis-variations?index=loosers";
+    private static final String GAINERS_API = "/api/live-analysis-variations?index=gainers&type=FO";
+    private static final String LOSERS_API = "/api/live-analysis-variations?index=loosers&type=FO";
 
     private final WebClient webClient;
     private final ObjectMapper objectMapper;

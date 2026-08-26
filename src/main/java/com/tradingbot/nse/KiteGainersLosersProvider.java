@@ -90,10 +90,12 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
             .map(list -> {
                 if (list.isEmpty()) return list;
                 List<NseGainerLoser> sorted = new ArrayList<>(list);
-                sorted.sort(Comparator.comparingDouble(NseGainerLoser::pChange));
-                int from = gainers ? Math.max(0, sorted.size() - TOP_N) : 0;
-                int to = gainers ? sorted.size() : Math.min(TOP_N, sorted.size());
-                return sorted.subList(from, to);
+                if (gainers) {
+                    sorted.sort(Comparator.comparingDouble(NseGainerLoser::pChange).reversed());
+                } else {
+                    sorted.sort(Comparator.comparingDouble(NseGainerLoser::pChange));
+                }
+                return sorted.subList(0, Math.min(TOP_N, sorted.size()));
             })
             .onErrorResume(e -> {
                 log.warn("[KITE-SEL] {} derive failed: {}", gainers ? "gainers" : "losers", e.getMessage());

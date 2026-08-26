@@ -364,6 +364,24 @@ public class LowestVolumeReversalStrategy implements Strategy {
     }
 
     /**
+     * Checks whether a given direction is allowed for the symbol based on stock selection.
+     * Top Gainers (longCandidates) -> LONG setups only.
+     * Top Losers (shortCandidates) -> SHORT setups only.
+     * If unconstrained (e.g. static fallback or backtest mode where sets are empty), allow both.
+     */
+    private boolean isDirectionAllowed(String symbol, Direction direction) {
+        boolean isGainer = longCandidates.contains(symbol);
+        boolean isLoser = shortCandidates.contains(symbol);
+        if (isGainer && !isLoser) {
+            return direction == Direction.LONG;
+        }
+        if (isLoser && !isGainer) {
+            return direction == Direction.SHORT;
+        }
+        return true;
+    }
+
+    /**
      * Detects consecutive momentum candles in one direction.
      */
     private void detectMomentum(SymbolState state, Candle candle) {
@@ -371,11 +389,11 @@ public class LowestVolumeReversalStrategy implements Strategy {
         boolean isRed = candle.close().compareTo(candle.open()) < 0;
 
         if (state.pendingDirection == null) {
-            // Start tracking from first momentum candle
-            if (isGreen) {
+            // Start tracking from first momentum candle if direction is permitted by selection
+            if (isGreen && isDirectionAllowed(state.symbol, Direction.LONG)) {
                 state.pendingDirection = Direction.LONG;
                 state.consecutiveMomentum = 1;
-            } else if (isRed) {
+            } else if (isRed && isDirectionAllowed(state.symbol, Direction.SHORT)) {
                 state.pendingDirection = Direction.SHORT;
                 state.consecutiveMomentum = 1;
             }
@@ -388,11 +406,11 @@ public class LowestVolumeReversalStrategy implements Strategy {
         } else if (state.pendingDirection == Direction.SHORT && isRed) {
             state.consecutiveMomentum++;
         } else {
-            // Direction changed — restart tracking
-            if (isGreen) {
+            // Direction changed — restart tracking if new direction is permitted
+            if (isGreen && isDirectionAllowed(state.symbol, Direction.LONG)) {
                 state.pendingDirection = Direction.LONG;
                 state.consecutiveMomentum = 1;
-            } else if (isRed) {
+            } else if (isRed && isDirectionAllowed(state.symbol, Direction.SHORT)) {
                 state.pendingDirection = Direction.SHORT;
                 state.consecutiveMomentum = 1;
             } else {

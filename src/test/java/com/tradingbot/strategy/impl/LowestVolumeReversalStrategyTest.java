@@ -294,6 +294,70 @@ class LowestVolumeReversalStrategyTest {
         assertTrue(strategy.getState("NSE:RELIANCE").dayCandles.isEmpty());
     }
 
+    @Test
+    void testTopGainerRejectsShortMomentumAndAcceptsLong() {
+        // Mock gainer selection
+        com.tradingbot.nse.NseGainerLoser gainer = new com.tradingbot.nse.NseGainerLoser(
+            "RELIANCE", "EQ", 3000, 50, 2.5, 2950, 3010, 2940, 2950, 100000L
+        );
+        when(nseClient.fetchGainers()).thenReturn(Mono.just(List.of(gainer)));
+        when(nseClient.fetchLosers()).thenReturn(Mono.just(List.of()));
+
+        // Trigger stock selection scan at 09:26
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.STOCK_SELECTION_SCAN));
+        assertTrue(strategy.getLongCandidates().contains("NSE:RELIANCE"));
+        assertFalse(strategy.getShortCandidates().contains("NSE:RELIANCE"));
+
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        String sym = "NSE:RELIANCE";
+
+        // First candle
+        strategy.onCandle(c(sym, t0, 3000, 3010, 2990, 3005, 5000));
+
+        // Red candle -> should NOT start SHORT momentum for a Top Gainer
+        strategy.onCandle(c(sym, t0.plusSeconds(300), 3005, 3010, 2980, 2985, 6000));
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        assertNull(st.pendingDirection);
+        assertEquals(0, st.consecutiveMomentum);
+
+        // Green candle -> DOES start LONG momentum for Top Gainer
+        strategy.onCandle(c(sym, t0.plusSeconds(600), 2985, 3020, 2980, 3015, 7000));
+        assertEquals(LowestVolumeReversalStrategy.Direction.LONG, st.pendingDirection);
+        assertEquals(1, st.consecutiveMomentum);
+    }
+
+    @Test
+    void testTopLoserRejectsLongMomentumAndAcceptsShort() {
+        // Mock loser selection
+        com.tradingbot.nse.NseGainerLoser loser = new com.tradingbot.nse.NseGainerLoser(
+            "TCS", "EQ", 3500, -80, -2.5, 3580, 3590, 3490, 3580, 100000L
+        );
+        when(nseClient.fetchGainers()).thenReturn(Mono.just(List.of()));
+        when(nseClient.fetchLosers()).thenReturn(Mono.just(List.of(loser)));
+
+        // Trigger stock selection scan at 09:26
+        strategy.onSchedule(ScheduledEvent.of(ScheduledEvent.STOCK_SELECTION_SCAN));
+        assertTrue(strategy.getShortCandidates().contains("NSE:TCS"));
+        assertFalse(strategy.getLongCandidates().contains("NSE:TCS"));
+
+        Instant t0 = Instant.parse("2024-12-18T09:15:00Z");
+        String sym = "NSE:TCS";
+
+        // First candle
+        strategy.onCandle(c(sym, t0, 3500, 3510, 3490, 3505, 5000));
+
+        // Green candle -> should NOT start LONG momentum for a Top Loser
+        strategy.onCandle(c(sym, t0.plusSeconds(300), 3505, 3530, 3500, 3525, 6000));
+        LowestVolumeReversalStrategy.SymbolState st = strategy.getState(sym);
+        assertNull(st.pendingDirection);
+        assertEquals(0, st.consecutiveMomentum);
+
+        // Red candle -> DOES start SHORT momentum for Top Loser
+        strategy.onCandle(c(sym, t0.plusSeconds(600), 3525, 3530, 3480, 3485, 7000));
+        assertEquals(LowestVolumeReversalStrategy.Direction.SHORT, st.pendingDirection);
+        assertEquals(1, st.consecutiveMomentum);
+    }
+
     private Candle c(String sym, Instant ts, double o, double h, double l, double cl, long vol) {
         return new Candle(sym, "5", ts,
             BigDecimal.valueOf(o), BigDecimal.valueOf(h),
