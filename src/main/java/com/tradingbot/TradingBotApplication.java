@@ -21,6 +21,8 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -186,25 +188,65 @@ public class TradingBotApplication {
      * Comment lines starting with {@code #} and blank lines are skipped.
      */
     private static void loadDotEnv() {
-        File envFile = new File(".env");
-        if (envFile.exists()) {
-            try (BufferedReader reader = new BufferedReader(new FileReader(envFile, StandardCharsets.UTF_8))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    line = line.trim();
-                    if (!line.isEmpty() && !line.startsWith("#") && line.contains("=")) {
-                        int idx = line.indexOf('=');
-                        String key = line.substring(0, idx).trim();
-                        String value = line.substring(idx + 1).trim();
-                        if (System.getProperty(key) == null && System.getenv(key) == null) {
-                            System.setProperty(key, value);
-                        }
+        File envFile = findEnvFile();
+        if (envFile == null) {
+            log.warn("No .env file found in working directory or alongside the application jar. "
+                + "If TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID / broker credentials are not supplied via "
+                + "OS environment variables (e.g. docker env_file), the bot will start with defaults "
+                + "and Telegram alerts will be DISABLED. Working dir: '{}'",
+                System.getProperty("user.dir"));
+            return;
+        }
+        try (BufferedReader reader = new BufferedReader(new FileReader(envFile, StandardCharsets.UTF_8))) {
+            String line;
+            int loaded = 0;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty() && !line.startsWith("#") && line.contains("=")) {
+                    int idx = line.indexOf('=');
+                    String key = line.substring(0, idx).trim();
+                    String value = line.substring(idx + 1).trim();
+                    if (System.getProperty(key) == null && System.getenv(key) == null) {
+                        System.setProperty(key, value);
+                        loaded++;
                     }
                 }
-                log.info("Loaded configuration properties from .env file");
-            } catch (Exception e) {
-                log.warn("Could not load .env file: {}", e.getMessage());
+            }
+            log.info("Loaded {} configuration properties from .env file at '{}'", loaded, envFile.getAbsolutePath());
+        } catch (Exception e) {
+            log.warn("Could not load .env file at '{}': {}", envFile.getAbsolutePath(), e.getMessage());
+        }
+    }
+
+    /**
+     * Locates the {@code .env} file, searching the working directory first and then the
+     * directory containing the running jar (and its parent) so the file is found regardless
+     * of the current working directory the application was launched from.
+     */
+    private static File findEnvFile() {
+        List<File> candidates = new ArrayList<>();
+        candidates.add(new File(".env"));
+        candidates.add(new File(System.getProperty("user.dir"), ".env"));
+        try {
+            java.security.ProtectionDomain pd = TradingBotApplication.class.getProtectionDomain();
+            java.security.CodeSource cs = pd.getCodeSource();
+            if (cs != null && cs.getLocation() != null) {
+                File jarDir = new File(cs.getLocation().toURI()).getParentFile();
+                if (jarDir != null) {
+                    candidates.add(new File(jarDir, ".env"));
+                    if (jarDir.getParentFile() != null) {
+                        candidates.add(new File(jarDir.getParentFile(), ".env"));
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // best-effort only
+        }
+        for (File c : candidates) {
+            if (c != null && c.exists() && c.isFile()) {
+                return c;
             }
         }
+        return null;
     }
 }

@@ -103,25 +103,30 @@ public class InstrumentSyncService {
             if (p.length < 12) continue;
 
             try {
-                String tradingSymbol = p[2].trim();
-                String exchange = p[11].trim();
-                String instrumentType = p[9].trim();
-                String expiry = p[5].trim();
+                String tradingSymbol = unquote(p[2]);
+                String exchange = unquote(p[11]);
+                String instrumentType = unquote(p[9]);
+                String expiry = unquote(p[5]);
+                String name = unquote(p[3]);
+                String kiteToken = unquote(p[0]);
+                String lotStr = unquote(p[8]);
+                String tickStr = unquote(p[7]);
+                String strikeStr = unquote(p[6]);
 
                 BigDecimal strike = null;
-                if (!p[6].trim().isEmpty()) {
-                    strike = new BigDecimal(p[6].trim());
+                if (strikeStr != null && !strikeStr.isEmpty()) {
+                    strike = new BigDecimal(strikeStr);
                 }
 
                 out.add(Instrument.builder()
                     .canonicalSymbol(exchange + ":" + tradingSymbol)
-                    .kiteToken(p[0].trim())
+                    .kiteToken(kiteToken)
                     .shoonyaToken(null)
                     .exchange(exchange)
                     .tradingSymbol(tradingSymbol)
-                    .name(p[3].trim())
-                    .lotSize(p[8].trim().isEmpty() ? 1 : (int) Double.parseDouble(p[8].trim()))
-                    .tickSize(p[7].trim().isEmpty() ? new BigDecimal("0.05") : new BigDecimal(p[7].trim()))
+                    .name(name)
+                    .lotSize(lotStr.isEmpty() ? 1 : (int) Double.parseDouble(lotStr))
+                    .tickSize(tickStr.isEmpty() ? new BigDecimal("0.05") : new BigDecimal(tickStr))
                     .instrumentType(instrumentType)
                     .strike(strike)
                     .expiry(expiry.isEmpty() ? null : expiry)
@@ -132,5 +137,15 @@ public class InstrumentSyncService {
             }
         }
         return out;
+    }
+
+    /** Strips surrounding double-quotes (Kite CSV quotes string fields) and trims. */
+    private static String unquote(String s) {
+        if (s == null) return s;
+        s = s.trim();
+        if (s.length() >= 2 && s.charAt(0) == '"' && s.charAt(s.length() - 1) == '"') {
+            s = s.substring(1, s.length() - 1);
+        }
+        return s;
     }
 }

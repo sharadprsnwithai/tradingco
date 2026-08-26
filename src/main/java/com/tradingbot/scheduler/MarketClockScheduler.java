@@ -4,6 +4,7 @@ import com.tradingbot.adapter.BrokerAdapter;
 import com.tradingbot.adapter.BrokerAdapterRegistry;
 import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.instrument.InstrumentSyncService;
+import com.tradingbot.instrument.ShoonyaInstrumentSyncService;
 import com.tradingbot.marketdata.KiteHistoricalDataService;
 import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.marketdata.ShoonyaHistoricalDataService;
@@ -51,6 +52,7 @@ public class MarketClockScheduler {
     private final KiteHistoricalDataService kiteHistoricalDataService;
     private final InstrumentMasterService instrumentMaster;
     private final InstrumentSyncService instrumentSyncService;
+    private final ShoonyaInstrumentSyncService shoonyaInstrumentSyncService;
     private final TelegramBotService telegramBot;
     private final IronFlyService ironFlyService;
 
@@ -71,6 +73,7 @@ public class MarketClockScheduler {
         @Autowired(required = false) KiteHistoricalDataService kiteHistoricalDataService,
         InstrumentMasterService instrumentMaster,
         InstrumentSyncService instrumentSyncService,
+        ShoonyaInstrumentSyncService shoonyaInstrumentSyncService,
         TelegramBotService telegramBot,
         IronFlyService ironFlyService,
         @Value("${bot.calendar.holidays:2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25}") String holidaysCsv
@@ -84,6 +87,7 @@ public class MarketClockScheduler {
         this.kiteHistoricalDataService = kiteHistoricalDataService;
         this.instrumentMaster = instrumentMaster;
         this.instrumentSyncService = instrumentSyncService;
+        this.shoonyaInstrumentSyncService = shoonyaInstrumentSyncService;
         this.telegramBot = telegramBot;
         this.ironFlyService = ironFlyService;
 
@@ -155,6 +159,14 @@ public class MarketClockScheduler {
             .doOnNext(count -> log.info("Instrument master synced: {} instruments", count))
             .onErrorResume(e -> {
                 log.error("Instrument sync failed ({}), continuing with pre-market dispatch", e.getMessage());
+                return reactor.core.publisher.Mono.empty();
+            })
+            .then(shoonyaInstrumentSyncService != null
+                ? shoonyaInstrumentSyncService.syncFromShoonya()
+                : reactor.core.publisher.Mono.empty())
+            .doOnNext(c -> log.info("[SHOONYA-SYNC] Shoonya master token sync complete: {} tokens mapped", c))
+            .onErrorResume(e -> {
+                log.error("Shoonya master sync failed ({}), continuing", e.getMessage());
                 return reactor.core.publisher.Mono.empty();
             })
             .doOnTerminate(() -> {

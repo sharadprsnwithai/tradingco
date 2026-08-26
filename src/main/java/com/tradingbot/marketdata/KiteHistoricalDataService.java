@@ -82,14 +82,7 @@ public class KiteHistoricalDataService {
             return Mono.just(Collections.emptyList());
         }
 
-        return instrumentMaster.findByCanonicalSymbol(symbol)
-            .switchIfEmpty(Mono.defer(() -> {
-                // If not found by exact canonical, try finding underlying future or equity
-                if (symbol.contains("NIFTY")) {
-                    return instrumentMaster.findNearestExpiring("NIFTY", "FUT");
-                }
-                return Mono.empty();
-            }))
+        return instrumentMaster.resolveForMarketData(symbol)
             .flatMap(instrument -> {
                 long token = 0;
                 try {

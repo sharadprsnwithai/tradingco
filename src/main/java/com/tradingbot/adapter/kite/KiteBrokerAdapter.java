@@ -57,7 +57,7 @@ public class KiteBrokerAdapter implements BrokerAdapter {
     // --- Live WebSocket (KiteTicker) state ---
     private final Sinks.Many<Tick> tickSink = Sinks.many().multicast().onBackpressureBuffer();
     private final AtomicReference<KiteTicker> tickerRef = new AtomicReference<>();
-    private final Map<Long, String> tokenToSymbol = new ConcurrentHashMap<>();
+    private final Map<Long, Set<String>> tokenToSymbols = new ConcurrentHashMap<>();
     private final Set<Long> subscribedTokens = ConcurrentHashMap.newKeySet();
 
     /**
@@ -377,7 +377,7 @@ public class KiteBrokerAdapter implements BrokerAdapter {
         List<Long> tokens = new ArrayList<>();
         for (String sym : symbols) {
             try {
-                var inst = instrumentMaster.findByCanonicalSymbol(sym).blockOptional();
+                var inst = instrumentMaster.resolveForMarketData(sym).blockOptional();
                 if (inst.isPresent() && inst.get().kiteToken() != null && !inst.get().kiteToken().isBlank()) {
                     long token = Long.parseLong(inst.get().kiteToken().trim());
                     registerTokenMapping(token, sym);
@@ -431,9 +431,13 @@ public class KiteBrokerAdapter implements BrokerAdapter {
         });
         ticker.setOnTickerArrivalListener(sdkTicks -> {
             for (com.zerodhatech.models.Tick sdkTick : sdkTicks) {
-                Tick mapped = mapSdkTick(sdkTick);
-                if (mapped != null) {
-                    tickSink.tryEmitNext(mapped);
+                Set<String> syms = tokenToSymbols.get(sdkTick.getInstrumentToken());
+                if (syms == null) continue;
+                for (String sym : syms) {
+                    Tick mapped = mapSdkTick(sdkTick, sym);
+                    if (mapped != null) {
+                        tickSink.tryEmitNext(mapped);
+                    }
                 }
             }
         });
@@ -461,15 +465,25 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      * Package-private so unit tests can seed mappings without a WebSocket.
      */
     void registerTokenMapping(long token, String canonicalSymbol) {
-        tokenToSymbol.put(token, canonicalSymbol);
+        tokenToSymbols.computeIfAbsent(token, k -> ConcurrentHashMap.newKeySet()).add(canonicalSymbol);
     }
 
     /**
-     * Maps an SDK tick to the internal Tick model. Package-private for unit testing.
+     * Maps an SDK tick to the internal Tick model, routing to the first registered
+     * symbol for the token. For unit testing (single-symbol registrations).
      */
     Tick mapSdkTick(com.zerodhatech.models.Tick t) {
-        String canonical = tokenToSymbol.get(t.getInstrumentToken());
-        if (canonical == null) return null;
+        Set<String> syms = tokenToSymbols.get(t.getInstrumentToken());
+        if (syms == null || syms.isEmpty()) return null;
+        return mapSdkTick(t, syms.iterator().next());
+    }
+
+    /**
+     * Maps an SDK tick to the internal Tick model for a specific (abstract) symbol.
+     * Allows fan-out when several abstract symbols share one physical contract token
+     * (e.g. NFO:NIFTY_FUT and NFO:NIFTY_50 both map to the NIFTY futures token).
+     */
+    Tick mapSdkTick(com.zerodhatech.models.Tick t, String canonical) {
         String exchange = canonical.contains(":") ? canonical.substring(0, canonical.indexOf(':')) : "NSE";
         Date ts = t.getTickTimestamp() != null ? t.getTickTimestamp() : t.getLastTradedTime();
         return Tick.builder()
@@ -502,7 +516,7 @@ public class KiteBrokerAdapter implements BrokerAdapter {
             }
         }
         subscribedTokens.clear();
-        tokenToSymbol.clear();
+        tokenToSymbols.clear();
     }
 
     /**

@@ -23,7 +23,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * Caches the daily gainers/losers response after the 09:26 IST scan.
  */
 @Service
-public class NseIndiaClient {
+public class NseIndiaClient implements GainersLosersSource {
 
     private static final Logger log = LoggerFactory.getLogger(NseIndiaClient.class);
     private static final String NSE_BASE_URL = "https://www.nseindia.com";

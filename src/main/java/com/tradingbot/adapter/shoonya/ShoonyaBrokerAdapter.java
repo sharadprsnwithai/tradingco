@@ -382,7 +382,9 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
         List<String> keys = new ArrayList<>();
         for (String sym : symbols) {
             try {
-                var inst = instrumentMaster.findByCanonicalSymbol(sym).blockOptional();
+                // resolveForMarketData maps abstract symbols (NFO:NIFTY_FUT / NFO:NIFTY_50)
+                // to the nearest-expiry contract, whose shoonya_token we back-filled via sync.
+                var inst = instrumentMaster.resolveForMarketData(sym).blockOptional();
                 if (inst.isPresent() && inst.get().shoonyaToken() != null && !inst.get().shoonyaToken().isBlank()) {
                     String exchange = sym.contains(":") ? sym.substring(0, sym.indexOf(':')) : "NSE";
                     String key = exchange + "|" + inst.get().shoonyaToken().trim();

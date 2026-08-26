@@ -110,9 +110,13 @@ public class TelegramBotService {
     @PostConstruct
     public void init() {
         if (!enabled) {
-            log.info("Telegram Bot is disabled (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured)");
+            log.error("Telegram Bot is DISABLED — TELEGRAM_BOT_TOKEN and/or TELEGRAM_CHAT_ID are not set. "
+                + "Trade/status alerts will NOT be delivered. Ensure .env is loaded at the runtime working "
+                + "directory (or supply them as OS environment variables) and restart the bot.");
             return;
         }
+
+        log.info("Telegram Bot ENABLED — alerts will be delivered to chat id '{}'", chatId);
 
         // 1. Subscribe to StrategyEngine signals to push trade alerts
         this.signalSub = strategyEngine.getSignalStream()
@@ -121,7 +125,9 @@ public class TelegramBotService {
 
         // 2. Start reactive long-polling for commands
         startPolling();
-        sendAlert("🚀 *Trading Bot Online*\nEnvironment: Multi-Broker Reactive\nType /help or /status for controls.");
+        sendAlert("🚀 *Trading Bot Online*\nEnvironment: Multi-Broker Reactive\nType /help or /status for controls.")
+            .doOnError(e -> log.error("Initial Telegram 'Online' alert failed (check host egress to api.telegram.org): {}", e.getMessage()))
+            .subscribe();
     }
 
     /**

@@ -46,8 +46,12 @@ public class StrategyEngine {
     private final Map<String, ExecutorService> strategyExecutors = new ConcurrentHashMap<>();
     private volatile Map<String, List<Strategy>> symbolToStrategies = Map.of();
 
-    // Reactive multicast sink for all generated trading signals
-    private final Sinks.Many<Signal> signalSink = Sinks.many().multicast().directBestEffort();
+    // Reactive multicast sink for all generated trading signals.
+    // NOTE: use onBackpressureBuffer (NOT directBestEffort). directBestEffort drops a signal
+    // for any subscriber lacking demand at that instant; the OMS pipeline uses concatMap
+    // (serial/slow) and would silently miss live signals/orders under backpressure. Buffering
+    // guarantees every subscriber (Telegram alerts + OMS execution) receives all signals.
+    private final Sinks.Many<Signal> signalSink = Sinks.many().multicast().onBackpressureBuffer();
 
     private final List<Disposable> subscriptions = new ArrayList<>();
 

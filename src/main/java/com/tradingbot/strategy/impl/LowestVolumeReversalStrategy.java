@@ -8,8 +8,8 @@ import com.tradingbot.model.enums.BookType;
 import com.tradingbot.model.enums.OrderType;
 import com.tradingbot.model.enums.ProductType;
 import com.tradingbot.model.enums.SignalType;
+import com.tradingbot.nse.GainersLosersSource;
 import com.tradingbot.nse.NseGainerLoser;
-import com.tradingbot.nse.NseIndiaClient;
 import com.tradingbot.strategy.ScheduledEvent;
 import com.tradingbot.strategy.Strategy;
 import com.tradingbot.strategy.StrategyContext;
@@ -57,8 +57,14 @@ public class LowestVolumeReversalStrategy implements Strategy {
     private final double minRrRatio;
     private final int momentumCandles;
 
-    private final NseIndiaClient nseClient;
+    private final GainersLosersSource gainersSource;
     private final LotSizeService lotSizeService;
+
+    /** Static F&O basket used as a last-resort fallback if dynamic selection yields nothing. */
+    private static final List<String> DEFAULT_LVR_SYMBOLS = List.of(
+        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "WIPRO",
+        "BHARTIARTL", "ITC", "KOTAKBANK", "AXISBANK", "MARUTI", "SUNPHARMA", "TITAN"
+    );
 
     private StrategyContext context;
     private volatile boolean enabled = true;
@@ -81,7 +87,7 @@ public class LowestVolumeReversalStrategy implements Strategy {
      * @param maxTradesPerDay   maximum number of trades per day
      * @param minRrRatio        minimum risk-to-reward ratio for entry validation
      * @param momentumCandles   number of consecutive candles to confirm momentum
-     * @param nseClient         NSE India API client for stock selection
+     * @param gainersSource     source for Top Gainers / Losers stock selection (Kite, falling back to NSE)
      * @param lotSizeService    service to fetch F&O lot sizes from Kite
      */
     public LowestVolumeReversalStrategy(
@@ -91,7 +97,7 @@ public class LowestVolumeReversalStrategy implements Strategy {
         @Value("${bot.strategies.lowest-volume-reversal.max-trades-per-day:2}") int maxTradesPerDay,
         @Value("${bot.strategies.lowest-volume-reversal.min-rr-ratio:2.0}") double minRrRatio,
         @Value("${bot.strategies.lowest-volume-reversal.momentum-candles:2}") int momentumCandles,
-        NseIndiaClient nseClient,
+        GainersLosersSource gainersSource,
         LotSizeService lotSizeService
     ) {
         this.strategyId = strategyId;
@@ -99,7 +105,7 @@ public class LowestVolumeReversalStrategy implements Strategy {
         this.maxTradesPerDay = maxTradesPerDay;
         this.minRrRatio = minRrRatio;
         this.momentumCandles = momentumCandles;
-        this.nseClient = nseClient;
+        this.gainersSource = gainersSource;
         this.lotSizeService = lotSizeService;
         if (symbolsStr != null && !symbolsStr.isBlank()) {
             for (String s : symbolsStr.split(",")) {
@@ -205,11 +211,12 @@ public class LowestVolumeReversalStrategy implements Strategy {
     }
 
     /**
-     * Phase 0: Fetches NSE Top Gainers/Losers and updates candidate watchlists.
+     * Phase 0: Fetches Top Gainers/Losers (Kite-derived, falling back to NSE) and
+     * updates candidate watchlists.
      */
     private void performStockSelection() {
-        Mono<List<NseGainerLoser>> gainersMono = nseClient.fetchGainers();
-        Mono<List<NseGainerLoser>> losersMono = nseClient.fetchLosers();
+        Mono<List<NseGainerLoser>> gainersMono = gainersSource.fetchGainers();
+        Mono<List<NseGainerLoser>> losersMono = gainersSource.fetchLosers();
 
         Mono.zip(gainersMono, losersMono)
             .subscribe(tuple -> {
@@ -240,6 +247,23 @@ public class LowestVolumeReversalStrategy implements Strategy {
                         SymbolState st = new SymbolState(symbol);
                         states.put(symbol, st);
                         seedFirstCandleOfDay(st, symbol);
+                    }
+                }
+
+                // Last-resort fallback: if dynamic selection produced nothing (e.g. both
+                // Kite and NSE sources failed), trade the static F&O basket so the
+                // strategy still has symbols to act on.
+                if (longCandidates.isEmpty() && shortCandidates.isEmpty()) {
+                    log.warn("[STOCK-SELECTION] Dynamic selection empty — using static F&O fallback basket");
+                    for (String s : DEFAULT_LVR_SYMBOLS) {
+                        String symbol = "NSE:" + s;
+                        longCandidates.add(symbol);
+                        if (!symbols.contains(symbol)) {
+                            symbols.add(symbol);
+                            SymbolState st = new SymbolState(symbol);
+                            states.put(symbol, st);
+                            seedFirstCandleOfDay(st, symbol);
+                        }
                     }
                 }
 
@@ -643,7 +667,6 @@ public class LowestVolumeReversalStrategy implements Strategy {
         this.dailyTradeCount = 0;
         longCandidates.clear();
         shortCandidates.clear();
-        nseClient.clearCache();
         for (SymbolState s : states.values()) {
             s.resetDaily();
         }

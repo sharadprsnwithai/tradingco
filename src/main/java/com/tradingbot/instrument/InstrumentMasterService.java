@@ -35,6 +35,9 @@ public class InstrumentMasterService {
 
     private static final Logger log = LoggerFactory.getLogger(InstrumentMasterService.class);
 
+    /** Normalizes the stored (possibly quote-wrapped) name column for matching. */
+    private static final String NAME_MATCH = "REPLACE(name, '\"', '')";
+
     private final String dbUrl;
     private final Map<String, Instrument> activeByCanonical = new ConcurrentHashMap<>();
     private final Map<String, Instrument> activeByKiteToken = new ConcurrentHashMap<>();
@@ -182,6 +185,46 @@ public class InstrumentMasterService {
     }
 
     /**
+     * Resolves a (possibly abstract) market-data symbol to a concrete tradeable
+     * instrument for live ticks / historical candles.
+     *
+     * Handles the abstract index-future symbols the strategies subscribe with
+     * (e.g. {@code NFO:NIFTY_FUT}, {@code NFO:NIFTY_50}) which are NOT stored as
+     * canonical symbols in the master. They are mapped to the current
+     * nearest-expiry FUT contract of the underlying (e.g. {@code NFO:NIFTY25AUG24FUT}),
+     * whose Kite token drives the actual feed.
+     *
+     * @param symbol abstract or concrete symbol (with or without exchange prefix)
+     * @return the concrete instrument to subscribe / fetch history for, or empty
+     */
+    public Mono<Instrument> resolveForMarketData(String symbol) {
+        if (symbol == null) return Mono.empty();
+        return findByCanonicalSymbol(symbol)
+            .switchIfEmpty(Mono.defer(() -> resolveAbstract(symbol)));
+    }
+
+    private Mono<Instrument> resolveAbstract(String symbol) {
+        String s = symbol.contains(":") ? symbol.substring(symbol.indexOf(':') + 1) : symbol;
+
+        // NFO:NIFTY_FUT / NFO:BANKNIFTY_FUT -> nearest FUT contract of the underlying
+        if (s.endsWith("_FUT")) {
+            String name = s.substring(0, s.length() - 4);
+            log.info("[INSTR] '{}' not found as canonical — mapping to nearest {} FUT contract", symbol, name);
+            return findNearestExpiring(name, "FUT");
+        }
+
+        // Index-style abstracts: NIFTY_50, BANKNIFTY_50, FINNIFTY_50, MIDCPNIFTY_50, ...
+        // Strip the trailing _<digits> to recover the underlying name and map to its FUT.
+        if (s.matches(".+_\\d+")) {
+            String name = s.substring(0, s.lastIndexOf('_'));
+            log.info("[INSTR] '{}' not found as canonical — mapping index '{}' to nearest FUT contract", symbol, name);
+            return findNearestExpiring(name, "FUT");
+        }
+
+        return Mono.empty();
+    }
+
+    /**
      * Look up instrument by Kite numeric token string.
      */
     public Mono<Instrument> findByKiteToken(String kiteToken) {
@@ -236,12 +279,61 @@ public class InstrumentMasterService {
     }
 
     /**
+     * Bulk-updates Shoonya instrument tokens keyed by canonical symbol.
+     * Used by the Shoonya master sync to back-fill {@code shoonya_token} on the
+     * rows already created from the Kite master.
+     *
+     * @param canonicalToToken map of canonicalSymbol -&gt; Shoonya token
+     * @return Mono emitting the number of rows updated
+     */
+    public Mono<Integer> updateShoonyaTokens(Map<String, String> canonicalToToken) {
+        if (canonicalToToken == null || canonicalToToken.isEmpty()) return Mono.just(0);
+        return Mono.fromCallable(() -> {
+            int updated = 0;
+            try (Connection conn = getConnection();
+                 PreparedStatement ps = conn.prepareStatement(
+                     "UPDATE instruments SET shoonya_token = ? WHERE canonical_symbol = ?")) {
+                for (Map.Entry<String, String> e : canonicalToToken.entrySet()) {
+                    if (e.getKey() == null || e.getValue() == null) continue;
+                    ps.setString(1, e.getValue());
+                    ps.setString(2, e.getKey());
+                    ps.addBatch();
+                }
+                int[] results = ps.executeBatch();
+                for (int r : results) if (r > 0) updated++;
+            }
+            return updated;
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /**
+     * Returns the distinct underlying names of NFO FUT contracts (the F&O stock universe).
+     * Used to build the gainers/losers universe for backup selection via another broker.
+     */
+    public Mono<List<String>> getDistinctFoUnderlyingNames() {
+        return Mono.fromCallable(() -> {
+            List<String> names = new ArrayList<>();
+            try (Connection conn = getConnection();
+                 PreparedStatement ps = conn.prepareStatement(
+                     "SELECT DISTINCT name FROM instruments WHERE exchange='NFO' AND instrument_type='FUT'")) {
+                try (ResultSet rs = ps.executeQuery()) {
+                    while (rs.next()) {
+                        String n = rs.getString(1);
+                        if (n != null && !n.isBlank()) names.add(n);
+                    }
+                }
+            }
+            return names;
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /**
      * Find option contracts for a given underlying, expiry, strike, and CE/PE type.
      */
     public Flux<Instrument> findOptionContracts(String underlying, String expiry, BigDecimal strike, String instrumentType) {
         return Mono.fromCallable(() -> {
             List<Instrument> results = new ArrayList<>();
-            StringBuilder sql = new StringBuilder("SELECT * FROM instruments WHERE name = ?");
+            StringBuilder sql = new StringBuilder("SELECT * FROM instruments WHERE " + NAME_MATCH + " = ?");
             List<Object> params = new ArrayList<>();
             params.add(underlying);
 
@@ -321,11 +413,8 @@ public class InstrumentMasterService {
     public Mono<Instrument> findNearestExpiring(String name, String instrumentType) {
         return Mono.fromCallable(() -> {
             String todayStr = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
-            String sql = """
-                SELECT * FROM instruments
-                WHERE name = ? AND instrument_type = ? AND expiry >= ?
-                ORDER BY expiry ASC LIMIT 1
-                """;
+            String sql = "SELECT * FROM instruments WHERE " + NAME_MATCH
+                + " = ? AND instrument_type = ? AND expiry >= ? ORDER BY expiry ASC LIMIT 1";
             try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, name);
                 ps.setString(2, instrumentType);
@@ -355,13 +444,9 @@ public class InstrumentMasterService {
     public Mono<Instrument> findNearestAtmOption(String name, double refPrice, String optionType) {
         return Mono.fromCallable(() -> {
             String todayStr = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
-            String sql = """
-                SELECT * FROM instruments
-                WHERE name = ? AND instrument_type = ? AND expiry >= ?
-                  AND expiry = (SELECT MIN(expiry) FROM instruments
-                                 WHERE name = ? AND instrument_type = ? AND expiry >= ?)
-                ORDER BY ABS(strike - ?) ASC LIMIT 1
-                """;
+            String sql = "SELECT * FROM instruments WHERE " + NAME_MATCH
+                + " = ? AND instrument_type = ? AND expiry >= ? AND expiry = (SELECT MIN(expiry) FROM instruments"
+                + " WHERE " + NAME_MATCH + " = ? AND instrument_type = ? AND expiry >= ?) ORDER BY ABS(strike - ?) ASC LIMIT 1";
             try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, name);
                 ps.setString(2, optionType);
