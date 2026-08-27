@@ -20,6 +20,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -86,6 +87,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
     private volatile boolean enabled = true;
 
     private final DailyState daily = new DailyState();
+
+    private volatile String lastEntryOutcome = "NONE";
+    private volatile String lastEntryDetail = "";
 
     @Autowired
     public IntradayTrendMomentumOptionSellingStrategy(
@@ -480,6 +484,58 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         }
     }
 
+    private double round2(double v) {
+        if (Double.isNaN(v)) return v;
+        return Math.round(v * 100.0) / 100.0;
+    }
+
+    @Scheduled(cron = "0 */5 9-15 * * MON-FRI", zone = "Asia/Kolkata")
+    public void logDiagnostic() {
+        if (!enabled || context == null) return;
+        try {
+            String sym = underlyingSymbol;
+            List<Candle> c15 = context.getHistoricalCandles(sym, TIMEFRAME_15M, 100);
+            double[] closes1h = context.getClosePrices(sym, TIMEFRAME_1H);
+            int n15 = c15 == null ? 0 : c15.size();
+            int n1h = closes1h == null ? 0 : closes1h.length;
+
+            double stLast = Double.NaN;
+            boolean bullST = false, bearST = false;
+            if (c15 != null && c15.size() >= superTrendAtrLength + 2) {
+                double[] hi = c15.stream().mapToDouble(c -> c.high().doubleValue()).toArray();
+                double[] lo = c15.stream().mapToDouble(c -> c.low().doubleValue()).toArray();
+                double[] cl = c15.stream().mapToDouble(c -> c.close().doubleValue()).toArray();
+                double[] st = TechnicalIndicators.calculateSuperTrend(hi, lo, cl, superTrendAtrLength, superTrendMultiplier);
+                stLast = st[st.length - 1];
+                bullST = stLast > 0; bearST = stLast < 0;
+            }
+            double rsi = (closes1h != null && closes1h.length >= rsiPeriod + 2)
+                ? TechnicalIndicators.calculateRsi(closes1h, rsiPeriod) : Double.NaN;
+            boolean bullRsi = !Double.isNaN(rsi) && rsi >= rsiUpperThreshold;
+            boolean bearRsi = !Double.isNaN(rsi) && rsi <= rsiLowerThreshold;
+
+            String gate;
+            if (n15 < superTrendAtrLength + 2) gate = "INSUFFICIENT_15M(" + n15 + ")";
+            else if (n1h < rsiPeriod + 2) gate = "INSUFFICIENT_1H(" + n1h + ")";
+            else if (Double.isNaN(stLast)) gate = "ST_NAN";
+            else if (Double.isNaN(rsi)) gate = "RSI_NAN";
+            else if (daily.position != Position.FLAT) gate = "IN_TRADE(" + daily.position + ")";
+            else if (daily.entryLocked) gate = "ENTRY_LOCKED";
+            else if (isBlackoutDay()) gate = "BLACKOUT";
+            else if (bullST && bullRsi) gate = "WOULD_ENTRY_BULLISH";
+            else if (bearST && bearRsi) gate = "WOULD_ENTRY_BEARISH";
+            else gate = "NO_DIRECTION(ST=" + (bearST ? "BEAR" : (bullST ? "BULL" : "n/a"))
+                + ",RSI=" + round2(rsi) + ",needRsi<=" + rsiLowerThreshold + "or>= " + rsiUpperThreshold + ")";
+
+            log.info("[{}] DIAG | sym={} | 15m={} | 1h={} | ST={}({}) | RSI1h={} | gate={} | pos={} | entries={} | locked={} | lastEntry={}:{}",
+                strategyId, sym, n15, n1h, bearST ? "BEAR" : (bullST ? "BULL" : "n/a"),
+                round2(Math.abs(stLast)), round2(rsi), gate, daily.position, daily.entriesToday,
+                daily.entryLocked, lastEntryOutcome, lastEntryDetail);
+        } catch (Exception e) {
+            log.warn("[{}] DIAG failed: {}", strategyId, e.getMessage());
+        }
+    }
+
     private record SelectedOptionTrade(
         Instrument shortOption,
         double shortPremium,
@@ -495,6 +551,8 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             // Select 0.20 delta option: if nearest expiry premium < minPremium (Rs 70), check next expiry
             var tradeSelection = selectOptionForTrading(spotPrice, optionType);
             if (tradeSelection.isEmpty()) {
+                lastEntryOutcome = "NO_CANDIDATE";
+                lastEntryDetail = optionType + " spot=" + round2(spotPrice) + " (selectOptionForTrading returned empty)";
                 log.warn("[{}] No {} option candidate found near spot {}", strategyId, optionType, spotPrice);
                 return;
             }
@@ -542,6 +600,8 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
                 .timestamp(time)
                 .build();
             context.emitSignal(entrySignal);
+            lastEntryOutcome = "SIGNAL_EMITTED";
+            lastEntryDetail = optionSymbol + " @ ₹" + round2(premium) + " (" + optionType + ")";
 
             // Emit hedge leg if available
             if (selected.hedgeOption().isPresent() && selected.hedgePremium() > 0) {
@@ -593,12 +653,17 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             List<String> expiries = instrumentMaster.findUpcomingExpiries("NIFTY", optionType, 3)
                 .collectList()
                 .block();
+            log.info("[{}] selectOptionForTrading: kitePcrProvider={}, expiries={}", strategyId,
+                kitePcrProvider != null, expiries);
 
             if (expiries == null || expiries.isEmpty()) {
                 var nearestOpt = instrumentMaster.findNearestExpiring("NIFTY", optionType).blockOptional();
                 if (nearestOpt.isPresent() && nearestOpt.get().expiry() != null) {
                     expiries = List.of(nearestOpt.get().expiry());
                 } else {
+                    lastEntryOutcome = "NO_EXPIRIES";
+                    lastEntryDetail = "findUpcomingExpiries & findNearestExpiring empty for " + optionType;
+                    log.warn("[{}] No expiries found for NIFTY {} — cannot select option", strategyId, optionType);
                     return Optional.empty();
                 }
             }
@@ -614,7 +679,25 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
 
                 String sym = candidateOpt.get().canonicalSymbol();
                 double ltp = kitePcrProvider != null ? kitePcrProvider.fetchLtp(sym) : 0.0;
-                if (ltp <= 0) continue;
+                if (ltp <= 0) {
+                    try {
+                        double tte = calculateTimeToExpiryYears(expiry);
+                        double theo = "CE".equalsIgnoreCase(optionType)
+                            ? BlackScholesPricer.callPrice(spotPrice, candidateOpt.get().strike().doubleValue(), tte, 0.07, 0.18)
+                            : BlackScholesPricer.putPrice(spotPrice, candidateOpt.get().strike().doubleValue(), tte, 0.07, 0.18);
+                        if (theo > 0) {
+                            log.warn("[{}] LTP unavailable for {} (kitePcrProvider={}); using theoretical premium ₹{}",
+                                strategyId, sym, kitePcrProvider != null, round2(theo));
+                            ltp = theo;
+                        } else {
+                            log.warn("[{}] LTP & theoretical premium unavailable for {}; skipping", strategyId, sym);
+                            continue;
+                        }
+                    } catch (Exception ex) {
+                        log.warn("[{}] LTP unavailable and theoretical premium failed for {}: {}", strategyId, sym, ex.getMessage());
+                        continue;
+                    }
+                }
 
                 if (i == 0) {
                     // Nearest expiry check
@@ -645,6 +728,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             }
 
             if (chosenOption == null || chosenPremium <= 0) {
+                lastEntryOutcome = "NO_CANDIDATE_PREMIUM";
+                lastEntryDetail = "all expiries skipped (LTP unavailable or premium<=0)";
+                log.warn("[{}] selectOptionForTrading: no valid option after scanning {} expiries", strategyId, expiries.size());
                 return Optional.empty();
             }
 

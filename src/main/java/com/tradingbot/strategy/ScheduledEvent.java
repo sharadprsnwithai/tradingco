@@ -19,6 +19,7 @@ public record ScheduledEvent(
     public static final String MARKET_OPEN = "MARKET_OPEN";
     public static final String VWAP_BASELINE_930 = "VWAP_BASELINE_930";
     public static final String VWAP_BIAS_CHECK_1100 = "VWAP_BIAS_CHECK_1100";
+    public static final String VWAP_RECOVER = "VWAP_RECOVER";
     public static final String INTRADAY_ENTRY_CUTOFF = "INTRADAY_ENTRY_CUTOFF";
     public static final String INTRADAY_SQUARE_OFF = "INTRADAY_SQUARE_OFF";
     public static final String LVR_HARD_EXIT = "LVR_HARD_EXIT";

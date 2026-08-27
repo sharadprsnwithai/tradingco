@@ -8,6 +8,7 @@ import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.oms.OrderManagerService;
 import com.tradingbot.position.PositionManagerService;
 import com.tradingbot.strategy.StrategyEngine;
+import com.tradingbot.strategy.ScheduledEvent;
 import com.tradingbot.telegram.TelegramBotService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -140,6 +141,35 @@ public class TradingBotApplication {
                     .block();
             } else {
                 log.info("Shoonya adapter is disabled; skipping verification");
+            }
+
+            // 2b. Rehydrate local position state from broker APIs (source of truth) now
+            //     that both brokers are authenticated and instrument masters are synced.
+            //     Triggered here — not at @PostConstruct — so valid sessions are guaranteed
+            //     and a mid-day container restart reliably recovers open positions for the
+            //     crash-recovery alert.
+            positionManager.rehydratePositionsFromBrokers().block();
+            log.info("Position rehydration from brokers complete at startup");
+
+            // 2c. Backfill historical candles into the CandleAggregator for all strategy
+            //     symbols (SuperTrend/RSI/VWAP look-back). This runs after both brokers are
+            //     authenticated so the Kite/Shoonya historical APIs have valid sessions. Without
+            //     this, the aggregator only holds live bars since process start and strategies
+            //     stay blind for hours after a mid-day restart.
+            try {
+                strategyEngine.warmupAllStrategies();
+            } catch (Exception ex) {
+                log.error("Historical candle warmup failed (strategies may have reduced look-back): {}", ex.getMessage());
+            }
+
+            // 2d. Now that 5m history is backfilled, let the VWAP strategy reconstruct any 9:30 /
+            //     11:00 bias snapshots it missed because this process started mid-day (those
+            //     scheduled events had already fired). Without this its bias stays NEUTRAL and
+            //     it never enters after a restart.
+            try {
+                strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.VWAP_RECOVER));
+            } catch (Exception ex) {
+                log.error("VWAP baseline recovery dispatch failed: {}", ex.getMessage());
             }
 
             // 3. Send Telegram Startup / Crash Recovery Notification

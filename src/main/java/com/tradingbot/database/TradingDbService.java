@@ -164,6 +164,22 @@ public class TradingDbService {
                 );
             """);
 
+            // 5. VWAP strategy 9:30 / 11:00 baseline snapshots (price + PCR) for restart
+            //    rehydration. Keyed by strategy + snapshot type + IST trade date so each
+            //    trading day holds one row per snapshot; the latest process to capture it
+            //    wins (INSERT OR REPLACE).
+            stmt.execute("""
+                CREATE TABLE IF NOT EXISTS vwap_baseline_snapshot (
+                    strategy_id TEXT,
+                    snapshot_type TEXT,
+                    trade_date TEXT,
+                    price REAL,
+                    pcr REAL,
+                    captured_at INTEGER,
+                    PRIMARY KEY(strategy_id, snapshot_type, trade_date)
+                );
+            """);
+
             log.info("SQLite Operational Database schema initialized at {}", dbUrl);
         } catch (SQLException e) {
             log.error("Failed to initialize TradingDbService schema", e);
@@ -576,4 +592,93 @@ public class TradingDbService {
     }
 
     public record RiskAuditRecord(long id, String strategyId, String accountId, String action, String level, String reason, Instant timestamp) {}
+
+    /**
+     * Persisted VWAP strategy baseline snapshot (price + PCR) captured at 9:30 / 11:00 IST,
+     * used to rehydrate bias after a mid-day container restart so recovery uses the real
+     * intraday PCR instead of a same-value approximation.
+     *
+     * @param strategyId   the strategy that produced the snapshot (e.g. VWAP_NIFTY_01)
+     * @param snapshotType the snapshot kind: "930" or "1100"
+     * @param tradeDate    IST trade date (yyyy-MM-dd)
+     * @param price        underlying (Nifty futures) price at the snapshot time
+     * @param pcr          Put-Call Ratio at the snapshot time
+     * @param capturedAt   instant the snapshot was persisted
+     */
+    public record VwapBaselineSnapshot(
+        String strategyId,
+        String snapshotType,
+        String tradeDate,
+        double price,
+        double pcr,
+        Instant capturedAt
+    ) {}
+
+    // =========================================================================
+    // VWAP Baseline Snapshot Persistence (restart rehydration)
+    // =========================================================================
+
+    /**
+     * Persists or replaces a VWAP baseline snapshot for the given strategy / type / trade date.
+     *
+     * @param s the snapshot to persist; if null, no operation is performed
+     * @return a {@link Mono} that completes when the save operation finishes
+     */
+    public Mono<Void> saveVwapSnapshot(VwapBaselineSnapshot s) {
+        if (s == null) return Mono.empty();
+        return Mono.fromRunnable(() -> {
+            String sql = """
+                INSERT OR REPLACE INTO vwap_baseline_snapshot
+                    (strategy_id, snapshot_type, trade_date, price, pcr, captured_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """;
+            try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, s.strategyId());
+                ps.setString(2, s.snapshotType());
+                ps.setString(3, s.tradeDate());
+                ps.setDouble(4, s.price());
+                ps.setDouble(5, s.pcr());
+                ps.setLong(6, s.capturedAt() != null ? s.capturedAt().toEpochMilli() : System.currentTimeMillis());
+                ps.executeUpdate();
+            } catch (SQLException e) {
+                log.error("Failed to persist VWAP baseline snapshot for {}/{}", s.strategyId(), s.snapshotType(), e);
+                throw new RuntimeException(e);
+            }
+        }).subscribeOn(Schedulers.boundedElastic()).then();
+    }
+
+    /**
+     * Loads the persisted VWAP baseline snapshot for a strategy / type / IST trade date.
+     *
+     * @param strategyId   the strategy id (e.g. VWAP_NIFTY_01)
+     * @param snapshotType the snapshot kind: "930" or "1100"
+     * @param tradeDate    IST trade date (yyyy-MM-dd)
+     * @return a {@link Mono} emitting the snapshot if present, otherwise empty
+     */
+    public Mono<Optional<VwapBaselineSnapshot>> loadVwapSnapshot(String strategyId, String snapshotType, String tradeDate) {
+        return Mono.fromCallable(() -> {
+            String sql = """
+                SELECT * FROM vwap_baseline_snapshot
+                WHERE strategy_id = ? AND snapshot_type = ? AND trade_date = ?
+                """;
+            try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, strategyId);
+                ps.setString(2, snapshotType);
+                ps.setString(3, tradeDate);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return Optional.of(new VwapBaselineSnapshot(
+                            rs.getString("strategy_id"),
+                            rs.getString("snapshot_type"),
+                            rs.getString("trade_date"),
+                            rs.getDouble("price"),
+                            rs.getDouble("pcr"),
+                            Instant.ofEpochMilli(rs.getLong("captured_at"))
+                        ));
+                    }
+                }
+            }
+            return Optional.<VwapBaselineSnapshot>empty();
+        }).subscribeOn(Schedulers.boundedElastic());
+    }
 }

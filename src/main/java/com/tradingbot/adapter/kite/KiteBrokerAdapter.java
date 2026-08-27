@@ -58,6 +58,11 @@ public class KiteBrokerAdapter implements BrokerAdapter {
     // --- Live WebSocket (KiteTicker) state ---
     private final Sinks.Many<Tick> tickSink = Sinks.many().multicast().onBackpressureBuffer();
     private final AtomicReference<KiteTicker> tickerRef = new AtomicReference<>();
+    // The access token the currently-connected ticker was built with. Used to detect
+    // when a re-auth minted a new token so the live WS can be re-keyed (Kite 403 fix).
+    private final AtomicReference<String> tickerToken = new AtomicReference<>();
+    private final Object tickerRekeyLock = new Object();
+    private volatile long lastWsRekeyAttemptMillis = 0;
     private final Map<Long, Set<String>> tokenToSymbols = new ConcurrentHashMap<>();
     private final Set<Long> subscribedTokens = ConcurrentHashMap.newKeySet();
 
@@ -79,6 +84,9 @@ public class KiteBrokerAdapter implements BrokerAdapter {
             .baseUrl(config.getBaseUrl())
             .defaultHeader("X-Kite-Version", "3")
             .build();
+        // Re-key the live WebSocket whenever a fresh access token is minted (e.g. after
+        // daily expiry), otherwise SDK auto-reconnect keeps using the stale token → 403.
+        authenticator.setTokenRenewedListener(this::rekeyTickerOnTokenRenewal);
     }
 
     /**
@@ -413,6 +421,20 @@ public class KiteBrokerAdapter implements BrokerAdapter {
         }
 
         log.info("Connecting Kite WebSocket (KiteTicker) for {} tokens...", newTokens.size());
+        KiteTicker ticker = createTicker(accessToken);
+        subscribedTokens.addAll(newTokens);
+        tickerRef.set(ticker);
+        tickerToken.set(accessToken);
+        ticker.connect();
+    }
+
+    /**
+     * Builds a fully configured (but not yet connected) KiteTicker bound to the given
+     * access token. The token is baked into the SDK client and reused on every internal
+     * auto-reconnect, so callers MUST rebuild the ticker (see {@link #rekeyTickerOnTokenRenewal})
+     * whenever a fresh access token is minted, otherwise reconnects fail with 403.
+     */
+    private KiteTicker createTicker(String accessToken) {
         KiteTicker ticker = new KiteTicker(accessToken, config.getApiKey());
         ticker.setTryReconnection(true);
         try {
@@ -451,7 +473,12 @@ public class KiteBrokerAdapter implements BrokerAdapter {
             log.warn("Kite WebSocket disconnected - SDK auto-reconnect is active"));
         ticker.setOnErrorListener(new OnError() {
             @Override public void onError(Exception exception) {
-                log.error("Kite WebSocket error: {}", exception.getMessage());
+                String msg = exception != null ? exception.getMessage() : null;
+                log.error("Kite WebSocket error: {}", msg);
+                if (isAuthFailure(msg)) {
+                    log.warn("Kite WebSocket handshake/auth failure detected - triggering token re-auth and ticker re-key");
+                    triggerWsReauth();
+                }
             }
             @Override public void onError(KiteException kiteException) {
                 log.error("Kite WebSocket KiteException: {}", kiteException.getMessage());
@@ -460,10 +487,66 @@ public class KiteBrokerAdapter implements BrokerAdapter {
                 log.error("Kite WebSocket error: {}", error);
             }
         });
+        return ticker;
+    }
 
-        subscribedTokens.addAll(newTokens);
-        tickerRef.set(ticker);
-        ticker.connect();
+    /**
+     * Rebuilds the live WebSocket ticker with a freshly minted access token. Invoked by
+     * {@link KiteAuthenticator}'s tokenRenewedListener whenever a new token is produced
+     * (headless login / manual token / daily re-auth). This is the core fix for the
+     * Kite 403 Forbidden issue: the SDK caches the token it was constructed with, so
+     * after a REST re-auth the WS must be reconstructed to stop reconnecting on a dead token.
+     */
+    private void rekeyTickerOnTokenRenewal(String newToken) {
+        if (newToken == null) return;
+        if (newToken.equals(tickerToken.get())) return; // already on this token, nothing to do
+        synchronized (tickerRekeyLock) {
+            if (newToken.equals(tickerToken.get())) return;
+            KiteTicker old = tickerRef.get();
+            if (old == null) {
+                // Not connected yet; remember the token so the next connect uses it.
+                tickerToken.set(newToken);
+                return;
+            }
+            log.info("Kite access token renewed - rebuilding WebSocket ticker with fresh token");
+            try { old.disconnect(); } catch (Exception ignore) {}
+            tickerRef.set(null);
+            KiteTicker fresh = createTicker(newToken);
+            tickerRef.set(fresh);
+            tickerToken.set(newToken);
+            fresh.connect();
+        }
+    }
+
+    /**
+     * Fallback triggered when the WebSocket itself reports an auth/handshake failure (HTTP 403).
+     * Invalidates the cached token, forces a fresh re-auth, and (via the tokenRenewedListener)
+     * rebuilds the ticker with the new token. Debounced to avoid a re-key storm while the SDK's
+     * auto-reconnect keeps reporting the same failure.
+     */
+    private void triggerWsReauth() {
+        long now = System.currentTimeMillis();
+        if (now - lastWsRekeyAttemptMillis < 60_000) {
+            return;
+        }
+        lastWsRekeyAttemptMillis = now;
+        log.warn("Kite WebSocket auth failure - invalidating token and refreshing via re-auth");
+        authenticator.invalidateToken();
+        authenticator.getAccessToken()
+            .doOnNext(this::rekeyTickerOnTokenRenewal)
+            .onErrorResume(ex -> {
+                log.error("Kite WebSocket re-auth failed: {}", ex.getMessage());
+                return Mono.empty();
+            })
+            .subscribe();
+    }
+
+    private static boolean isAuthFailure(String msg) {
+        if (msg == null) return false;
+        return msg.contains("403")
+            || msg.contains("Forbidden")
+            || msg.contains("Unauthorized")
+            || msg.contains("Switching Protocols");
     }
 
     /**

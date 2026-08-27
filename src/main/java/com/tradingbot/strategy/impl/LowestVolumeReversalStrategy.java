@@ -13,9 +13,13 @@ import com.tradingbot.nse.NseGainerLoser;
 import com.tradingbot.strategy.ScheduledEvent;
 import com.tradingbot.strategy.Strategy;
 import com.tradingbot.strategy.StrategyContext;
+import com.tradingbot.telegram.TelegramBotService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Mono;
 
@@ -59,6 +63,7 @@ public class LowestVolumeReversalStrategy implements Strategy {
 
     private final GainersLosersSource gainersSource;
     private final LotSizeService lotSizeService;
+    private final TelegramBotService telegramBot;
 
     /** Static F&O basket used as a last-resort fallback if dynamic selection yields nothing. */
     private static final List<String> DEFAULT_LVR_SYMBOLS = List.of(
@@ -89,7 +94,9 @@ public class LowestVolumeReversalStrategy implements Strategy {
      * @param momentumCandles   number of consecutive candles to confirm momentum
      * @param gainersSource     source for Top Gainers / Losers stock selection (Kite, falling back to NSE)
      * @param lotSizeService    service to fetch F&O lot sizes from Kite
+     * @param telegramBot       Telegram alert sink (lazy to avoid a StrategyEngine <-> Telegram cycle)
      */
+    @Autowired
     public LowestVolumeReversalStrategy(
         @Value("${bot.strategies.lowest-volume-reversal.id:LOWEST_VOL_REV_01}") String strategyId,
         @Value("${bot.strategies.lowest-volume-reversal.account-id:KITE_USER_01}") String assignedAccountId,
@@ -98,7 +105,8 @@ public class LowestVolumeReversalStrategy implements Strategy {
         @Value("${bot.strategies.lowest-volume-reversal.min-rr-ratio:2.0}") double minRrRatio,
         @Value("${bot.strategies.lowest-volume-reversal.momentum-candles:2}") int momentumCandles,
         GainersLosersSource gainersSource,
-        LotSizeService lotSizeService
+        LotSizeService lotSizeService,
+        @Lazy TelegramBotService telegramBot
     ) {
         this.strategyId = strategyId;
         this.assignedAccountId = assignedAccountId;
@@ -107,11 +115,30 @@ public class LowestVolumeReversalStrategy implements Strategy {
         this.momentumCandles = momentumCandles;
         this.gainersSource = gainersSource;
         this.lotSizeService = lotSizeService;
+        this.telegramBot = telegramBot;
         if (symbolsStr != null && !symbolsStr.isBlank()) {
             for (String s : symbolsStr.split(",")) {
                 symbols.add(s.trim());
             }
         }
+    }
+
+    /**
+     * Backtest/test convenience constructor (no Telegram sink). Delegates to the
+     * primary constructor with a null TelegramBotService.
+     */
+    public LowestVolumeReversalStrategy(
+        String strategyId,
+        String assignedAccountId,
+        String symbolsStr,
+        int maxTradesPerDay,
+        double minRrRatio,
+        int momentumCandles,
+        GainersLosersSource gainersSource,
+        LotSizeService lotSizeService
+    ) {
+        this(strategyId, assignedAccountId, symbolsStr, maxTradesPerDay, minRrRatio,
+            momentumCandles, gainersSource, lotSizeService, null);
     }
 
     @Override
@@ -210,6 +237,38 @@ public class LowestVolumeReversalStrategy implements Strategy {
         }
     }
 
+    @Scheduled(cron = "0 */5 9-15 * * MON-FRI", zone = "Asia/Kolkata")
+    public void logDiagnostic() {
+        if (!enabled) return;
+        try {
+            int inTrade = 0, waitingMomentum = 0, waitingPullback = 0, waitingEntry = 0, disqualified = 0;
+            StringBuilder sb = new StringBuilder();
+            for (SymbolState st : states.values()) {
+                if (st.position == TradePosition.IN_TRADE) inTrade++;
+                else if (st.disqualified) disqualified++;
+                else if (st.setupPhase == SetupPhase.WAITING_FOR_MOMENTUM) waitingMomentum++;
+                else if (st.setupPhase == SetupPhase.WAITING_FOR_PULLBACK) waitingPullback++;
+                else if (st.setupPhase == SetupPhase.WAITING_FOR_ENTRY) waitingEntry++;
+
+                if (st.position == TradePosition.IN_TRADE
+                        || st.setupPhase == SetupPhase.WAITING_FOR_ENTRY
+                        || st.pendingDirection != null) {
+                    sb.append(String.format("%n  - %s | phase=%s | dir=%s | pos=%s | candles=%d | disq=%s",
+                        st.symbol, st.setupPhase, st.pendingDirection, st.position,
+                        st.dayCandles.size(), st.disqualified));
+                }
+            }
+
+            log.info("[{}] DIAG | symbols={} | longC={} | shortC={} | entryLocked={} | trades={}/{} | "
+                    + "inTrade={} | waitMomentum={} | waitPullback={} | waitEntry={} | disqualified={}{}",
+                strategyId, symbols.size(), longCandidates.size(), shortCandidates.size(),
+                entryLocked, dailyTradeCount, maxTradesPerDay, inTrade, waitingMomentum,
+                waitingPullback, waitingEntry, disqualified, sb);
+        } catch (Exception e) {
+            log.warn("[{}] DIAG failed: {}", strategyId, e.getMessage());
+        }
+    }
+
     /**
      * Phase 0: Fetches Top Gainers/Losers (Kite-derived, falling back to NSE) and
      * updates candidate watchlists.
@@ -222,6 +281,10 @@ public class LowestVolumeReversalStrategy implements Strategy {
             .subscribe(tuple -> {
                 List<NseGainerLoser> gainers = tuple.getT1();
                 List<NseGainerLoser> losers = tuple.getT2();
+
+                log.info("[STOCK-SELECTION] F&O stock list received — Gainers({}): {} | Losers({}): {}",
+                    gainers.size(), gainers.stream().map(NseGainerLoser::symbol).toList(),
+                    losers.size(), losers.stream().map(NseGainerLoser::symbol).toList());
 
                 longCandidates.clear();
                 shortCandidates.clear();
@@ -270,6 +333,8 @@ public class LowestVolumeReversalStrategy implements Strategy {
                 log.info("Stock Selection Complete — Long candidates: {} | Short candidates: {}",
                     longCandidates, shortCandidates);
 
+                sendGainersLosersAlert(gainers, losers);
+
                 // Symbols are now in the list — deterministically sync broker subscriptions
                 // so ticks/candles for the newly added symbols are ingested from this point.
                 if (context != null) {
@@ -277,6 +342,28 @@ public class LowestVolumeReversalStrategy implements Strategy {
                     log.info("Subscription sync requested for {} symbols after stock selection", symbols.size());
                 }
             });
+    }
+
+    /**
+     * Pushes the Top 10 Gainers and Top 10 Losers uncovered during the LVR stock
+     * selection scan to Telegram so the operator can see what the strategy picked
+     * from. No-op when Telegram is disabled.
+     */
+    private void sendGainersLosersAlert(List<NseGainerLoser> gainers, List<NseGainerLoser> losers) {
+        if (telegramBot == null) return;
+        StringBuilder sb = new StringBuilder();
+        sb.append("📊 *LVR Stock Selection — Top 10 Gainers & Losers*\n\n");
+        sb.append("🟢 *Top 10 Gainers*\n");
+        int i = 1;
+        for (NseGainerLoser g : gainers.stream().limit(10).toList()) {
+            sb.append(String.format("%d. %s  %+.2f%%\n", i++, g.symbol(), g.pChange()));
+        }
+        sb.append("\n🔴 *Top 10 Losers*\n");
+        i = 1;
+        for (NseGainerLoser l : losers.stream().limit(10).toList()) {
+            sb.append(String.format("%d. %s  %+.2f%%\n", i++, l.symbol(), l.pChange()));
+        }
+        telegramBot.sendAlert(sb.toString()).subscribe();
     }
 
     /**

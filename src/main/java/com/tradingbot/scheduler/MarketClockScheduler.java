@@ -8,12 +8,14 @@ import com.tradingbot.instrument.ShoonyaInstrumentSyncService;
 import com.tradingbot.marketdata.KiteHistoricalDataService;
 import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.marketdata.ShoonyaHistoricalDataService;
+import com.tradingbot.model.Candle;
 import com.tradingbot.model.Instrument;
 import com.tradingbot.position.PositionManagerService;
 import com.tradingbot.risk.RiskManager;
 import com.tradingbot.strategy.ScheduledEvent;
 import com.tradingbot.strategy.Strategy;
 import com.tradingbot.strategy.StrategyEngine;
+import com.tradingbot.strategy.TechnicalIndicators;
 import com.tradingbot.strategy.ironfly.IronFlyService;
 import com.tradingbot.telegram.TelegramBotService;
 import org.slf4j.Logger;
@@ -22,6 +24,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import reactor.core.publisher.Mono;
 
 import java.time.DayOfWeek;
 import java.time.LocalDate;
@@ -393,5 +396,88 @@ public class MarketClockScheduler {
         if (!isTradingDay(clock.get())) return;
         log.info("15:00 IST: Iron Fly - Running daily evaluation");
         ironFlyService.runDailyEvaluation().subscribe();
+    }
+
+    /**
+     * Every 15 minutes during market hours: broadcast NIFTY 50 status to Telegram and
+     * logs it — current LTP, 1-hour RSI(14), and 15-minute SuperTrend direction/level.
+     */
+    @Scheduled(cron = "0 0/15 9-15 * * MON-FRI", zone = "Asia/Kolkata")
+    public void onNiftyStatusBroadcast() {
+        if (!isTradingDay(clock.get())) return;
+        broadcastNiftyStatus();
+    }
+
+    private void broadcastNiftyStatus() {
+        // Resolve the Nifty instrument: prefer the NIFTY 50 index, fall back to the
+        // nearest NIFTY futures contract (the index canonical "NSE:NIFTY 50" is what the
+        // Kite master stores; the bare "NSE:NIFTY" does not resolve and yields no candles).
+        Mono<String> symbolMono = instrumentMaster.findByCanonicalSymbol("NSE:NIFTY 50")
+            .map(Instrument::canonicalSymbol)
+            .switchIfEmpty(instrumentMaster.findNearestExpiring("NIFTY", "FUT").map(Instrument::canonicalSymbol))
+            .defaultIfEmpty("NSE:NIFTY 50");
+
+        symbolMono.flatMap(symbol ->
+                Mono.zip(fetchNiftyCandles(symbol, "60", 60), fetchNiftyCandles(symbol, "15", 60))
+                    .doOnNext(tuple -> emitNiftyStatus(symbol, tuple.getT1(), tuple.getT2())))
+            .subscribe(v -> {}, err -> log.error("[NIFTY-STATUS] broadcast failed: {}", err.getMessage()));
+    }
+
+    private void emitNiftyStatus(String symbol, List<Candle> h1, List<Candle> m15) {
+        if (h1.isEmpty() || m15.isEmpty()) {
+            log.warn("[NIFTY-STATUS] Insufficient candle data for {} (1h={}, 15m={}) — skipping broadcast",
+                symbol, h1.size(), m15.size());
+            return;
+        }
+        double[] c1 = closes(h1);
+        double[] c15 = closes(m15);
+        double[] hi15 = highs(m15);
+        double[] lo15 = lows(m15);
+
+        double rsi1h = TechnicalIndicators.calculateRsi(c1, 14);
+        double[] st = TechnicalIndicators.calculateSuperTrend(hi15, lo15, c15, 7, 3.0);
+        double stLast = st[st.length - 1];
+        double current = c15[c15.length - 1];
+
+        String stDir = Double.isNaN(stLast) ? "n/a" : (stLast > 0 ? "BULLISH" : "BEARISH");
+        String msg = String.format(
+            "📈 *NIFTY 50 Status*\n• LTP: *%.2f*\n• 1H RSI(14): *%.2f*\n• 15m SuperTrend: *%s* (level %.2f)",
+            current, rsi1h, stDir, Math.abs(stLast));
+
+        log.info("[NIFTY-STATUS] {} LTP={} | 1H RSI(14)={} | 15m SuperTrend={} (level {})",
+            symbol, current, rsi1h, stDir, Math.abs(stLast));
+        telegramBot.sendAlert(msg).subscribe();
+    }
+
+    private Mono<List<Candle>> fetchNiftyCandles(String symbol, String timeframe, int numCandles) {
+        if (kiteHistoricalDataService != null) {
+            return kiteHistoricalDataService.fetchHistoricalCandles(symbol, timeframe, numCandles)
+                .filter(list -> !list.isEmpty())
+                .switchIfEmpty(fallbackShoonyaCandles(symbol, timeframe, numCandles));
+        }
+        return fallbackShoonyaCandles(symbol, timeframe, numCandles);
+    }
+
+    private Mono<List<Candle>> fallbackShoonyaCandles(String symbol, String timeframe, int numCandles) {
+        return instrumentMaster.findByCanonicalSymbol(symbol)
+            .map(Instrument::shoonyaToken)
+            .flatMap(token -> {
+                if (token == null || token.isBlank()) return Mono.just(List.<Candle>of());
+                String exch = symbol.startsWith("NSE:") ? "NSE" : "NFO";
+                return historicalDataService.fetchHistoricalCandles(symbol, exch, token, timeframe, numCandles);
+            })
+            .defaultIfEmpty(List.of());
+    }
+
+    private static double[] closes(List<Candle> candles) {
+        return candles.stream().mapToDouble(c -> c.close().doubleValue()).toArray();
+    }
+
+    private static double[] highs(List<Candle> candles) {
+        return candles.stream().mapToDouble(c -> c.high().doubleValue()).toArray();
+    }
+
+    private static double[] lows(List<Candle> candles) {
+        return candles.stream().mapToDouble(c -> c.low().doubleValue()).toArray();
     }
 }

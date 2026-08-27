@@ -45,6 +45,13 @@ public class ShoonyaAuthenticator {
     private final AtomicReference<String> accessToken = new AtomicReference<>();
     private final AtomicReference<String> sUserToken = new AtomicReference<>();
 
+    // Single-flight guard: concurrent getAccessToken() callers (e.g. many REST calls
+    // failing with 401/403 at once) share ONE headless login. Without this, parallel
+    // logins invalidate each other's session at Shoonya, producing an INVALID_SESSION
+    // death-spiral. Mirrors the KiteAuthenticator pattern.
+    private final Object authLock = new Object();
+    private volatile Mono<String> inFlightAuth;
+
     /**
      * Constructs a ShoonyaAuthenticator with the specified configuration, web client builder, and object mapper.
      *
@@ -202,7 +209,22 @@ public class ShoonyaAuthenticator {
         if (token != null) {
             return Mono.just(token);
         }
-        return authenticate();
+        synchronized (authLock) {
+            token = accessToken.get();
+            if (token != null) {
+                return Mono.just(token);
+            }
+            if (inFlightAuth == null) {
+                inFlightAuth = authenticate()
+                    .doFinally(sig -> {
+                        synchronized (authLock) {
+                            inFlightAuth = null;
+                        }
+                    })
+                    .cache();
+            }
+            return inFlightAuth;
+        }
     }
 
     /**

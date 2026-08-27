@@ -2,6 +2,7 @@ package com.tradingbot.strategy.impl;
 
 import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.instrument.LotSizeService;
+import com.tradingbot.database.TradingDbService;
 import com.tradingbot.marketdata.KitePcrProvider;
 import com.tradingbot.model.Candle;
 import com.tradingbot.model.Signal;
@@ -16,13 +17,17 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
@@ -46,6 +51,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public class NiftyVwapMomentumReversalStrategy implements Strategy {
 
     private static final Logger log = LoggerFactory.getLogger(NiftyVwapMomentumReversalStrategy.class);
+    private static final ZoneId IST_ZONE = ZoneId.of("Asia/Kolkata");
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ISO_LOCAL_DATE;
     private static final String TIMEFRAME = "5";
     private static final int LOT_SIZE = 65;
     private static final int LOTS_PER_ENTRY = 2;
@@ -69,6 +76,10 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     private final KitePcrProvider kitePcrProvider;
     private final InstrumentMasterService instrumentMaster;
     private final LotSizeService lotSizeService;
+
+    /** Optional — present only in the live Spring context; null in backtest/manual construction. */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private TradingDbService tradingDbService;
 
     /** Dynamic subscription list: resolved NIFTY futures + any active option contract. */
     private final List<String> symbols = new CopyOnWriteArrayList<>();
@@ -212,10 +223,72 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
                 // 11:00 AM: Capture Nifty Futures price + PCR, determine bias
                 captureBiasCheck1100();
             }
+            case ScheduledEvent.VWAP_RECOVER -> {
+                // Startup/history-backfill recovery: reconstruct any 9:30 / 11:00 snapshots
+                // missed because the process started mid-day (those cron events already passed).
+                recoverBaselinesIfNeeded();
+            }
             case ScheduledEvent.INTRADAY_ENTRY_CUTOFF -> daily.entryLocked = true;
             case ScheduledEvent.INTRADAY_SQUARE_OFF -> squareOffAll("EOD_SQUARE_OFF");
             case ScheduledEvent.MARKET_CLOSE -> daily.reset();
         }
+    }
+
+    /**
+     * Periodic diagnostic (every 5 min during market hours) so operators can see exactly
+     * what data the strategy holds and why it is / isn't generating signals. Surfaces the
+     * 5m candle buffer size, the live VWAP, the 9:30/11:00 bias snapshots, and the gating
+     * state. The most common mid-day-restart failure is {@code bias=NEUTRAL} because the
+     * 9:30 and 11:00 scheduled snapshots never fired for this process — this log makes that
+     * immediately obvious.
+     */
+    @Scheduled(cron = "0 */5 9-15 * * MON-FRI", zone = "Asia/Kolkata")
+    public void logDiagnostic() {
+        if (!enabled || context == null) return;
+        try {
+            String sym = underlyingSymbol;
+            List<Candle> fiveMin = context.getHistoricalCandles(sym, TIMEFRAME, 200);
+            if (fiveMin == null) fiveMin = Collections.emptyList();
+            Candle last = fiveMin.isEmpty() ? null : fiveMin.get(fiveMin.size() - 1);
+            double lastClose = last != null ? last.close().doubleValue() : 0.0;
+            double vwap = getVwap();
+            boolean isGreen = last != null && last.close().compareTo(last.open()) > 0;
+            boolean isRed = last != null && last.close().compareTo(last.open()) < 0;
+
+            String gate;
+            if (vwap <= 0) {
+                gate = "VWAP_NOT_READY";
+            } else if (daily.bias == Bias.NEUTRAL) {
+                gate = "BIAS_NEUTRAL(missed 9:30/11:00 snapshots)";
+            } else if (daily.position != Position.FLAT) {
+                gate = "IN_TRADE";
+            } else if (daily.entryLocked) {
+                gate = "ENTRY_LOCKED";
+            } else if (daily.entriesToday >= MAX_ENTRIES_PER_DAY) {
+                gate = "MAX_ENTRIES(" + daily.entriesToday + ")";
+            } else {
+                boolean cond = (daily.bias == Bias.BULLISH && isGreen
+                        && lastClose > vwap + triggerTolerance && last != null && last.low().doubleValue() < vwap)
+                    || (daily.bias == Bias.BEARISH && isRed
+                        && lastClose < vwap - triggerTolerance && last != null && last.high().doubleValue() > vwap);
+                gate = cond ? "WOULD_ENTER(" + daily.bias + ")" : "CONDITIONS_NOT_MET";
+            }
+
+            log.info("[{}] DIAG | sym={} | buffer5m={} | vwapCandles={} | lastClose={} | vwap={} (ready={}) | "
+                    + "bias={} | pos={} | entries={}/{} | locked={} | "
+                    + "930[price={},pcr={},done={}] 1100[price={},pcr={},done={}] | gate={}",
+                strategyId, sym, fiveMin.size(), daily.allCandles.size(), round2(lastClose), round2(vwap),
+                daily.vwapReady, daily.bias, daily.position, daily.entriesToday, MAX_ENTRIES_PER_DAY, daily.entryLocked,
+                round2(daily.nifty930), round2(daily.pcr930), daily.snapshot930Done,
+                round2(daily.nifty1100), round2(daily.pcr1100), daily.snapshot1100Done,
+                gate);
+        } catch (Exception e) {
+            log.warn("[{}] DIAG failed: {}", strategyId, e.getMessage());
+        }
+    }
+
+    private static double round2(double v) {
+        return Math.round(v * 100.0) / 100.0;
     }
 
     /**
@@ -740,6 +813,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         double pcr = fetchLivePcr();
 
         setBaseline930(niftyPrice, pcr);
+        persistSnapshot("930", niftyPrice, pcr);
         log.info("[{}] 9:30 Baseline captured: price={} pcr={}", strategyId, niftyPrice, pcr);
     }
 
@@ -759,7 +833,121 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         double pcr = fetchLivePcr();
 
         setBaseline1100(niftyPrice, pcr);
+        persistSnapshot("1100", niftyPrice, pcr);
         log.info("[{}] 11:00 Bias Check captured: price={} pcr={} bias={}", strategyId, niftyPrice, pcr, daily.bias);
+    }
+
+    /**
+     * Reconstructs the 9:30 / 11:00 bias snapshots from historical 5m candles when they were
+     * missed because the process started mid-day (those scheduled events already fired before
+     * this instance existed). Without this the {@code bias} stays NEUTRAL forever and the
+     * strategy never enters. Intended to be dispatched once after the candle history has been
+     * backfilled (see {@code StrategyEngine.warmupAllStrategies}).
+     * <p>
+     * Historical PCR is not available, so the current live PCR is used for both snapshots;
+     * the bias decision therefore hinges on the 9:30→11:00 price move (PCR acts as a
+     * secondary confirmation only, and equals itself across both snapshots). If the market
+     * isn't yet at the relevant time, that snapshot is left for its normal scheduled event.
+     */
+    private void recoverBaselinesIfNeeded() {
+        if (!isLiveMode() || context == null) return;
+        if (daily.snapshot930Done && daily.snapshot1100Done) return; // normal flow already handled it
+
+        ZonedDateTime now = ZonedDateTime.now(IST_ZONE);
+        LocalTime t = now.toLocalTime();
+        if (t.isBefore(LocalTime.of(9, 30))) return; // not at baseline time yet — wait for normal events
+
+        List<Candle> hist = context.getHistoricalCandles(underlyingSymbol, TIMEFRAME, 300);
+        if (hist == null || hist.isEmpty()) {
+            log.warn("[{}] Baseline recovery skipped — no 5m history available for {}", strategyId, underlyingSymbol);
+            return;
+        }
+
+        double pcr = fetchLivePcr(); // only used if no DB snapshot exists (historical PCR unavailable)
+        LocalDate today = now.toLocalDate();
+        String tradeDate = today.format(DATE_FMT);
+        Instant t930 = today.atTime(9, 30).atZone(IST_ZONE).toInstant();
+        Instant t1100 = today.atTime(11, 0).atZone(IST_ZONE).toInstant();
+
+        // Prefer a previously persisted (real) snapshot; only reconstruct from history as a
+        // fallback when this is the very first process of the day and nothing was captured yet.
+        if (!daily.snapshot930Done) {
+            TradingDbService.VwapBaselineSnapshot stored = loadStoredSnapshot("930", tradeDate);
+            if (stored != null) {
+                setBaseline930(stored.price(), stored.pcr());
+                log.info("[{}] Recovery: rehydrated 9:30 baseline from DB price={} pcr={}",
+                    strategyId, stored.price(), stored.pcr());
+            } else if (!t.isBefore(LocalTime.of(9, 30))) {
+                Candle c930 = findCandleNear(hist, t930);
+                if (c930 != null) {
+                    double p = c930.close().doubleValue();
+                    setBaseline930(p, pcr);
+                    persistSnapshot("930", p, pcr);
+                    log.info("[{}] Recovery: reconstructed 9:30 baseline from history price={} pcr={}",
+                        strategyId, p, pcr);
+                } else {
+                    log.warn("[{}] Recovery: no 5m candle near 9:30 found for {}", strategyId, underlyingSymbol);
+                }
+            }
+        }
+
+        if (!daily.snapshot1100Done) {
+            TradingDbService.VwapBaselineSnapshot stored = loadStoredSnapshot("1100", tradeDate);
+            if (stored != null) {
+                setBaseline1100(stored.price(), stored.pcr());
+                log.info("[{}] Recovery: rehydrated 11:00 bias snapshot from DB price={} pcr={}",
+                    strategyId, stored.price(), stored.pcr());
+            } else if (!t.isBefore(LocalTime.of(11, 0))) {
+                Candle c1100 = findCandleNear(hist, t1100);
+                if (c1100 != null) {
+                    double p = c1100.close().doubleValue();
+                    setBaseline1100(p, pcr);
+                    persistSnapshot("1100", p, pcr);
+                    log.info("[{}] Recovery: reconstructed 11:00 bias snapshot from history price={} pcr={}",
+                        strategyId, p, pcr);
+                } else {
+                    log.warn("[{}] Recovery: no 5m candle near 11:00 found for {}", strategyId, underlyingSymbol);
+                }
+            }
+        }
+    }
+
+    /** Persists a baseline snapshot to the DB (best-effort, fire-and-forget). No-op if DB absent. */
+    private void persistSnapshot(String type, double price, double pcr) {
+        if (tradingDbService == null) return;
+        try {
+            tradingDbService.saveVwapSnapshot(new TradingDbService.VwapBaselineSnapshot(
+                strategyId, type, LocalDate.now(IST_ZONE).format(DATE_FMT), price, pcr, Instant.now())).subscribe();
+        } catch (Exception e) {
+            log.warn("[{}] Failed to persist {} snapshot: {}", strategyId, type, e.getMessage());
+        }
+    }
+
+    /** Loads a persisted baseline snapshot for today, or null if absent / DB unavailable. */
+    private TradingDbService.VwapBaselineSnapshot loadStoredSnapshot(String type, String tradeDate) {
+        if (tradingDbService == null) return null;
+        try {
+            return tradingDbService.loadVwapSnapshot(strategyId, type, tradeDate)
+                .block().orElse(null);
+        } catch (Exception e) {
+            log.warn("[{}] Failed to load stored {} snapshot: {}", strategyId, type, e.getMessage());
+            return null;
+        }
+    }
+
+    /** Returns the candle in the list whose timestamp is closest to the given target instant. */
+    private static Candle findCandleNear(List<Candle> candles, Instant target) {
+        Candle best = null;
+        long bestDelta = Long.MAX_VALUE;
+        for (Candle c : candles) {
+            if (c.timestamp() == null) continue;
+            long delta = Math.abs(c.timestamp().getEpochSecond() - target.getEpochSecond());
+            if (delta < bestDelta) {
+                bestDelta = delta;
+                best = c;
+            }
+        }
+        return best;
     }
 
     /**

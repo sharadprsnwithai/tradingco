@@ -27,6 +27,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Sinks;
+import reactor.util.retry.Retry;
 
 import java.math.BigDecimal;
 import java.net.URI;
@@ -85,8 +86,33 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
         this.authenticator = authenticator;
         this.objectMapper = objectMapper;
         this.instrumentMaster = instrumentMaster;
+
+        // Backoff retry for transient upstream outages (Shoonya 502/503/504 + timeouts).
+        // This is the fix for the "502/504 storm": instead of hammering Shoonya on every
+        // poll, failed idempotent reads back off exponentially (max 3, 0.5s→8s, jittered).
+        // Order-mutation endpoints (Place/Modify/Cancel) are deliberately excluded so we
+        // never auto-retry a write and risk a duplicate fill.
+        var transientRetry = Retry.backoff(3, Duration.ofMillis(500))
+            .maxBackoff(Duration.ofSeconds(8))
+            .jitter(0.5)
+            .filter(ShoonyaBrokerAdapter::isTransientUpstreamError)
+            .doBeforeRetry(sig -> log.warn("Shoonya upstream transient error ({}), backing off before retry {}: {}",
+                sig.failure() != null ? sig.failure().getClass().getSimpleName() : "?",
+                sig.totalRetries() + 1,
+                sig.failure() != null ? sig.failure().getMessage() : ""));
+
+        org.springframework.web.reactive.function.client.ExchangeFilterFunction backoffRetryFilter =
+            (request, next) -> {
+                String path = request.url().getPath();
+                if (path.contains("/PlaceOrder") || path.contains("/ModifyOrder") || path.contains("/CancelOrder")) {
+                    return next.exchange(request);
+                }
+                return next.exchange(request).retryWhen(transientRetry);
+            };
+
         this.webClient = webClientBuilder
             .baseUrl("https://api.shoonya.com")
+            .filter(backoffRetryFilter)
             .build();
     }
 
@@ -175,6 +201,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                                 return OrderResult.success(norenordno, request.tag(), OrderStatus.OPEN);
                             } else {
                                 String emsg = root.path("emsg").asText("Shoonya order placement failed");
+                                if (isSessionError(emsg)) throw new ShoonyaSessionException(emsg);
                                 return OrderResult.failure(request.tag(), emsg);
                             }
                         } catch (Exception e) {
@@ -224,7 +251,9 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                                 String norenordno = root.path("result").asText(orderId);
                                 return OrderResult.success(norenordno, request.orderId(), OrderStatus.OPEN);
                             } else {
-                                return OrderResult.failure(request.orderId(), root.path("emsg").asText());
+                                String emsg = root.path("emsg").asText("Shoonya order modification failed");
+                                if (isSessionError(emsg)) throw new ShoonyaSessionException(emsg);
+                                return OrderResult.failure(request.orderId(), emsg);
                             }
                         } catch (Exception e) {
                             return OrderResult.failure(request.orderId(), "Parse error: " + e.getMessage());
@@ -265,14 +294,21 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
             Map<String, Object> payload = Map.of("uid", config.getUserId());
             String formBody = buildFormBody(payload, token);
 
-            return webClient.post()
-                .uri("/NorenWClientAPI/OrderBook")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .body(BodyInserters.fromValue(formBody))
-                .retrieve()
-                .bodyToMono(String.class)
-                .map(this::parseOrderBook);
+                return webClient.post()
+                    .uri("/NorenWClientAPI/OrderBook")
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                    .body(BodyInserters.fromValue(formBody))
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .map(json -> {
+                        try {
+                            checkSession(objectMapper.readTree(json));
+                        } catch (com.fasterxml.jackson.core.JsonProcessingException ignore) {
+                            // parseOrderBook handles malformed JSON below
+                        }
+                        return parseOrderBook(json);
+                    });
         }).onErrorResume(ex -> {
             String detail = ex.getMessage();
             if (ex instanceof org.springframework.web.reactive.function.client.WebClientResponseException wcre) {
@@ -293,14 +329,21 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
             String formBody = buildFormBody(payload, token);
 
             log.info("Fetching Shoonya positions for user: {}", config.getUserId());
-            return webClient.post()
-                .uri("/NorenWClientAPI/PositionBook")
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .body(BodyInserters.fromValue(formBody))
-                .retrieve()
-                .bodyToMono(String.class)
-                .map(this::parsePositions);
+                return webClient.post()
+                    .uri("/NorenWClientAPI/PositionBook")
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                    .body(BodyInserters.fromValue(formBody))
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .map(json -> {
+                        try {
+                            checkSession(objectMapper.readTree(json));
+                        } catch (com.fasterxml.jackson.core.JsonProcessingException ignore) {
+                            // parsePositions handles malformed JSON below
+                        }
+                        return parsePositions(json);
+                    });
         }).onErrorResume(ex -> {
             log.error("Failed to fetch Shoonya positions: {}", ex.getMessage());
             return Mono.just(List.of());
@@ -326,6 +369,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                 .map(json -> {
                     try {
                         JsonNode root = objectMapper.readTree(json);
+                        checkSession(root);
                         BigDecimal cash = BigDecimal.valueOf(root.path("cash").asDouble(0.0));
                         BigDecimal marginUsed = BigDecimal.valueOf(root.path("marginused").asDouble(0.0));
                         BigDecimal payin = BigDecimal.valueOf(root.path("payin").asDouble(0.0));
@@ -463,7 +507,19 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
 
             switch (type) {
                 case "ck" -> {
-                    // Connection acknowledged -> subscribe all pending keys
+                    // Connection ack. On success (s=OK) subscribe pending keys; on auth
+                    // rejection (s=ERR / "Invalid Session") the cached token is dead - drop
+                    // the socket and reconnect with a freshly re-authed token (backed off).
+                    String s = node.path("s").asText("");
+                    String emsg = node.path("emsg").asText(node.path("msg").asText(""));
+                    if (!"OK".equalsIgnoreCase(s)) {
+                        log.warn("Shoonya NorenWS connection rejected (s={}, emsg={})", s, emsg);
+                        if (isSessionError(emsg) || "ERR".equalsIgnoreCase(s)) {
+                            wsRef.compareAndSet(webSocket, null);
+                            scheduleWsReconnectWithNewToken();
+                        }
+                        return;
+                    }
                     log.info("Shoonya NorenWS authenticated - subscribing {} keys", subscribedKeys.size());
                     subscribeKeys(new ArrayList<>(subscribedKeys));
                 }
@@ -512,6 +568,32 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                 sendJson(ws, Map.of("t", "h"));
             }
         }, 30, 30, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Recovers the NorenWS feed after a session/auth rejection. Invalidates the dead
+     * token and reconnects with a freshly re-authed one. getAccessToken() is
+     * single-flight, so concurrent triggers collapse into one re-auth, and the 2s
+     * delay provides backoff so a flapping WS does not login in a tight loop.
+     */
+    private void scheduleWsReconnectWithNewToken() {
+        if (!config.isEnabled()) return;
+        log.warn("Shoonya NorenWS session invalid - invalidating token and reconnecting with fresh token (backed off)");
+        authenticator.invalidateToken();
+        authenticator.getAccessToken()
+            .delayElement(Duration.ofSeconds(2))
+            .doOnNext(tok -> {
+                String suToken = authenticator.getSUserToken();
+                if (suToken != null) {
+                    log.info("Shoonya NorenWS re-authed - reconnecting feed");
+                    ensureWsConnected(suToken, new ArrayList<>(subscribedKeys));
+                }
+            })
+            .onErrorResume(ex -> {
+                log.error("Shoonya NorenWS re-auth failed: {}", ex.getMessage());
+                return Mono.empty();
+            })
+            .subscribe();
     }
 
     /**
@@ -761,25 +843,107 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
         return authenticator.getAccessToken()
             .flatMap(apiCall)
             .onErrorResume(ShoonyaBrokerAdapter::isTokenError, ex -> {
-                log.warn("Shoonya rejected session token (401/403) - re-authenticating and retrying once");
+                log.warn("Shoonya rejected session token - re-authenticating and retrying once");
+                // Clear the dead token. Single-flight in ShoonyaAuthenticator guarantees that
+                // all concurrent callers share ONE re-auth instead of each firing their own
+                // (which previously caused the INVALID_SESSION death-spiral).
                 authenticator.invalidateToken();
-                return authenticator.getAccessToken().flatMap(apiCall);
+                // Small backoff so a burst of concurrent 401s doesn't instantly re-login.
+                return Mono.delay(Duration.ofSeconds(1))
+                    .then(authenticator.getAccessToken())
+                    .flatMap(apiCall);
             });
     }
 
     /**
      * Determines whether an error indicates an invalid/expired Shoonya session
-     * token (HTTP 401 Unauthorized or 403 Forbidden).
+     * token (HTTP 401/403, or a ShoonyaSessionException raised when Shoonya returns
+     * a 200 response whose body reports "Invalid Session"/"Not_Ok" auth failure).
      *
      * @param ex the error to inspect
      * @return true if the error is an authentication/token failure
      */
     private static boolean isTokenError(Throwable ex) {
+        if (ex instanceof ShoonyaSessionException) {
+            return true;
+        }
         if (ex instanceof org.springframework.web.reactive.function.client.WebClientResponseException wcre) {
             int status = wcre.getStatusCode().value();
             return status == 401 || status == 403;
         }
         String msg = ex.getMessage();
         return msg != null && (msg.contains("401") || msg.contains("403") || msg.toLowerCase().contains("unauthorized"));
+    }
+
+    /**
+     * Thrown when a Shoonya REST response indicates the session token is no longer
+     * valid (HTTP 200 body with stat=Not_Ok and a session-related message). Wrapping
+     * it in a dedicated exception lets {@link #withTokenRetry} detect the failure and
+     * transparently re-authenticate, which the generic 401/403 check could not do
+     * for Shoonya's 200-with-error responses.
+     */
+    private static final class ShoonyaSessionException extends RuntimeException {
+        ShoonyaSessionException(String message) {
+            super(message);
+        }
+    }
+
+    /**
+     * Detects whether a Shoonya error message denotes an invalid/expired session
+     * (as opposed to a benign business error like "insufficient funds"). Used to
+     * decide whether to trigger a re-auth.
+     */
+    private static boolean isSessionError(String emsg) {
+        if (emsg == null) return false;
+        String l = emsg.toLowerCase();
+        return l.contains("session")
+            || l.contains("unauthoriz")
+            || l.contains("login")
+            || l.contains("token")
+            || l.contains("not logged")
+            || l.contains("expire")
+            || l.contains("401")
+            || l.contains("403");
+    }
+
+    /**
+     * Inspects a Shoonya JSON response; throws {@link ShoonyaSessionException} when the
+     * response reports an auth/session failure so the caller can re-authenticate.
+     */
+    private static void checkSession(JsonNode root) {
+        if ("Not_Ok".equalsIgnoreCase(root.path("stat").asText())) {
+            String emsg = root.path("emsg").asText("");
+            if (isSessionError(emsg)) {
+                throw new ShoonyaSessionException(emsg);
+            }
+        }
+    }
+
+    /**
+     * Classifies a transport-level failure as a transient upstream outage that is
+     * worth backing off and retrying: HTTP 502/503/504, request-level failures
+     * (DNS/connect/TLS), and IO/timeout exceptions. Auth errors (401/403) are NOT
+     * included — those go through the re-auth path instead.
+     */
+    private static boolean isTransientUpstreamError(Throwable ex) {
+        if (ex instanceof org.springframework.web.reactive.function.client.WebClientResponseException wcre) {
+            int s = wcre.getStatusCode().value();
+            return s == 502 || s == 503 || s == 504;
+        }
+        if (ex instanceof org.springframework.web.reactive.function.client.WebClientRequestException) {
+            return true;
+        }
+        if (ex instanceof java.io.IOException) {
+            return true;
+        }
+        String msg = ex.getMessage();
+        if (msg != null) {
+            String m = msg.toLowerCase();
+            return m.contains("timed out") || m.contains("timeout")
+                || m.contains("connection reset") || m.contains("broken pipe")
+                || m.contains("connection refused") || m.contains("502")
+                || m.contains("503") || m.contains("504");
+        }
+        return false;
     }
 }

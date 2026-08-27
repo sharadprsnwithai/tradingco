@@ -83,7 +83,11 @@ public class PositionManagerService {
 
     /**
      * Initializes the PositionManagerService by subscribing to order fill events
-     * and market tick streams, and rehydrating positions from broker APIs.
+     * and market tick streams. Rehydration of positions from broker APIs is NOT done
+     * here on purpose: at {@code @PostConstruct} time the broker sessions may not yet
+     * be authenticated (they are established by the startup ApplicationRunner), so an
+     * eager rehydrate would race and silently yield zero positions. Instead, rehydration
+     * is triggered explicitly by the startup sequence once both brokers are authed.
      */
     @PostConstruct
     public void init() {
@@ -99,8 +103,6 @@ public class PositionManagerService {
             .publishOn(Schedulers.boundedElastic())
             .subscribe(this::onTick, err -> log.error("Error processing tick in PositionManager: {}", err.getMessage()));
         subscriptions.add(tickSub);
-
-        rehydratePositionsFromBrokers().subscribe();
     }
 
     /**

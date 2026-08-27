@@ -21,6 +21,7 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -34,6 +35,15 @@ public class KiteAuthenticator {
     private final ObjectMapper objectMapper;
     private final AtomicReference<String> accessToken = new AtomicReference<>();
     private final GoogleAuthenticator gAuth;
+
+    /**
+     * Optional listener invoked whenever a brand-new access token is minted
+     * (headless login, manual token, or mock). The Kite WebSocket ticker caches
+     * the token it was constructed with; callers (KiteBrokerAdapter) use this
+     * hook to re-key the live ticker with the fresh token so auto-reconnects
+     * after daily expiry stop returning 403 Forbidden.
+     */
+    private volatile Consumer<String> tokenRenewedListener;
 
     // Single-flight guard: concurrent getAccessToken() callers share ONE headless login.
     // Without this, parallel headless logins invalidate each other's request_id at Zerodha.
@@ -53,6 +63,27 @@ public class KiteAuthenticator {
     }
 
     /**
+     * Registers a listener that fires with the new token whenever (re)authentication
+     * produces a fresh access token. Replaces any previously registered listener.
+     *
+     * @param listener consumer receiving the newly minted access token
+     */
+    public void setTokenRenewedListener(Consumer<String> listener) {
+        this.tokenRenewedListener = listener;
+    }
+
+    private void notifyTokenRenewed(String token) {
+        Consumer<String> listener = this.tokenRenewedListener;
+        if (listener != null && token != null) {
+            try {
+                listener.accept(token);
+            } catch (Exception ex) {
+                log.warn("Kite tokenRenewedListener threw: {}", ex.getMessage());
+            }
+        }
+    }
+
+    /**
      * Performs headless authentication with Zerodha Kite.
      * If the adapter is disabled, returns a mock access token.
      * Otherwise, executes the full headless login flow including 2FA.
@@ -64,6 +95,7 @@ public class KiteAuthenticator {
             log.info("Kite adapter is disabled; using mock access token");
             String mockToken = "mock_kite_access_token_" + config.getUserId();
             accessToken.set(mockToken);
+            notifyTokenRenewed(mockToken);
             return Mono.just(mockToken);
         }
 
@@ -73,6 +105,7 @@ public class KiteAuthenticator {
         if (manualToken != null && !manualToken.isBlank()) {
             log.info("Using manually provided KITE_ACCESS_TOKEN for user: {}", config.getUserId());
             accessToken.set(manualToken.trim());
+            notifyTokenRenewed(manualToken.trim());
             return Mono.just(manualToken.trim());
         }
 
@@ -237,6 +270,7 @@ public class KiteAuthenticator {
 
         String token = tokenJson.path("data").path("access_token").asText();
         accessToken.set(token);
+        notifyTokenRenewed(token);
         return token;
     }
 
