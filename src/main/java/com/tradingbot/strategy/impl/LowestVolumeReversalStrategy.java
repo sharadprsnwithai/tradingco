@@ -67,8 +67,10 @@ public class LowestVolumeReversalStrategy implements Strategy {
 
     /** Static F&O basket used as a last-resort fallback if dynamic selection yields nothing. */
     private static final List<String> DEFAULT_LVR_SYMBOLS = List.of(
-        "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "WIPRO",
-        "BHARTIARTL", "ITC", "KOTAKBANK", "AXISBANK", "MARUTI", "SUNPHARMA", "TITAN"
+        "ABB", "ADANIENSOL", "ADANIGREEN", "ADANIPOWER", "ABCAPITAL", "BSE", "BHARATFORG",
+        "BHEL", "CGPOWER", "CUMMINSIND", "FEDERALBNK", "GLENMARK", "HINDALCO", "POWERINDIA",
+        "KEI", "LAURUSLABS", "MCX", "NTPC", "NATIONALUM", "POLYCAB", "MOTHERSON", "SHRIRAMFIN",
+        "SOLARINDS", "SAIL", "TATASTEEL", "TORNTPHARM", "VEDL", "IDEA", "TITAN"
     );
 
     private StrategyContext context;
