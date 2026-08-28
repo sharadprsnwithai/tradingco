@@ -271,14 +271,15 @@ public class PositionManagerService {
      * where autoSquareOff is true. Positions with autoSquareOff=false are skipped.
      */
     public Mono<Void> executeEodIntradaySquareOff() {
-        log.warn("15:18 EOD INTRADAY AUTO SQUARE-OFF TRIGGERED. Liquidating eligible IntradayBook positions.");
+        log.warn("15:14 EOD INTRADAY AUTO SQUARE-OFF TRIGGERED. Notifying strategies and liquidating open IntradayBook positions.");
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.INTRADAY_SQUARE_OFF));
 
         List<Position> openIntraday = getOpenIntradayPositions().stream()
             .filter(Position::autoSquareOff)
+            .filter(pos -> pos.netQuantity() != 0)
             .toList();
         if (openIntraday.isEmpty()) {
-            log.info("No auto-square-off eligible intraday positions found for 15:18 EOD");
+            log.info("No unmanaged open intraday positions remaining for EOD square-off");
             return Mono.empty();
         }
 
@@ -298,10 +299,10 @@ public class PositionManagerService {
                     .orderType(OrderType.LIMIT)
                     .productType(pos.productType())
                     .bookType(BookType.INTRADAY)
-                    .tag("EOD_15:18_AUTO_SQUARE_OFF")
+                    .tag("EOD_15:14_AUTO_SQUARE_OFF")
                     .build();
 
-                log.info("Submitting EOD square-off order for {} x {} @ {}", pos.symbol(), qty, pos.ltp());
+                log.info("Submitting safety EOD square-off order for {} x {} @ {}", pos.symbol(), qty, pos.ltp());
                 return oms.executeSignal(exitSignal);
             })
             .then();

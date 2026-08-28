@@ -85,6 +85,10 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     private final List<String> symbols = new CopyOnWriteArrayList<>();
     /** Resolved NIFTY futures canonical symbol (set at PRE_MARKET_SCAN in live mode). */
     private volatile String underlyingSymbol;
+    /** Resolved NIFTY spot index symbol (used for ATM strike selection — AUD-11). */
+    private String spotSymbol;
+    /** Last spot index price observed (ATM strike selection must use SPOT, not futures — AUD-11). */
+    private volatile double lastSpotPrice = 0.0;
 
     private StrategyContext context;
     private volatile boolean enabled = true;
@@ -146,6 +150,15 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         return instrumentMaster != null && kitePcrProvider != null;
     }
 
+    /**
+     * Returns the spot index price when available, otherwise falls back to the supplied
+     * futures price. ATM strike selection (and PCR strike selection) must use SPOT, not the
+     * futures price, because the futures trade at a 30–80 pt basis (AUD-11).
+     */
+    private double getSpotPrice(double futuresPrice) {
+        return lastSpotPrice > 0 ? lastSpotPrice : futuresPrice;
+    }
+
     @Override
     public String getStrategyId() { return strategyId; }
 
@@ -165,6 +178,10 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     @Override
     public void onTick(Tick tick) {
         if (!enabled || tick == null) return;
+        // Track the live spot index price (used for ATM strike selection) whenever we see a spot tick.
+        if (tick.symbol() != null && tick.symbol().equals(spotSymbol) && tick.ltp() != null) {
+            lastSpotPrice = tick.ltp().doubleValue();
+        }
         // Premium exits are driven by OPTION ticks in live mode, configured-symbol ticks in legacy mode
         String premiumSymbol = daily.activeOptionSymbol != null ? daily.activeOptionSymbol : symbol;
         if (!premiumSymbol.equals(tick.symbol())) return;
@@ -181,9 +198,30 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     @Override
     public void onCandle(Candle candle) {
         if (!enabled || candle == null || !TIMEFRAME.equals(candle.timeframe())) return;
+
+        // Track the spot index close for ATM strike selection (AUD-11). Spot candles are NOT
+        // added to the VWAP buffer, which is computed solely from the futures.
+        if (spotSymbol != null && spotSymbol.equals(candle.symbol()) && candle.close() != null) {
+            lastSpotPrice = candle.close().doubleValue();
+        }
+
         if (!underlyingSymbol.equals(candle.symbol())) return;
 
+        String candleDate = candle.timestamp().atZone(IST_ZONE).toLocalDate().format(DATE_FMT);
+
         synchronized (daily) {
+            // Day-boundary safeguard (AUD-05): if a scheduled reset (MARKET_CLOSE / PRE_MARKET_SCAN)
+            // was missed (e.g. process (re)started mid-day), the candle date still advances, so
+            // reset daily state here to prevent VWAP/snapshots from leaking across trading days.
+            if (!candleDate.equals(daily.currentDate)) {
+                if (!daily.currentDate.isEmpty()) {
+                    daily.reset();
+                    log.info("[{}] New trading day detected: {} — resetting daily state (VWAP/snapshots)",
+                        strategyId, candleDate);
+                }
+                daily.currentDate = candleDate;
+            }
+
             daily.allCandles.add(candle);
 
             // Update VWAP accumulator
@@ -229,7 +267,18 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
                 recoverBaselinesIfNeeded();
             }
             case ScheduledEvent.INTRADAY_ENTRY_CUTOFF -> daily.entryLocked = true;
-            case ScheduledEvent.INTRADAY_SQUARE_OFF -> squareOffAll("EOD_SQUARE_OFF");
+            case ScheduledEvent.INTRADAY_SQUARE_OFF -> {
+                // Actual EOD liquidation is owned solely by PositionManagerService
+                // (executeEodIntradaySquareOff scans its position books) to avoid duplicate
+                // exit orders / reverse naked positions (AUD-02). Reset local state only.
+                synchronized (daily) {
+                    if (daily.position == Position.IN_TRADE) {
+                        log.info("[{}] 15:14 SQUARE-OFF: marking strategy flat (liquidation handled by PositionManagerService)",
+                            strategyId);
+                    }
+                    daily.reset();
+                }
+            }
             case ScheduledEvent.MARKET_CLOSE -> daily.reset();
         }
     }
@@ -245,6 +294,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     @Scheduled(cron = "0 */5 9-15 * * MON-FRI", zone = "Asia/Kolkata")
     public void logDiagnostic() {
         if (!enabled || context == null) return;
+        synchronized (daily) {
         try {
             String sym = underlyingSymbol;
             List<Candle> fiveMin = context.getHistoricalCandles(sym, TIMEFRAME, 200);
@@ -285,6 +335,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         } catch (Exception e) {
             log.warn("[{}] DIAG failed: {}", strategyId, e.getMessage());
         }
+        }
     }
 
     private static double round2(double v) {
@@ -304,8 +355,15 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
                 underlyingSymbol = fut.get().canonicalSymbol();
                 symbols.clear();
                 symbols.add(underlyingSymbol);
+                // Also subscribe to the underlying SPOT index so ATM strike selection uses the
+                // spot price (not the futures basis) — see getSpotPrice() (AUD-11).
+                String name = fut.get().name();
+                if (name != null && !name.isBlank()) {
+                    spotSymbol = "NSE:" + name;
+                    if (!symbols.contains(spotSymbol)) symbols.add(spotSymbol);
+                }
                 if (context != null) context.requestSubscriptionSync();
-                log.info("[{}] Resolved NIFTY futures underlying: {}", strategyId, underlyingSymbol);
+                log.info("[{}] Resolved NIFTY futures underlying: {} (spot: {})", strategyId, underlyingSymbol, spotSymbol);
             } else {
                 underlyingSymbol = symbol;
                 log.warn("[{}] No NIFTY FUT in instrument master (sync pending?) - keeping {}", strategyId, symbol);
@@ -437,7 +495,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     private void enterLiveTrade(Direction dir, double futuresClose, Instant time) {
         String optionType = dir == Direction.LONG ? "CE" : "PE";
         try {
-            var opt = instrumentMaster.findNearestAtmOption("NIFTY", futuresClose, optionType).blockOptional();
+            var opt = instrumentMaster.findNearestAtmOption("NIFTY", getSpotPrice(futuresClose), optionType).blockOptional();
             if (opt.isEmpty()) {
                 log.warn("[{}] No ATM {} option found near futures price {} - entry skipped", strategyId, optionType, futuresClose);
                 return;
@@ -550,9 +608,8 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
                 exitTrade(ltp, "INITIAL_SL_HIT", tick.timestamp());
                 return;
             }
-            if (isAfterTime(15, 14)) {
-                exitTrade(ltp, "EOD_HARD_EXIT", tick.timestamp());
-            }
+            // EOD liquidation is owned solely by PositionManagerService (AUD-02) — do not emit
+            // a duplicate 15:14 exit here.
             return;
         }
 
@@ -584,19 +641,8 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
             }
         }
 
-        // Check EOD square-off time (3:14 PM IST)
-        if (isAfterTime(15, 14)) {
-            exitTrade(ltp, "EOD_HARD_EXIT", tick.timestamp());
-        }
-    }
-
-    private void squareOffAll(String reason) {
-        if (daily.position == Position.IN_TRADE) {
-            // Use last known price — for backtest this is the last candle close
-            double lastPrice = daily.allCandles.isEmpty() ? daily.entryPremium
-                : daily.allCandles.get(daily.allCandles.size() - 1).close().doubleValue();
-            exitTrade(lastPrice, reason, context.now());
-        }
+        // EOD liquidation is owned solely by PositionManagerService (AUD-02) — do not emit a
+        // duplicate 15:14 exit on ticks here.
     }
 
     private void exitTrade(double exitPrice, String reason, java.time.Instant timestamp) {
@@ -635,6 +681,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     // ========== Daily State ==========
 
     private static class DailyState {
+        String currentDate = "";
         Bias bias = Bias.NEUTRAL;
         Position position = Position.FLAT;
         Direction tradeDirection = null;
@@ -702,6 +749,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         }
 
         void reset() {
+            currentDate = "";
             bias = Bias.NEUTRAL;
             position = Position.FLAT;
             tradeDirection = null;
@@ -737,10 +785,10 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
 
     // ========== Public getters for backtest inspection ==========
 
-    public Bias getBias() { return daily.bias; }
-    public Position getPosition() { return daily.position; }
-    public int getEntriesToday() { return daily.entriesToday; }
-    public double getVwap() { return getVwapBeforeCurrentCandle(); }
+    public Bias getBias() { synchronized (daily) { return daily.bias; } }
+    public Position getPosition() { synchronized (daily) { return daily.position; } }
+    public int getEntriesToday() { synchronized (daily) { return daily.entriesToday; } }
+    public double getVwap() { synchronized (daily) { return getVwapBeforeCurrentCandle(); } }
 
     /**
      * Sets 9:30 AM snapshot values (for backtest or live scheduling).
@@ -962,14 +1010,9 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
         }
 
         try {
-            // Get current Nifty price from last candle for ATM strike calculation
-            double spotPrice = 24000.0;
-            if (context != null) {
-                var lastCandle = context.getLastCandle(underlyingSymbol, TIMEFRAME);
-                if (lastCandle.isPresent()) {
-                    spotPrice = lastCandle.get().close().doubleValue();
-                }
-            }
+            // Get current Nifty price from last candle for ATM strike calculation.
+            // Prefer the SPOT index (lastSpotPrice) over the futures (AUD-11).
+            double spotPrice = getSpotPrice(24000.0);
             return kitePcrProvider.fetchPcr(spotPrice);
         } catch (Exception e) {
             log.warn("[{}] Failed to fetch Kite PCR, using default 1.0: {}", strategyId, e.getMessage());

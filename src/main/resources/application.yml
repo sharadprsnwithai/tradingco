@@ -115,7 +115,6 @@ bot:
       id: ${VWAP_STRATEGY_ID:VWAP_NIFTY_01}
       account-id: ${VWAP_ACCOUNT_ID:KITE_USER_01}
       symbol: ${VWAP_SYMBOL:NFO:NIFTY_FUT}
-
 management:
   endpoints:
     web:

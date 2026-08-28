@@ -4,8 +4,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tradingbot.adapter.kite.KiteAuthenticator;
 import com.tradingbot.adapter.kite.KiteConfig;
+import com.tradingbot.instrument.InstrumentMasterService;
+import com.tradingbot.model.Instrument;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
@@ -30,12 +33,22 @@ public class KitePcrProvider {
     private final KiteAuthenticator authenticator;
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
+    private final InstrumentMasterService instrumentMaster;
 
-    public KitePcrProvider(KiteConfig config, KiteAuthenticator authenticator,
-                           WebClient.Builder webClientBuilder, ObjectMapper objectMapper) {
+    private volatile String cachedNearestExpiry = null;
+    private volatile long lastExpiryCacheTime = 0;
+
+    public KitePcrProvider(
+        KiteConfig config,
+        KiteAuthenticator authenticator,
+        WebClient.Builder webClientBuilder,
+        ObjectMapper objectMapper,
+        @Autowired(required = false) InstrumentMasterService instrumentMaster
+    ) {
         this.config = config;
         this.authenticator = authenticator;
         this.objectMapper = objectMapper;
+        this.instrumentMaster = instrumentMaster;
         this.webClient = webClientBuilder
             .baseUrl(config.getBaseUrl())
             .defaultHeader("X-Kite-Version", "3")
@@ -43,17 +56,29 @@ public class KitePcrProvider {
     }
 
     /**
-     * Fetches PCR for NIFTY options using Kite quotes API.
-     * Fetches OI for ATM ± 4 strikes (9 strikes × 2 sides = 18 instruments).
+     * Fetches PCR for NIFTY options using Kite quotes API with default ATM ± 4 strike range.
      *
      * @param spotPrice current NIFTY spot price to determine ATM strike
      * @return PCR value (Total Put OI / Total Call OI), or 0.0 if unavailable
      */
     public double fetchPcr(double spotPrice) {
+        return fetchPcr(spotPrice, 4);
+    }
+
+    /**
+     * Fetches PCR for NIFTY options using Kite quotes API for a custom ATM ± N strike range.
+     *
+     * @param spotPrice   current NIFTY spot price to determine ATM strike
+     * @param strikeRange strike offset range around ATM (e.g., 3 for ATM ± 3 strikes)
+     * @return PCR value (Total Put OI / Total Call OI), or 0.0 if unavailable
+     */
+    public double fetchPcr(double spotPrice, int strikeRange) {
         if (!config.isEnabled() || !authenticator.hasValidSession()) {
             log.debug("Kite not enabled or not authenticated, returning default PCR 1.0");
             return 1.0;
         }
+
+        int range = strikeRange > 0 ? strikeRange : 4;
 
         try {
             return authenticator.getAccessToken()
@@ -67,20 +92,56 @@ public class KitePcrProvider {
                     // Calculate ATM strike (round to nearest 50)
                     int atmStrike = (int) Math.round(spotPrice / 50.0) * 50;
 
-                    // Build instrument list: ATM ± 4 strikes × CE + PE
+                    if (instrumentMaster != null) {
+                        // Resolve the exact option instruments from the instrument master (which already
+                        // carries the correct Kite trading symbols). This avoids (a) the ~20MB
+                        // /instruments/NFO CSV download and (b) hand-built weekly/monthly expiry symbol
+                        // strings that produced 404s and a fallback PCR of 1.0 (AUD-04).
+                        List<String> instruments = instrumentMaster
+                            .findOptionContracts("NIFTY", nearestExpiry, null, null)
+                            .filter(inst -> {
+                                if (inst.strike() == null) return false;
+                                int strike = (int) Math.round(inst.strike().doubleValue());
+                                return Math.abs(strike - atmStrike) <= range * 50;
+                            })
+                            .map(Instrument::canonicalSymbol)
+                            .filter(s -> s != null && (s.endsWith("CE") || s.endsWith("PE")))
+                            .collectList()
+                            .block();
+
+                        if (instruments == null || instruments.isEmpty()) {
+                            log.warn("[PCR] No NIFTY option instruments in master for expiry={}, atm={} — returning PCR 1.0",
+                                nearestExpiry, atmStrike);
+                            return Mono.just(1.0);
+                        }
+
+                        String queryParams = String.join("&", instruments.stream()
+                            .map(i -> "i=" + i)
+                            .toArray(String[]::new));
+
+                        return webClient.get()
+                            .uri("/quote?" + queryParams)
+                            .header("Authorization", "token " + config.getApiKey() + ":" + token)
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .map(this::parsePcr)
+                            .onErrorResume(ex -> {
+                                log.warn("Failed to fetch Kite quotes for PCR: {}", ex.getMessage());
+                                return Mono.just(1.0);
+                            });
+                    }
+
+                    // Fallback (no instrument master): build symbols manually using the expiry date part.
                     List<String> instruments = new ArrayList<>();
-                    for (int offset = -4; offset <= 4; offset++) {
+                    for (int offset = -range; offset <= range; offset++) {
                         int strike = atmStrike + offset * 50;
                         String datePart = formatExpiryForKite(nearestExpiry);
                         instruments.add("NFO:NIFTY" + datePart + strike + "CE");
                         instruments.add("NFO:NIFTY" + datePart + strike + "PE");
                     }
-
-                    // Fetch quotes in a single request (Kite supports up to 500 instruments)
                     String queryParams = String.join("&", instruments.stream()
                         .map(i -> "i=" + i)
                         .toArray(String[]::new));
-
                     return webClient.get()
                         .uri("/quote?" + queryParams)
                         .header("Authorization", "token " + config.getApiKey() + ":" + token)
@@ -137,12 +198,27 @@ public class KitePcrProvider {
     }
 
     /**
-     * Gets the nearest expiry date from Kite instruments endpoint.
-     */
-    /**
      * Gets the nearest expiry date from Kite instruments endpoint (today or future only).
      */
     private String getNearestExpiry(String token) {
+        long now = System.currentTimeMillis();
+        if (cachedNearestExpiry != null && (now - lastExpiryCacheTime) < 3_600_000) {
+            return cachedNearestExpiry;
+        }
+
+        if (instrumentMaster != null) {
+            try {
+                String exp = instrumentMaster.findUpcomingExpiries("NIFTY", "CE", 1).blockFirst();
+                if (exp != null && !exp.isBlank()) {
+                    this.cachedNearestExpiry = exp;
+                    this.lastExpiryCacheTime = now;
+                    return exp;
+                }
+            } catch (Exception ex) {
+                log.debug("Failed to query upcoming expiry from InstrumentMasterService: {}", ex.getMessage());
+            }
+        }
+
         try {
             String response = webClient.get()
                 .uri("/instruments/NFO")
@@ -175,6 +251,10 @@ public class KitePcrProvider {
                 }
             }
 
+            if (nearestExpiry != null) {
+                this.cachedNearestExpiry = nearestExpiry;
+                this.lastExpiryCacheTime = now;
+            }
             return nearestExpiry;
         } catch (Exception e) {
             log.warn("Failed to fetch Kite instruments: {}", e.getMessage());
