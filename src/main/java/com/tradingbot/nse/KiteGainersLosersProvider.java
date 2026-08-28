@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Primary;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import java.net.URLEncoder;
@@ -104,16 +105,19 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
     }
 
     private Mono<List<String>> getUniverse() {
-        if (foUniverse != null) return Mono.just(foUniverse);
-        return authenticator.getAccessToken()
-            .flatMap(token -> webClient.get()
-                .uri("/instruments")
-                .header("Authorization", "token " + config.getApiKey() + ":" + token)
-                .header("X-Kite-Version", "3")
-                .retrieve()
-                .bodyToMono(String.class))
+        if (foUniverse != null && !foUniverse.isEmpty()) return Mono.just(foUniverse);
+        return webClient.get()
+            .uri("/instruments")
+            .header("X-Kite-Version", "3")
+            .retrieve()
+            .bodyToMono(String.class)
             .map(this::parseFoUniverse)
-            .doOnNext(u -> { foUniverse = u; log.info("[KITE-SEL] Resolved F&O equity universe: {} symbols", u.size()); })
+            .doOnNext(u -> {
+                if (!u.isEmpty()) {
+                    foUniverse = u;
+                    log.info("[KITE-SEL] Resolved F&O equity universe: {} symbols", u.size());
+                }
+            })
             .onErrorResume(e -> {
                 log.warn("[KITE-SEL] instruments download failed: {}", e.getMessage());
                 return Mono.just(List.of());
@@ -126,17 +130,23 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
         if (lines.length < 2) return List.of();
         String[] header = lines[0].split(",", -1);
         int idxSegment = indexOf(header, "segment");
+        int idxExchange = indexOf(header, "exchange");
         int idxType = indexOf(header, "instrument_type");
         int idxName = indexOf(header, "name");
-        if (idxSegment < 0 || idxType < 0 || idxName < 0) return List.of();
+        if (idxName < 0) return List.of();
         for (int i = 1; i < lines.length; i++) {
-            String[] c = lines[i].split(",", -1);
+            String line = lines[i].trim();
+            if (line.isEmpty()) continue;
+            String[] c = line.split(",", -1);
             if (c.length <= idxName) continue;
-            String segment = c[idxSegment].trim();
-            String type = c[idxType].trim();
-            String name = c[idxName].trim();
-            if (!"NFO".equals(segment)) continue;
-            if (!Set.of("FUT", "CE", "PE").contains(type)) continue;
+            String segment = idxSegment >= 0 && c.length > idxSegment ? c[idxSegment].trim() : "";
+            String exchange = idxExchange >= 0 && c.length > idxExchange ? c[idxExchange].trim() : "";
+            String type = idxType >= 0 && c.length > idxType ? c[idxType].trim() : "";
+            String name = c[idxName].trim().replace("\"", "");
+
+            boolean isNfo = "NFO".equalsIgnoreCase(exchange) || segment.startsWith("NFO");
+            if (!isNfo) continue;
+            if (!type.isEmpty() && !Set.of("FUT", "CE", "PE").contains(type)) continue;
             if (name.isEmpty() || INDEX_NAMES.contains(name)) continue;
             names.add("NSE:" + name);
         }
@@ -145,21 +155,41 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
 
     private Mono<List<NseGainerLoser>> quote(List<String> symbols) {
         if (symbols.isEmpty()) return Mono.just(List.of());
-        String query = symbols.stream()
-            .map(s -> "i=" + URLEncoder.encode(s, StandardCharsets.UTF_8))
-            .collect(Collectors.joining("&"));
         return authenticator.getAccessToken()
-            .flatMap(token -> webClient.get()
-                .uri("/quote?" + query)
-                .header("Authorization", "token " + config.getApiKey() + ":" + token)
-                .header("X-Kite-Version", "3")
-                .retrieve()
-                .bodyToMono(String.class))
-            .map(this::parseQuotes)
+            .flatMap(token -> {
+                List<List<String>> partitions = partition(symbols, 100);
+                return Flux.fromIterable(partitions)
+                    .flatMap(batch -> {
+                        String query = batch.stream()
+                            .map(s -> "i=" + URLEncoder.encode(s, StandardCharsets.UTF_8))
+                            .collect(Collectors.joining("&"));
+                        return webClient.get()
+                            .uri("/quote?" + query)
+                            .header("Authorization", "token " + config.getApiKey() + ":" + token)
+                            .header("X-Kite-Version", "3")
+                            .retrieve()
+                            .bodyToMono(String.class)
+                            .map(this::parseQuotes)
+                            .onErrorResume(e -> {
+                                log.warn("[KITE-SEL] quote batch failed: {}", e.getMessage());
+                                return Mono.just(List.of());
+                            });
+                    })
+                    .flatMapIterable(list -> list)
+                    .collectList();
+            })
             .onErrorResume(e -> {
                 log.warn("[KITE-SEL] quote failed: {}", e.getMessage());
                 return Mono.just(List.of());
             });
+    }
+
+    private static <T> List<List<T>> partition(List<T> list, int size) {
+        List<List<T>> partitions = new ArrayList<>();
+        for (int i = 0; i < list.size(); i += size) {
+            partitions.add(list.subList(i, Math.min(i + size, list.size())));
+        }
+        return partitions;
     }
 
     private List<NseGainerLoser> parseQuotes(String body) {

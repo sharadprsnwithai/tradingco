@@ -1,5 +1,6 @@
 package com.tradingbot.nse;
 
+import com.fasterxml.jackson.annotation.JsonAlias;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
@@ -24,13 +25,13 @@ public record NseGainerLoser(
     @JsonProperty("symbol") String symbol,
     @JsonProperty("series") String series,
     @JsonProperty("ltp") double ltp,
-    @JsonProperty("change") double change,
-    @JsonProperty("pChange") double pChange,
-    @JsonProperty("open") double open,
-    @JsonProperty("high") double high,
-    @JsonProperty("low") double low,
-    @JsonProperty("previousClose") double previousClose,
-    @JsonProperty("totalTradedVolume") long totalTradedVolume
+    @JsonProperty("change") @JsonAlias({"net_price", "change"}) double change,
+    @JsonProperty("pChange") @JsonAlias({"perChange", "pChange"}) double pChange,
+    @JsonProperty("open") @JsonAlias({"open_price", "open"}) double open,
+    @JsonProperty("high") @JsonAlias({"high_price", "high"}) double high,
+    @JsonProperty("low") @JsonAlias({"low_price", "low"}) double low,
+    @JsonProperty("previousClose") @JsonAlias({"prev_price", "previousClose", "close"}) double previousClose,
+    @JsonProperty("totalTradedVolume") @JsonAlias({"trade_quantity", "totalTradedVolume", "volume"}) long totalTradedVolume
 ) {
 
     /**

@@ -27,8 +27,8 @@ public class NseIndiaClient implements GainersLosersSource {
 
     private static final Logger log = LoggerFactory.getLogger(NseIndiaClient.class);
     private static final String NSE_BASE_URL = "https://www.nseindia.com";
-    private static final String GAINERS_API = "/api/live-analysis-variations?index=gainers&type=FO";
-    private static final String LOSERS_API = "/api/live-analysis-variations?index=loosers&type=FO";
+    private static final String GAINERS_API = "/api/live-analysis-variations?index=gainers";
+    private static final String LOSERS_API = "/api/live-analysis-variations?index=loosers";
 
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
@@ -83,13 +83,17 @@ public class NseIndiaClient implements GainersLosersSource {
 
     private Mono<List<NseGainerLoser>> fetchFromCacheOrApi(String key, String apiPath) {
         List<NseGainerLoser> cached = dailyCache.get(key);
-        if (cached != null) {
+        if (cached != null && !cached.isEmpty()) {
             return Mono.just(cached);
         }
 
         return ensureSession()
             .then(fetchApiData(apiPath))
-            .doOnNext(data -> dailyCache.put(key, data));
+            .doOnNext(data -> {
+                if (data != null && !data.isEmpty()) {
+                    dailyCache.put(key, data);
+                }
+            });
     }
 
     private Mono<Void> ensureSession() {
@@ -134,17 +138,29 @@ public class NseIndiaClient implements GainersLosersSource {
             .header(HttpHeaders.ACCEPT_LANGUAGE, "en-US,en;q=0.9")
             .header(HttpHeaders.ACCEPT, MediaType.APPLICATION_JSON_VALUE)
             .retrieve()
-            .bodyToMono(Map.class)
-            .flatMap(response -> {
+            .bodyToMono(com.fasterxml.jackson.databind.JsonNode.class)
+            .flatMap(root -> {
                 try {
-                    @SuppressWarnings("unchecked")
-                    List<Map<String, Object>> rawData = (List<Map<String, Object>>) response.get("data");
-                    if (rawData == null) {
+                    com.fasterxml.jackson.databind.JsonNode target = null;
+                    if (root.has("FOSec") && root.path("FOSec").has("data")) {
+                        target = root.path("FOSec").path("data");
+                    } else if (root.has("NIFTY") && root.path("NIFTY").has("data")) {
+                        target = root.path("NIFTY").path("data");
+                    } else if (root.has("allSec") && root.path("allSec").has("data")) {
+                        target = root.path("allSec").path("data");
+                    } else if (root.has("data")) {
+                        target = root.path("data");
+                    }
+
+                    if (target == null || !target.isArray()) {
+                        log.warn("No data array found in NSE response for {}", apiPath);
                         return Mono.just(List.<NseGainerLoser>of());
                     }
-                    List<NseGainerLoser> result = rawData.stream()
-                        .map(m -> objectMapper.convertValue(m, NseGainerLoser.class))
-                        .toList();
+
+                    List<NseGainerLoser> result = new java.util.ArrayList<>();
+                    for (com.fasterxml.jackson.databind.JsonNode item : target) {
+                        result.add(objectMapper.treeToValue(item, NseGainerLoser.class));
+                    }
                     return Mono.just(result);
                 } catch (Exception e) {
                     log.error("Failed to parse NSE API response: {}", e.getMessage());
