@@ -450,7 +450,8 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
                 return;
             }
 
-            int qty = lotSizeService != null ? lotSizeService.getOrderQuantity("NIFTY") : QTY_PER_ENTRY;
+            int qty = lotSizeService != null ? lotSizeService.getOrderQuantity("NIFTY", 2) : QTY_PER_ENTRY;
+            if (qty < 25) qty = QTY_PER_ENTRY;
 
             if (!symbols.contains(optionSymbol)) {
                 symbols.add(optionSymbol);

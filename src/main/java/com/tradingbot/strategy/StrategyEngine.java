@@ -510,7 +510,13 @@ public class StrategyEngine {
             if (signal != null) {
                 log.info("SIGNAL EMITTED [{}] {} {} x {} @ {} (tag: {})",
                     strategyId, signal.signalType(), signal.symbol(), signal.quantity(), signal.price(), signal.tag());
-                signalSink.tryEmitNext(signal);
+                signalSink.emitNext(signal, (signalType, emitResult) -> {
+                    if (emitResult == Sinks.EmitResult.FAIL_NON_SERIALIZED) {
+                        java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
+                        return true;
+                    }
+                    return false;
+                });
             }
         }
 

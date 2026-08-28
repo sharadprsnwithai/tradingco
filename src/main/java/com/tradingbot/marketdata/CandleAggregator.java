@@ -36,9 +36,31 @@ public class CandleAggregator {
     // symbol -> (timeframe -> forming higher candle)
     private final Map<String, Map<Integer, FormingCandle>> formingHigherCandles = new ConcurrentHashMap<>();
 
-    // Multicast reactive sinks
-    private final Sinks.Many<Candle> candleSink = Sinks.many().multicast().directBestEffort();
-    private final Sinks.Many<Tick> tickSink = Sinks.many().multicast().directBestEffort();
+    // Multicast reactive sinks with backpressure buffers
+    private final Sinks.Many<Candle> candleSink = Sinks.many().multicast().onBackpressureBuffer(1024);
+    private final Sinks.Many<Tick> tickSink = Sinks.many().multicast().onBackpressureBuffer(4096);
+
+    private void emitCandleSafe(Candle candle) {
+        if (candle == null) return;
+        candleSink.emitNext(candle, (signalType, emitResult) -> {
+            if (emitResult == Sinks.EmitResult.FAIL_NON_SERIALIZED) {
+                java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
+                return true;
+            }
+            return false;
+        });
+    }
+
+    private void emitTickSafe(Tick tick) {
+        if (tick == null) return;
+        tickSink.emitNext(tick, (signalType, emitResult) -> {
+            if (emitResult == Sinks.EmitResult.FAIL_NON_SERIALIZED) {
+                java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
+                return true;
+            }
+            return false;
+        });
+    }
 
     /**
      * Process an incoming tick: updates forming candles and emits raw tick stream.
@@ -49,7 +71,7 @@ public class CandleAggregator {
         }
 
         // 1. Emit to real-time tick stream for instantaneous SL / breakout execution
-        tickSink.tryEmitNext(tick);
+        emitTickSafe(tick);
 
         String symbol = tick.symbol();
         Instant tickTime = tick.timestamp() != null ? tick.timestamp() : Instant.now();
@@ -100,6 +122,8 @@ public class CandleAggregator {
                     tick.ltp(),
                     tick.volume()
                 ));
+            } else {
+                log.debug("Late tick received for symbol {} (tick minute: {}, current: {})", symbol, tickMinute, current1m.minuteBucket);
             }
         }
     }
@@ -128,7 +152,7 @@ public class CandleAggregator {
         buffer1m.add(candle1m);
 
         // 2. Emit closed 1m candle
-        candleSink.tryEmitNext(candle1m);
+        emitCandleSafe(candle1m);
 
         // 3. Aggregate into higher timeframes (3m, 5m, 15m)
         for (int tf : HIGHER_TIMEFRAMES) {
@@ -136,18 +160,22 @@ public class CandleAggregator {
         }
     }
 
+    private static final long IST_OFFSET_MINUTES = 330; // UTC+05:30 (Asia/Kolkata)
+    private static final long MARKET_OPEN_OFFSET_MINUTES = 15; // 09:15 IST alignment
+
     /**
-     * Aggregates a 1-minute candle into a higher timeframe candle (3m, 5m, or 15m).
-     * Closes the previous higher timeframe candle if a new bucket starts, and emits
-     * the closed candle when the current bucket completes.
+     * Aggregates a 1-minute candle into a higher timeframe candle (3m, 5m, 15m, 60m).
+     * Aligns timeframe buckets to Indian Standard Time (IST) and market open (09:15 IST).
      *
-     * @param candle1m        the 1-minute candle to aggregate
-     * @param timeframeMinutes the target timeframe in minutes (e.g., 3, 5, 15)
+     * @param candle1m         the 1-minute candle to aggregate
+     * @param timeframeMinutes the target timeframe in minutes (e.g., 3, 5, 15, 60)
      */
     private void aggregateHigherTimeframe(Candle candle1m, int timeframeMinutes) {
         String symbol = candle1m.symbol();
         long minuteEpoch = candle1m.timestamp().getEpochSecond() / 60;
-        long bucketStartMinute = (minuteEpoch / timeframeMinutes) * timeframeMinutes;
+        long istMinute = minuteEpoch + IST_OFFSET_MINUTES;
+        long bucketStartIstMinute = ((istMinute - MARKET_OPEN_OFFSET_MINUTES) / timeframeMinutes) * timeframeMinutes + MARKET_OPEN_OFFSET_MINUTES;
+        long bucketStartMinute = bucketStartIstMinute - IST_OFFSET_MINUTES;
         Instant bucketStartTime = Instant.ofEpochSecond(bucketStartMinute * 60);
 
         Map<Integer, FormingCandle> higherMap = formingHigherCandles.computeIfAbsent(symbol, s -> new ConcurrentHashMap<>());
@@ -158,7 +186,7 @@ public class CandleAggregator {
                 // Close previous higher timeframe candle
                 Candle closedHigher = forming.toClosedCandle();
                 getOrCreateBuffer(symbol, String.valueOf(timeframeMinutes)).add(closedHigher);
-                candleSink.tryEmitNext(closedHigher);
+                emitCandleSafe(closedHigher);
             }
             // Start new higher timeframe forming candle
             forming = new FormingCandle(
@@ -182,10 +210,10 @@ public class CandleAggregator {
         }
 
         // Check if this 1m candle is the closing candle of the higher bucket (e.g. minute 4, 9, 14...)
-        if ((minuteEpoch % timeframeMinutes) == (timeframeMinutes - 1)) {
+        if (((istMinute - MARKET_OPEN_OFFSET_MINUTES + 1) % timeframeMinutes) == 0) {
             Candle closedHigher = forming.toClosedCandle();
             getOrCreateBuffer(symbol, String.valueOf(timeframeMinutes)).add(closedHigher);
-            candleSink.tryEmitNext(closedHigher);
+            emitCandleSafe(closedHigher);
             higherMap.remove(timeframeMinutes);
         }
     }

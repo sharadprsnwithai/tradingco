@@ -20,12 +20,14 @@ public record OptionLeg(
      * Calculates the decay percentage for a short leg.
      * Decay = (entryPrice - currentPrice) / entryPrice * 100
      * A higher value means more time decay has occurred.
+     * Returns 0.0 if currentPrice or entryPrice is uninitialized/zero.
      */
     public double getDecayPercentage() {
-        if (!isShort || entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) == 0) {
+        if (!isShort || entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0
+            || currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
             return 0.0;
         }
-        BigDecimal decay = entryPrice.subtract(nullSafe(currentPrice))
+        BigDecimal decay = entryPrice.subtract(currentPrice)
             .divide(entryPrice, 6, RoundingMode.HALF_UP)
             .multiply(BigDecimal.valueOf(100));
         return decay.doubleValue();
@@ -35,12 +37,14 @@ public record OptionLeg(
      * Calculates loss percentage for a short leg.
      * Loss = (currentPrice - entryPrice) / entryPrice * 100
      * Positive value means the short leg is losing money.
+     * Returns 0.0 if currentPrice or entryPrice is uninitialized/zero.
      */
     public double getLossPercentage() {
-        if (!isShort || entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) == 0) {
+        if (!isShort || entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0
+            || currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
             return 0.0;
         }
-        BigDecimal loss = nullSafe(currentPrice).subtract(entryPrice)
+        BigDecimal loss = currentPrice.subtract(entryPrice)
             .divide(entryPrice, 6, RoundingMode.HALF_UP)
             .multiply(BigDecimal.valueOf(100));
         return Math.max(0.0, loss.doubleValue());
@@ -50,12 +54,14 @@ public record OptionLeg(
      * Calculates profit percentage for a long leg.
      * Profit = (currentPrice - entryPrice) / entryPrice * 100
      * Positive value means the long leg is profitable.
+     * Returns 0.0 if currentPrice or entryPrice is uninitialized/zero.
      */
     public double getProfitPercentage() {
-        if (isShort || entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) == 0) {
+        if (isShort || entryPrice == null || entryPrice.compareTo(BigDecimal.ZERO) <= 0
+            || currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
             return 0.0;
         }
-        BigDecimal profit = nullSafe(currentPrice).subtract(entryPrice)
+        BigDecimal profit = currentPrice.subtract(entryPrice)
             .divide(entryPrice, 6, RoundingMode.HALF_UP)
             .multiply(BigDecimal.valueOf(100));
         return Math.max(0.0, profit.doubleValue());
@@ -67,15 +73,14 @@ public record OptionLeg(
      * Long leg: profit when price rises (currentPrice - entryPrice) * lotSize
      */
     public BigDecimal getMtmPnl() {
-        BigDecimal entry = nullSafe(entryPrice);
-        BigDecimal current = nullSafe(currentPrice);
+        if (entryPrice == null || currentPrice == null || currentPrice.compareTo(BigDecimal.ZERO) <= 0) {
+            return BigDecimal.ZERO;
+        }
+        BigDecimal entry = entryPrice;
+        BigDecimal current = currentPrice;
         BigDecimal pnlPerUnit = isShort
             ? entry.subtract(current)
             : current.subtract(entry);
         return pnlPerUnit.multiply(BigDecimal.valueOf(lotSize));
-    }
-
-    private static BigDecimal nullSafe(BigDecimal val) {
-        return val != null ? val : BigDecimal.ZERO;
     }
 }

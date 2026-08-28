@@ -67,13 +67,24 @@ public class OrderManagerService {
 
     // In-memory hot order book: orderId -> Order
     private final Map<String, Order> orderBook = new ConcurrentHashMap<>();
-    private final Sinks.Many<Order> orderSink = Sinks.many().multicast().directBestEffort();
+    private final Sinks.Many<Order> orderSink = Sinks.many().multicast().onBackpressureBuffer(1024);
 
     // Resting exchange-side protective stops: strategyId|tradingSymbol -> local SL order id
     private final Map<String, String> restingStops = new ConcurrentHashMap<>();
 
     private final AtomicLong orderSequence = new AtomicLong(1);
     private Disposable reconcilerSubscription;
+
+    private void emitOrderSafe(Order order) {
+        if (order == null) return;
+        orderSink.emitNext(order, (signalType, emitResult) -> {
+            if (emitResult == Sinks.EmitResult.FAIL_NON_SERIALIZED) {
+                java.util.concurrent.locks.LockSupport.parkNanos(1_000_000);
+                return true;
+            }
+            return false;
+        });
+    }
 
     /**
      * Constructs the OrderManagerService with all required dependencies.
@@ -128,7 +139,7 @@ public class OrderManagerService {
                     log.warn("Signal REJECTED by RMS: rule={}, reason={}", riskResult.ruleName(), riskResult.reason());
                     Order rejectedOrder = buildRejectedOrder(signal, riskResult.ruleName() + ": " + riskResult.reason());
                     orderBook.put(rejectedOrder.id(), rejectedOrder);
-                    orderSink.tryEmitNext(rejectedOrder);
+                    emitOrderSafe(rejectedOrder);
                     return dbService.saveOrder(rejectedOrder).thenReturn(rejectedOrder);
                 }
 
@@ -228,7 +239,7 @@ public class OrderManagerService {
                     .build();
 
                 orderBook.put(orderId, initialOrder);
-                orderSink.tryEmitNext(initialOrder);
+                emitOrderSafe(initialOrder);
 
                 OrderRequest req = OrderRequest.builder()
                     .accountId(signal.targetAccountId())
@@ -332,7 +343,7 @@ public class OrderManagerService {
                 .build();
 
             orderBook.put(orderId, updated);
-            orderSink.tryEmitNext(updated);
+            emitOrderSafe(updated);
             log.info("ORDER PLACED [{}] brokerId={} status={}", orderId, result.brokerOrderId(), status);
             return dbService.saveOrder(updated).thenReturn(updated);
         } else {
@@ -448,7 +459,7 @@ public class OrderManagerService {
                 .build();
 
             orderBook.put(localOrder.id(), updated);
-            orderSink.tryEmitNext(updated);
+            emitOrderSafe(updated);
             dbService.saveOrder(updated).subscribe();
         }
     }
@@ -536,7 +547,7 @@ public class OrderManagerService {
             .updatedAt(Instant.now())
             .build();
         orderBook.put(slOrderId, slOrder);
-        orderSink.tryEmitNext(slOrder);
+        emitOrderSafe(slOrder);
         dbService.saveOrder(slOrder).subscribe();
     }
 
@@ -697,7 +708,7 @@ public class OrderManagerService {
             .build();
 
         orderBook.put(orderId, updated);
-        orderSink.tryEmitNext(updated);
+        emitOrderSafe(updated);
         dbService.saveOrder(updated).subscribe();
         return updated;
     }

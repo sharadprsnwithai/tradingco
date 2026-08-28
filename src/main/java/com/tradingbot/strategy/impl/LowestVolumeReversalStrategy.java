@@ -274,8 +274,19 @@ public class LowestVolumeReversalStrategy implements Strategy {
      * updates candidate watchlists.
      */
     private void performStockSelection() {
-        Mono<List<NseGainerLoser>> gainersMono = gainersSource.fetchGainers();
-        Mono<List<NseGainerLoser>> losersMono = gainersSource.fetchLosers();
+        Mono<List<NseGainerLoser>> gainersMono = gainersSource.fetchGainers()
+            .onErrorResume(e -> {
+                log.error("[STOCK-SELECTION] Failed to fetch gainers: {}", e.getMessage());
+                return Mono.just(List.of());
+            })
+            .defaultIfEmpty(List.of());
+
+        Mono<List<NseGainerLoser>> losersMono = gainersSource.fetchLosers()
+            .onErrorResume(e -> {
+                log.error("[STOCK-SELECTION] Failed to fetch losers: {}", e.getMessage());
+                return Mono.just(List.of());
+            })
+            .defaultIfEmpty(List.of());
 
         Mono.zip(gainersMono, losersMono)
             .subscribe(tuple -> {
@@ -317,21 +328,12 @@ public class LowestVolumeReversalStrategy implements Strategy {
                 // Kite and NSE sources failed), trade the static F&O basket so the
                 // strategy still has symbols to act on.
                 if (longCandidates.isEmpty() && shortCandidates.isEmpty()) {
-                    log.warn("[STOCK-SELECTION] Dynamic selection empty — using static F&O fallback basket");
-                    for (String s : DEFAULT_LVR_SYMBOLS) {
-                        String symbol = "NSE:" + s;
-                        longCandidates.add(symbol);
-                        if (!symbols.contains(symbol)) {
-                            symbols.add(symbol);
-                            SymbolState st = new SymbolState(symbol);
-                            states.put(symbol, st);
-                            seedFirstCandleOfDay(st, symbol);
-                        }
-                    }
+                    log.warn("[STOCK-SELECTION] Dynamic selection empty — activating static F&O fallback basket");
+                    fallbackToStaticBasket();
                 }
 
-                log.info("Stock Selection Complete — Long candidates: {} | Short candidates: {}",
-                    longCandidates, shortCandidates);
+                log.info("Stock Selection Complete — Long Watchlist ({}): {} | Short Watchlist ({}): {}",
+                    longCandidates.size(), longCandidates, shortCandidates.size(), shortCandidates);
 
                 sendGainersLosersAlert(gainers, losers);
 
@@ -341,7 +343,29 @@ public class LowestVolumeReversalStrategy implements Strategy {
                     context.requestSubscriptionSync();
                     log.info("Subscription sync requested for {} symbols after stock selection", symbols.size());
                 }
+            }, err -> {
+                log.error("[STOCK-SELECTION] Critical error in stock selection stream: {}", err.getMessage());
+                fallbackToStaticBasket();
+                sendGainersLosersAlert(List.of(), List.of());
             });
+    }
+
+    private void fallbackToStaticBasket() {
+        int mid = (DEFAULT_LVR_SYMBOLS.size() + 1) / 2;
+        for (int i = 0; i < DEFAULT_LVR_SYMBOLS.size(); i++) {
+            String symbol = "NSE:" + DEFAULT_LVR_SYMBOLS.get(i);
+            if (i < mid) {
+                longCandidates.add(symbol);
+            } else {
+                shortCandidates.add(symbol);
+            }
+            if (!symbols.contains(symbol)) {
+                symbols.add(symbol);
+                SymbolState st = new SymbolState(symbol);
+                states.put(symbol, st);
+                seedFirstCandleOfDay(st, symbol);
+            }
+        }
     }
 
     /**
@@ -418,8 +442,7 @@ public class LowestVolumeReversalStrategy implements Strategy {
         state.dayCandles.add(candle);
 
         // Phase 1: Disqualification — skip if the first candle of the day moves >5%.
-        // Uses firstCandleToday (seeded historically at selection time or set on the first
-        // live candle) so the rule sees the real 09:15 open even though subscription starts late.
+        // Uses firstCandleToday (seeded historically at selection time or set on the first candle)
         if (state.firstCandleToday == null) {
             state.firstCandleToday = candle;
             BigDecimal open = candle.open();

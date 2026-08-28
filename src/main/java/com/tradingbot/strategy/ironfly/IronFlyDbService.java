@@ -249,10 +249,14 @@ public class IronFlyDbService {
     private IronFlyPosition mapPosition(ResultSet rs) throws SQLException {
         long id = rs.getLong("id");
         List<AdjustmentRecord> adjustments = loadAdjustments(id);
+        java.util.Map<String, OptionLeg> legs = loadLegs(id);
 
         return new IronFlyPosition(
             rs.getString("underlying"),
-            null, null, null, null,
+            legs.get("SHORT_CALL"),
+            legs.get("SHORT_PUT"),
+            legs.get("LONG_CALL_HEDGE"),
+            legs.get("LONG_PUT_HEDGE"),
             BigDecimal.valueOf(rs.getDouble("entry_spot")),
             BigDecimal.valueOf(rs.getDouble("net_credit")),
             BigDecimal.valueOf(rs.getDouble("original_credit")),
@@ -262,6 +266,34 @@ public class IronFlyDbService {
             rs.getLong("closed_at") > 0 ? Instant.ofEpochMilli(rs.getLong("closed_at")) : null,
             adjustments
         );
+    }
+
+    private java.util.Map<String, OptionLeg> loadLegs(long positionId) {
+        java.util.Map<String, OptionLeg> legs = new java.util.HashMap<>();
+        String sql = "SELECT * FROM ironfly_legs WHERE position_id = ? AND (status != 'CLOSED' OR status IS NULL)";
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setLong(1, positionId);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String legType = rs.getString("leg_type");
+                    int strike = rs.getInt("strike");
+                    OptionType optionType = OptionType.valueOf(rs.getString("option_type"));
+                    boolean isShort = rs.getInt("is_short") == 1;
+                    BigDecimal entryPrice = BigDecimal.valueOf(rs.getDouble("entry_price"));
+                    BigDecimal currentPrice = BigDecimal.valueOf(rs.getDouble("current_price"));
+                    int lotSize = rs.getInt("lot_size");
+                    String symbol = strike + optionType.name();
+
+                    OptionLeg leg = new OptionLeg(
+                        symbol, strike, optionType, isShort, entryPrice, currentPrice, 0.0, lotSize
+                    );
+                    legs.put(legType, leg);
+                }
+            }
+        } catch (SQLException e) {
+            log.warn("Failed to load legs for position {}", positionId, e);
+        }
+        return legs;
     }
 
     private List<AdjustmentRecord> loadAdjustments(long positionId) {

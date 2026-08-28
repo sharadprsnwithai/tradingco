@@ -269,15 +269,15 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         // Auto-reset on new trading day (needed for backtest where onSchedule is not called)
         ZonedDateTime candleTime = candle.timestamp().atZone(IST_ZONE);
         String candleDate = candleTime.format(DATE_FMT);
-        if (!candleDate.equals(daily.currentDate)) {
-            if (daily.position == Position.IN_TRADE) {
-                squareOffAll("EOD_SQUARE_OFF");
-            }
-            daily.currentDate = candleDate;
-            synchronized (daily) {
+        synchronized (daily) {
+            if (!candleDate.equals(daily.currentDate)) {
+                if (daily.position == Position.IN_TRADE) {
+                    squareOffAll("EOD_SQUARE_OFF");
+                }
+                daily.currentDate = candleDate;
                 daily.reset();
+                log.info("[{}] New day detected: {}", strategyId, candleDate);
             }
-            log.info("[{}] New day detected: {}", strategyId, candleDate);
         }
 
         // Process 60m candles for RSI update
@@ -288,6 +288,11 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
 
         // Process 15m candles for SuperTrend and entry/exit evaluation
         if (!TIMEFRAME_15M.equals(candle.timeframe())) return;
+
+        // In live mode, scan for entries on 15m candles starting from 09:30 AM IST
+        if (isLiveMode() && candleTime.toLocalTime().isBefore(java.time.LocalTime.of(9, 30))) {
+            return;
+        }
 
         synchronized (daily) {
             if (daily.position == Position.WAIT_FOR_REENTRY) {
@@ -314,7 +319,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
                 }
                 resolveUnderlying();
             }
-            case ScheduledEvent.MARKET_OPEN -> { }
+            case ScheduledEvent.MARKET_OPEN -> {
+                logMarketOpenBaseline();
+            }
             case ScheduledEvent.INTRADAY_ENTRY_CUTOFF -> {
                 synchronized (daily) {
                     daily.entryLocked = true;
@@ -385,10 +392,18 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             closes15m[i] = c.close().doubleValue();
         }
 
-        // Get 1h candles for RSI
+        // Get 1h candles for RSI (fallback to resampling 15m closes if 1h buffer is cold)
         double[] closes1h = context.getClosePrices(underlyingSymbol, TIMEFRAME_1H);
         if (closes1h == null || closes1h.length < rsiPeriod + 2) {
-            return;
+            if (closes15m.length >= (rsiPeriod + 2) * 4) {
+                int resampledLen = closes15m.length / 4;
+                closes1h = new double[resampledLen];
+                for (int j = 0; j < resampledLen; j++) {
+                    closes1h[j] = closes15m[(j + 1) * 4 - 1];
+                }
+            } else {
+                return;
+            }
         }
 
         // Calculate SuperTrend on 15m
@@ -484,6 +499,47 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         }
     }
 
+    /**
+     * Calculates and logs the 09:15 AM baseline 15m SuperTrend and 1H RSI using prior days' historical candles.
+     */
+    private void logMarketOpenBaseline() {
+        if (context == null) return;
+        try {
+            List<Candle> c15 = context.getHistoricalCandles(underlyingSymbol, TIMEFRAME_15M, 100);
+            if (c15 != null && c15.size() >= superTrendAtrLength + 2) {
+                int len = c15.size();
+                double[] h = new double[len];
+                double[] l = new double[len];
+                double[] c = new double[len];
+                for (int i = 0; i < len; i++) {
+                    h[i] = c15.get(i).high().doubleValue();
+                    l[i] = c15.get(i).low().doubleValue();
+                    c[i] = c15.get(i).close().doubleValue();
+                }
+                double[] st = TechnicalIndicators.calculateSuperTrend(h, l, c, superTrendAtrLength, superTrendMultiplier);
+                double lastSt = st[st.length - 1];
+
+                double[] closes1h = context.getClosePrices(underlyingSymbol, TIMEFRAME_1H);
+                if (closes1h == null || closes1h.length < rsiPeriod + 2) {
+                    if (c.length >= (rsiPeriod + 2) * 4) {
+                        int resampledLen = c.length / 4;
+                        closes1h = new double[resampledLen];
+                        for (int j = 0; j < resampledLen; j++) {
+                            closes1h[j] = c[(j + 1) * 4 - 1];
+                        }
+                    }
+                }
+                double rsi = closes1h != null && closes1h.length >= rsiPeriod + 1 ? TechnicalIndicators.calculateRsi(closes1h, rsiPeriod) : Double.NaN;
+
+                String trend = !Double.isNaN(lastSt) ? (lastSt > 0 ? "BULLISH (Green)" : "BEARISH (Red)") : "N/A";
+                log.info("[{}] 09:15 MARKET OPEN BASELINE (from prior days) — 15m SuperTrend: {} | 1H RSI: {} | 15mBars: {} | 1hBars: {}",
+                    strategyId, trend, !Double.isNaN(rsi) ? round2(rsi) : "N/A", len, closes1h != null ? closes1h.length : 0);
+            }
+        } catch (Exception e) {
+            log.debug("[{}] Baseline calculation error at 09:15: {}", strategyId, e.getMessage());
+        }
+    }
+
     private double round2(double v) {
         if (Double.isNaN(v)) return v;
         return Math.round(v * 100.0) / 100.0;
@@ -562,7 +618,7 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             String optionSymbol = shortOpt.canonicalSymbol();
             double premium = selected.shortPremium();
 
-            int qty = lotSizeService != null ? lotSizeService.getOrderQuantity("NIFTY") : 25 * lots;
+            int qty = lotSizeService != null ? lotSizeService.getOrderQuantity("NIFTY", this.lots) : 65 * this.lots;
 
             // Subscribe to short option symbol for tick data
             if (!symbols.contains(optionSymbol)) {
@@ -727,6 +783,28 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
                 }
             }
 
+            if (chosenOption == null) {
+                // If minPremium was not met across expiries, fallback to best candidate from nearest expiry
+                String expiry = expiries.get(0);
+                var candidateOpt = findOtmOptionForExpiry(spotPrice, optionType, targetDelta, expiry);
+                if (candidateOpt.isPresent()) {
+                    String sym = candidateOpt.get().canonicalSymbol();
+                    double ltp = kitePcrProvider != null ? kitePcrProvider.fetchLtp(sym) : 0.0;
+                    if (ltp <= 0) {
+                        double tte = calculateTimeToExpiryYears(expiry);
+                        ltp = "CE".equalsIgnoreCase(optionType)
+                            ? BlackScholesPricer.callPrice(spotPrice, candidateOpt.get().strike().doubleValue(), tte, 0.07, 0.18)
+                            : BlackScholesPricer.putPrice(spotPrice, candidateOpt.get().strike().doubleValue(), tte, 0.07, 0.18);
+                    }
+                    if (ltp > 0) {
+                        chosenOption = candidateOpt.get();
+                        chosenPremium = ltp;
+                        chosenExpiry = expiry;
+                        log.info("[{}] Selected nearest expiry {} candidate {} @ ₹{}", strategyId, expiry, sym, round2(ltp));
+                    }
+                }
+            }
+
             if (chosenOption == null || chosenPremium <= 0) {
                 lastEntryOutcome = "NO_CANDIDATE_PREMIUM";
                 lastEntryDetail = "all expiries skipped (LTP unavailable or premium<=0)";
@@ -800,11 +878,19 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         if (expiryStr == null || expiryStr.isEmpty()) return 7.0 / 365.0;
         try {
             LocalDate expiry = LocalDate.parse(expiryStr);
-            LocalDate today = context != null
-                ? context.now().atZone(IST_ZONE).toLocalDate()
-                : LocalDate.now(IST_ZONE);
+            ZonedDateTime now = context != null
+                ? context.now().atZone(IST_ZONE)
+                : ZonedDateTime.now(IST_ZONE);
+            LocalDate today = now.toLocalDate();
             long days = ChronoUnit.DAYS.between(today, expiry);
-            return Math.max(days, 0.5) / 365.0;
+            if (days == 0) {
+                java.time.LocalTime currentTime = now.toLocalTime();
+                java.time.LocalTime closeTime = java.time.LocalTime.of(15, 30);
+                long remainingMinutes = java.time.Duration.between(currentTime, closeTime).toMinutes();
+                if (remainingMinutes <= 0) remainingMinutes = 15;
+                return (remainingMinutes / (60.0 * 24.0)) / 365.0;
+            }
+            return Math.max(days, 1.0) / 365.0;
         } catch (Exception e) {
             return 7.0 / 365.0;
         }

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.tradingbot.adapter.kite.KiteAuthenticator;
 import com.tradingbot.adapter.kite.KiteConfig;
+import com.tradingbot.instrument.InstrumentMasterService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.annotation.Primary;
@@ -55,12 +56,15 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
 
     private volatile List<String> foUniverse; // resolved "NSE:<symbol>" tokens
 
+    private final InstrumentMasterService instrumentMaster;
+
     public KiteGainersLosersProvider(KiteConfig config,
                                      KiteAuthenticator authenticator,
                                      WebClient.Builder webClientBuilder,
                                      ObjectMapper objectMapper,
                                      NseIndiaClient fallback,
-                                     ShoonyaGainersLosersProvider shoonyaBackup) {
+                                     ShoonyaGainersLosersProvider shoonyaBackup,
+                                     @org.springframework.beans.factory.annotation.Autowired(required = false) InstrumentMasterService instrumentMaster) {
         this.config = config;
         this.authenticator = authenticator;
         this.webClient = webClientBuilder.baseUrl(KITE_REST)
@@ -69,6 +73,7 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
         this.objectMapper = objectMapper;
         this.fallback = fallback;
         this.shoonyaBackup = shoonyaBackup;
+        this.instrumentMaster = instrumentMaster;
     }
 
     @Override
@@ -112,6 +117,14 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
             .retrieve()
             .bodyToMono(String.class)
             .map(this::parseFoUniverse)
+            .flatMap(u -> {
+                if (!u.isEmpty()) return Mono.just(u);
+                if (instrumentMaster != null) {
+                    return instrumentMaster.getDistinctFoUnderlyingNames()
+                        .map(names -> names.stream().map(n -> "NSE:" + n).toList());
+                }
+                return Mono.just(List.<String>of());
+            })
             .doOnNext(u -> {
                 if (!u.isEmpty()) {
                     foUniverse = u;
@@ -120,6 +133,16 @@ public class KiteGainersLosersProvider implements GainersLosersSource {
             })
             .onErrorResume(e -> {
                 log.warn("[KITE-SEL] instruments download failed: {}", e.getMessage());
+                if (instrumentMaster != null) {
+                    return instrumentMaster.getDistinctFoUnderlyingNames()
+                        .map(names -> names.stream().map(n -> "NSE:" + n).toList())
+                        .doOnNext(u -> {
+                            if (!u.isEmpty()) {
+                                foUniverse = u;
+                                log.info("[KITE-SEL] Fallback F&O equity universe from DB: {} symbols", u.size());
+                            }
+                        });
+                }
                 return Mono.just(List.of());
             });
     }

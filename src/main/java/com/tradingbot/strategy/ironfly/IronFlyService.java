@@ -5,28 +5,32 @@ import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.model.Position;
 import com.tradingbot.position.PositionManagerService;
 import com.tradingbot.telegram.TelegramBotService;
+import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class IronFlyService {
 
     private static final Logger log = LoggerFactory.getLogger(IronFlyService.class);
     private static final ZoneId IST_ZONE = ZoneId.of("Asia/Kolkata");
+    private static final Pattern OPTION_SYMBOL_PATTERN = Pattern.compile(".*?(\\d+)(CE|PE)$");
 
     private final OptionChainProvider optionChainProvider;
     private final DailyAnalyzer dailyAnalyzer;
@@ -71,7 +75,10 @@ public class IronFlyService {
         this.positionManager = positionManager;
         this.telegramBot = telegramBot;
         this.dbService = dbService;
-        this.underlyings = List.of(underlyingsCsv.split(","));
+        this.underlyings = Arrays.stream(underlyingsCsv.split(","))
+            .map(String::trim)
+            .filter(s -> !s.isEmpty())
+            .toList();
         this.maxConcurrent = maxConcurrent;
         this.discoveryWindowMins = discoveryWindowMins;
         this.minStraddlePctOfSpot = minStraddlePctOfSpot;
@@ -79,70 +86,108 @@ public class IronFlyService {
         this.maxBidAskSpreadPct = maxBidAskSpreadPct;
     }
 
-    public Mono<Void> sendRecommendations() {
-        log.info("[IronFly] Sending entry recommendations for {}", underlyings);
-        int currentActive = (int) activePositions.values().stream()
-            .filter(p -> p.status() != IronFlyStatus.CLOSED).count();
-        if (currentActive >= maxConcurrent) {
-            log.info("[IronFly] Max concurrent positions ({}) reached, skipping", maxConcurrent);
-            return Mono.empty();
-        }
-        return Mono.fromRunnable(() -> {
-            for (String underlying : underlyings) {
-                IronFlyPosition existing = activePositions.get(underlying);
-                if (existing != null && existing.status() != IronFlyStatus.CLOSED) {
-                    log.debug("[IronFly] {} already has active position, skipping", underlying);
-                    continue;
-                }
-                evaluateAndRecommend(underlying);
-            }
-        }).then();
+    @PostConstruct
+    public void init() {
+        dbService.initSchema();
+        dbService.findActivePositions()
+            .doOnNext(pos -> {
+                String key = pos.underlying().toUpperCase();
+                activePositions.put(key, pos);
+                log.info("[IronFly] Restored active position for {}", key);
+            })
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe(
+                null,
+                e -> log.warn("[IronFly] Error hydrating active positions on startup: {}", e.getMessage())
+            );
     }
 
-    private void evaluateAndRecommend(String underlying) {
+    /**
+     * Sends Iron Fly entry recommendations for candidate underlyings.
+     * Evaluates ATM straddle premium, OI, spread, and generates short + hedge strikes.
+     */
+    public Mono<Void> sendRecommendations() {
+        log.info("[IronFly] Evaluating entry recommendations for: {}", underlyings);
+        return Flux.fromIterable(underlyings)
+            .filter(u -> {
+                IronFlyPosition existing = activePositions.get(u.toUpperCase());
+                return existing == null || existing.status() == IronFlyStatus.CLOSED;
+            })
+            .flatMap(this::evaluateAndRecommend)
+            .then();
+    }
+
+    private Mono<Void> evaluateAndRecommend(String underlying) {
         LocalDate expiry = getNextMonthlyExpiry();
-        optionChainProvider.getOptionChain(underlying, expiry.toString())
+        return optionChainProvider.getOptionChain(underlying, expiry.toString())
             .zipWith(optionChainProvider.getSpotPrice(underlying))
-            .doOnNext(tuple -> {
-                Map<Integer, StrikeQuote> chain = tuple.getT1();
+            .flatMap(tuple -> {
+                OptionChain chain = tuple.getT1();
                 double spot = tuple.getT2();
-                if (chain.isEmpty() || spot <= 0) {
+                if (chain == null || chain.isEmpty() || spot <= 0) {
                     log.warn("[IronFly] No chain data or spot for {}", underlying);
-                    return;
+                    return Mono.empty();
                 }
-                int atmStrike = chain.keySet().stream()
-                    .min(Comparator.comparingInt(s -> Math.abs(s - (int) Math.round(spot / 50) * 50)))
-                    .orElse((int) Math.round(spot / 50) * 50);
-                StrikeQuote ceQuote = chain.get(atmStrike);
-                StrikeQuote peQuote = chain.get(atmStrike);
+
+                int strikeStep = determineStrikeStep(underlying, spot);
+                int atmStrike = (int) Math.round(spot / strikeStep) * strikeStep;
+
+                StrikeQuote ceQuote = chain.getCall(atmStrike);
+                StrikeQuote peQuote = chain.getPut(atmStrike);
                 if (ceQuote == null || peQuote == null) {
                     log.warn("[IronFly] Missing quotes for ATM {} on {}", atmStrike, underlying);
-                    return;
+                    return Mono.empty();
                 }
+
                 BigDecimal straddlePremium = ceQuote.ltp().add(peQuote.ltp());
-                double straddlePct = straddlePremium.doubleValue() / spot * 100;
+                double straddlePct = straddlePremium.doubleValue() / spot * 100.0;
                 if (straddlePct < minStraddlePctOfSpot) {
                     log.info("[IronFly] {} skipped: straddle {:.1f}% < {:.1f}%", underlying, straddlePct, minStraddlePctOfSpot);
-                    return;
+                    return Mono.empty();
                 }
                 if (ceQuote.openInterest() < minOI || peQuote.openInterest() < minOI) {
                     log.info("[IronFly] {} skipped: OI below threshold", underlying);
-                    return;
+                    return Mono.empty();
                 }
-                int longCallStrike = atmStrike + straddlePremium.intValue();
-                int longPutStrike = atmStrike - straddlePremium.intValue();
-                StrikeQuote longCallQuote = chain.get(longCallStrike);
-                StrikeQuote longPutQuote = chain.get(longPutStrike);
+
+                int roundedOffset = (int) (Math.round(straddlePremium.doubleValue() / strikeStep) * strikeStep);
+                if (roundedOffset < strikeStep) roundedOffset = strikeStep;
+
+                int longCallStrike = atmStrike + roundedOffset;
+                int longPutStrike = atmStrike - roundedOffset;
+
+                // Snap to nearest available strikes in chain if exact strike is absent
+                if (!chain.calls().containsKey(longCallStrike)) {
+                    final int targetCall = longCallStrike;
+                    longCallStrike = chain.calls().keySet().stream()
+                        .filter(s -> s >= targetCall)
+                        .min(Integer::compareTo)
+                        .orElse(targetCall);
+                }
+                if (!chain.puts().containsKey(longPutStrike)) {
+                    final int targetPut = longPutStrike;
+                    longPutStrike = chain.puts().keySet().stream()
+                        .filter(s -> s <= targetPut)
+                        .max(Integer::compareTo)
+                        .orElse(targetPut);
+                }
+
+                StrikeQuote longCallQuote = chain.getCall(longCallStrike);
+                StrikeQuote longPutQuote = chain.getPut(longPutStrike);
                 double netCredit = straddlePremium.doubleValue()
-                    - (longCallQuote != null ? longCallQuote.ltp().doubleValue() : 0)
-                    - (longPutQuote != null ? longPutQuote.ltp().doubleValue() : 0);
+                    - (longCallQuote != null ? longCallQuote.ltp().doubleValue() : 0.0)
+                    - (longPutQuote != null ? longPutQuote.ltp().doubleValue() : 0.0);
+
                 String msg = formatRecommendation(underlying, atmStrike, spot, straddlePremium.doubleValue(),
                     longCallStrike, longPutStrike, netCredit, expiry);
-                telegramBot.sendAlert(msg).subscribe();
-                log.info("[IronFly] Recommendation sent for {}: ATM {} net credit {}", underlying, atmStrike, netCredit);
+
+                log.info("[IronFly] Recommendation generated for {}: ATM {} net credit ₹{:.2f}", underlying, atmStrike, netCredit);
+                return telegramBot.sendAlert(msg).then();
             })
-            .doOnError(e -> log.error("[IronFly] Error evaluating {}: {}", underlying, e.getMessage()))
-            .subscribe();
+            .onErrorResume(e -> {
+                log.error("[IronFly] Error evaluating {}: {}", underlying, e.getMessage(), e);
+                return Mono.empty();
+            });
     }
 
     public Mono<Void> discoverPositions() {
@@ -154,7 +199,7 @@ public class IronFlyService {
             .flatMap(adapter -> adapter.getPositions())
             .doOnNext(positions -> {
                 for (String underlying : underlyings) {
-                    IronFlyPosition existing = activePositions.get(underlying);
+                    IronFlyPosition existing = activePositions.get(underlying.toUpperCase());
                     if (existing != null && existing.status() != IronFlyStatus.CLOSED) continue;
                     discoverForUnderlying(underlying, positions);
                 }
@@ -163,62 +208,168 @@ public class IronFlyService {
     }
 
     private void discoverForUnderlying(String underlying, List<Position> brokerPositions) {
+        String uUpper = underlying.toUpperCase();
         List<Position> optionLegs = brokerPositions.stream()
-            .filter(p -> p.symbol() != null && p.symbol().toUpperCase().contains(underlying.toUpperCase()))
+            .filter(p -> p.symbol() != null && p.symbol().toUpperCase().contains(uUpper))
             .filter(p -> p.netQuantity() != 0)
             .toList();
+
         if (optionLegs.size() < 4) {
             log.debug("[IronFly] {} has {} option legs (need 4), skipping", underlying, optionLegs.size());
             return;
         }
+
         log.info("[IronFly] Found {} option legs for {}", optionLegs.size(), underlying);
+
+        OptionLeg shortCall = null;
+        OptionLeg shortPut = null;
+        OptionLeg longCallHedge = null;
+        OptionLeg longPutHedge = null;
+
+        for (Position p : optionLegs) {
+            String sym = p.symbol().toUpperCase();
+            boolean isCall = sym.endsWith("CE") || sym.contains("CE");
+            boolean isPut = sym.endsWith("PE") || sym.contains("PE");
+            boolean isShort = p.netQuantity() < 0;
+            int lotSize = Math.abs(p.netQuantity());
+            BigDecimal entryPrice = isShort
+                ? (p.sellAveragePrice() != null && p.sellAveragePrice().compareTo(BigDecimal.ZERO) > 0 ? p.sellAveragePrice() : p.buyAveragePrice())
+                : (p.buyAveragePrice() != null && p.buyAveragePrice().compareTo(BigDecimal.ZERO) > 0 ? p.buyAveragePrice() : p.sellAveragePrice());
+            if (entryPrice == null) entryPrice = BigDecimal.ZERO;
+            BigDecimal currentPrice = p.ltp() != null && p.ltp().compareTo(BigDecimal.ZERO) > 0 ? p.ltp() : entryPrice;
+            int strike = extractStrike(p.symbol());
+
+            OptionType type = isCall ? OptionType.CE : OptionType.PE;
+            OptionLeg leg = new OptionLeg(p.symbol(), strike, type, isShort, entryPrice, currentPrice, 0.0, lotSize);
+
+            if (isShort && isCall && shortCall == null) shortCall = leg;
+            else if (isShort && isPut && shortPut == null) shortPut = leg;
+            else if (!isShort && isCall && longCallHedge == null) longCallHedge = leg;
+            else if (!isShort && isPut && longPutHedge == null) longPutHedge = leg;
+        }
+
+        BigDecimal netCredit = BigDecimal.ZERO;
+        if (shortCall != null && shortPut != null) {
+            BigDecimal shortCredits = shortCall.entryPrice().add(shortPut.entryPrice());
+            BigDecimal longDebits = (longCallHedge != null ? longCallHedge.entryPrice() : BigDecimal.ZERO)
+                .add(longPutHedge != null ? longPutHedge.entryPrice() : BigDecimal.ZERO);
+            netCredit = shortCredits.subtract(longDebits);
+        }
+
+        int totalLots = shortCall != null ? shortCall.lotSize() : (optionLegs.get(0) != null ? Math.abs(optionLegs.get(0).netQuantity()) : 0);
+        BigDecimal entrySpot = shortCall != null ? BigDecimal.valueOf(shortCall.strike()) : BigDecimal.ZERO;
+
         IronFlyPosition position = new IronFlyPosition(
-            underlying, null, null, null, null,
-            BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO,
-            0, IronFlyStatus.DISCOVERED, Instant.now(), null, List.of()
+            uUpper, shortCall, shortPut, longCallHedge, longPutHedge,
+            entrySpot, netCredit, netCredit,
+            totalLots, IronFlyStatus.DISCOVERED, Instant.now(), null, List.of()
         );
-        activePositions.put(underlying, position);
+
+        activePositions.put(uUpper, position);
         dbService.savePosition(position)
             .doOnNext(id -> {
-                positionDbIds.put(underlying, id);
-                log.info("[IronFly] {} position discovered and saved (DB ID: {})", underlying, id);
+                positionDbIds.put(uUpper, id);
+                log.info("[IronFly] {} position discovered and saved with rehydrated legs (DB ID: {})", uUpper, id);
             })
             .subscribe();
     }
 
+    private int extractStrike(String symbol) {
+        if (symbol == null) return 0;
+        Matcher m = OPTION_SYMBOL_PATTERN.matcher(symbol.trim());
+        if (m.find()) {
+            try {
+                return Integer.parseInt(m.group(1));
+            } catch (NumberFormatException ignored) {}
+        }
+        return 0;
+    }
+
+    /**
+     * Refreshes active position leg quotes with live market prices prior to daily evaluation.
+     */
+    public Mono<IronFlyPosition> refreshPositionQuotes(IronFlyPosition position) {
+        if (position == null || position.status() == IronFlyStatus.CLOSED) {
+            return Mono.justOrEmpty(position);
+        }
+
+        LocalDate expiry = getNextMonthlyExpiry();
+        return optionChainProvider.getOptionChain(position.underlying(), expiry.toString())
+            .zipWith(optionChainProvider.getSpotPrice(position.underlying()))
+            .map(tuple -> {
+                OptionChain chain = tuple.getT1();
+                double liveSpot = tuple.getT2();
+
+                OptionLeg shortCall = refreshLeg(position.shortCall(), chain);
+                OptionLeg shortPut = refreshLeg(position.shortPut(), chain);
+                OptionLeg longCall = refreshLeg(position.longCallHedge(), chain);
+                OptionLeg longPut = refreshLeg(position.longPutHedge(), chain);
+
+                BigDecimal entrySpot = position.entrySpotPrice() != null && position.entrySpotPrice().compareTo(BigDecimal.ZERO) > 0
+                    ? position.entrySpotPrice()
+                    : (liveSpot > 0 ? BigDecimal.valueOf(liveSpot) : BigDecimal.ZERO);
+
+                return new IronFlyPosition(
+                    position.underlying(), shortCall, shortPut, longCall, longPut,
+                    entrySpot, position.netCredit(), position.originalCredit(),
+                    position.totalLotSize(), position.status(), position.createdAt(), position.closedAt(), position.adjustmentHistory()
+                );
+            })
+            .defaultIfEmpty(position);
+    }
+
+    private OptionLeg refreshLeg(OptionLeg leg, OptionChain chain) {
+        if (leg == null) return null;
+        StrikeQuote quote = chain.getQuote(leg.strike(), leg.optionType());
+        if (quote != null && quote.ltp() != null && quote.ltp().compareTo(BigDecimal.ZERO) > 0) {
+            return new OptionLeg(
+                leg.symbol(), leg.strike(), leg.optionType(), leg.isShort(),
+                leg.entryPrice(), quote.ltp(), quote.delta() != 0.0 ? quote.delta() : leg.delta(), leg.lotSize()
+            );
+        }
+        return leg;
+    }
+
     public Mono<Void> runDailyEvaluation() {
         log.info("[IronFly] Running daily evaluation on {} active positions", activePositions.size());
-        return Mono.fromRunnable(() -> {
-            StringBuilder summary = new StringBuilder("\ud83d\udcca *IRON FLY DAILY SUMMARY*\n\n");
-            boolean hasPositions = false;
-            for (Map.Entry<String, IronFlyPosition> entry : activePositions.entrySet()) {
-                String underlying = entry.getKey();
-                IronFlyPosition position = entry.getValue();
-                if (position.status() == IronFlyStatus.CLOSED) continue;
-                hasPositions = true;
-                int daysToExpiry = dailyAnalyzer.getDaysToExpiry(getNextMonthlyExpiry());
-                DailyAnalyzer.EvaluationResult result = dailyAnalyzer.evaluate(position, daysToExpiry);
-                if (result.isExit()) {
-                    sendExitAlert(underlying, result);
-                } else if (result.isAdjust()) {
-                    String action = result.action().name();
-                    String side;
-                    if (action.contains("LONG_CALL") || action.contains("SHORT_CALL")) {
-                        side = "CALL";
-                    } else {
-                        side = "PUT";
+        return Flux.fromIterable(new ArrayList<>(activePositions.entrySet()))
+            .filter(entry -> entry.getValue().status() != IronFlyStatus.CLOSED)
+            .flatMap(entry -> refreshPositionQuotes(entry.getValue())
+                .doOnNext(updatedPos -> {
+                    String underlying = entry.getKey();
+                    activePositions.put(underlying, updatedPos);
+                    int daysToExpiry = dailyAnalyzer.getDaysToExpiry(getNextMonthlyExpiry());
+                    DailyAnalyzer.EvaluationResult result = dailyAnalyzer.evaluate(updatedPos, daysToExpiry);
+
+                    if (result.isExit()) {
+                        sendExitAlert(underlying, result);
+                    } else if (result.isAdjust()) {
+                        String action = result.action().name();
+                        String side = (action.contains("LONG_CALL") || action.contains("SHORT_CALL")) ? "CALL" : "PUT";
+                        sendAdjustmentAlert(underlying, result, side);
                     }
-                    sendAdjustmentAlert(underlying, result, side);
-                }
-                summary.append(String.format("*%s* [%s]\n  Credit: ₹%.2f | MTM: ₹%.2f\n  BE: ₹%.2f / ₹%.2f | DTE: %d\n\n",
-                    underlying, position.status(),
-                    position.getCurrentNetCredit(), position.getTotalMtm(),
-                    position.getUpperBreakeven(), position.getLowerBreakeven(), daysToExpiry));
-            }
-            if (hasPositions) {
-                telegramBot.sendAlert(summary.toString()).subscribe();
-            }
-        }).then();
+                })
+            )
+            .then(Mono.fromRunnable(this::sendDailySummary));
+    }
+
+    private void sendDailySummary() {
+        StringBuilder summary = new StringBuilder("📊 *IRON FLY DAILY SUMMARY*\n\n");
+        boolean hasPositions = false;
+        for (Map.Entry<String, IronFlyPosition> entry : activePositions.entrySet()) {
+            String underlying = entry.getKey();
+            IronFlyPosition position = entry.getValue();
+            if (position.status() == IronFlyStatus.CLOSED) continue;
+            hasPositions = true;
+            int daysToExpiry = dailyAnalyzer.getDaysToExpiry(getNextMonthlyExpiry());
+            summary.append(String.format("*%s* [%s]\n  Credit: ₹%.2f | MTM: ₹%.2f\n  BE: ₹%.2f / ₹%.2f | DTE: %d\n\n",
+                underlying, position.status(),
+                position.getCurrentNetCredit(), position.getTotalMtm(),
+                position.getUpperBreakeven(), position.getLowerBreakeven(), daysToExpiry));
+        }
+        if (hasPositions) {
+            telegramBot.sendAlert(summary.toString()).subscribe();
+        }
     }
 
     public Map<String, IronFlyPosition> getActivePositions() {
@@ -235,14 +386,18 @@ public class IronFlyService {
         if (existing != null && existing.status() != IronFlyStatus.CLOSED) {
             return "Already have an active Iron Fly on " + key + ". Close it first.";
         }
-        int atmStrike = (int) Math.round(spot / 50.0) * 50;
+
+        int strikeStep = determineStrikeStep(key, spot);
+        int atmStrike = (int) Math.round(spot / strikeStep) * strikeStep;
         double deployedMargin = spot * lotSize * 0.25;
         double targetAmount = deployedMargin * 0.04;
         double slAmount = deployedMargin * 0.08;
 
         IronFlyPosition position = new IronFlyPosition(
             key, null, null, null, null,
-            BigDecimal.valueOf(credit), BigDecimal.valueOf(spot), BigDecimal.ZERO,
+            BigDecimal.valueOf(spot),   // Correct: entrySpotPrice
+            BigDecimal.valueOf(credit), // Correct: netCredit
+            BigDecimal.valueOf(credit), // Correct: originalCredit
             lotSize, IronFlyStatus.TRACKING, Instant.now(), null, List.of()
         );
         activePositions.put(key, position);
@@ -259,75 +414,98 @@ public class IronFlyService {
     }
 
     private void sendExitAlert(String underlying, DailyAnalyzer.EvaluationResult result) {
+        String key = underlying.toUpperCase();
         String msg = String.format(
-            "\u26a0\ufe0f *IRON FLY EXIT SIGNAL \u2014 %s*\n\n*Trigger:* %s\n*Reason:* %s\n\n_Close all 4 legs now on your broker._",
+            "⚠️ *IRON FLY EXIT SIGNAL — %s*\n\n*Trigger:* %s\n*Reason:* %s\n\n_Close all 4 legs now on your broker._",
             underlying, result.action(), result.reason());
         telegramBot.sendAlert(msg).subscribe();
+
+        IronFlyPosition pos = activePositions.get(key);
+        if (pos != null) {
+            IronFlyPosition closedPos = new IronFlyPosition(
+                pos.underlying(), pos.shortCall(), pos.shortPut(), pos.longCallHedge(), pos.longPutHedge(),
+                pos.entrySpotPrice(), pos.netCredit(), pos.originalCredit(),
+                pos.totalLotSize(), IronFlyStatus.CLOSED, pos.createdAt(), Instant.now(), pos.adjustmentHistory()
+            );
+            activePositions.put(key, closedPos);
+            Long dbId = positionDbIds.get(key);
+            if (dbId != null) {
+                dbService.closePosition(dbId).subscribe();
+                log.info("[IronFly] Closed position persisted to DB for {} (DB ID: {})", key, dbId);
+            }
+        }
     }
 
     private void sendAdjustmentAlert(String underlying, DailyAnalyzer.EvaluationResult result, String side) {
         String action = result.action().name();
         boolean isHedge = action.contains("LONG");
+        AdjustmentSide adjSide = "CALL".equalsIgnoreCase(side) ? AdjustmentSide.CALL : AdjustmentSide.PUT;
+        String key = underlying.toUpperCase();
 
-        // Find current spot and 0.4 delta strike
         optionChainProvider.getSpotPrice(underlying)
-            .doOnNext(spot -> {
+            .flatMap(spot -> {
                 LocalDate expiry = getNextMonthlyExpiry();
-                optionChainProvider.getOptionChain(underlying, expiry.toString())
+                return optionChainProvider.getOptionChain(underlying, expiry.toString())
                     .doOnNext(chain -> {
-                        int newStrike = findDeltaStrike(chain, spot, side, expiry);
+                        IronFlyPosition pos = activePositions.get(key);
+                        BigDecimal currentNetCredit = pos != null ? pos.getCurrentNetCredit() : BigDecimal.ZERO;
+                        int lotSize = pos != null ? pos.totalLotSize() : 25;
+
+                        AdjustmentHandler.AdjustmentStrikeSelection selection = adjustmentHandler.selectStrikes(
+                            chain, adjSide, spot, currentNetCredit, lotSize
+                        );
+
                         String actionType = isHedge ? "Sell profitable hedge" : "Buy back losing leg";
                         String msg = String.format(
-                            "\ud83d\udd27 *IRON FLY ADJUSTMENT \u2014 %s*\n\n*Trigger:* %s\n*Reason:* %s\n\n*Action:* %s %s, sell new %s @ %d (0.4 delta)\n\n_Please adjust manually._",
-                            underlying, result.action(), result.reason(), actionType, side, side, newStrike);
+                            "🔧 *IRON FLY ADJUSTMENT — %s*\n\n*Trigger:* %s\n*Reason:* %s\n\n*Action:* %s %s, sell new %s @ %d (premium ₹%.2f), buy hedge @ %d (premium ₹%.2f)\n*Credit Delta:* ₹%.2f\n\n_Please adjust manually._",
+                            underlying, result.action(), result.reason(), actionType, side, side,
+                            selection.newShortStrike(), selection.shortPremium(),
+                            selection.newLongStrike(), selection.hedgePremium(),
+                            selection.creditDelta());
                         telegramBot.sendAlert(msg).subscribe();
-                    })
-                    .subscribe();
+
+                        // Persist adjustment and update status
+                        Long dbId = positionDbIds.get(key);
+                        if (dbId != null && pos != null) {
+                            IronFlyPosition adjustedPos = new IronFlyPosition(
+                                pos.underlying(), pos.shortCall(), pos.shortPut(), pos.longCallHedge(), pos.longPutHedge(),
+                                pos.entrySpotPrice(), pos.netCredit().add(selection.creditDelta()), pos.originalCredit(),
+                                pos.totalLotSize(), IronFlyStatus.ADJUSTED, pos.createdAt(), pos.closedAt(), pos.adjustmentHistory()
+                            );
+                            activePositions.put(key, adjustedPos);
+                            dbService.updatePositionStatus(dbId, "ADJUSTED", adjustedPos.getCurrentNetCredit().doubleValue()).subscribe();
+                            AdjustmentRecord rec = new AdjustmentRecord(
+                                adjSide, Instant.now(), pos.getAtmStrike(), selection.newShortStrike(),
+                                0, selection.newLongStrike(), selection.creditDelta(), result.reason()
+                            );
+                            dbService.saveAdjustment(dbId, rec).subscribe();
+                            log.info("[IronFly] Adjustment persisted to DB for {} (DB ID: {})", key, dbId);
+                        }
+                    });
             })
             .subscribe();
     }
 
-    private int findDeltaStrike(Map<Integer, StrikeQuote> chain, double spot, String side, LocalDate expiry) {
-        OptionType type = "CALL".equals(side) ? OptionType.CE : OptionType.PE;
-        double targetDelta = 0.4;
-        double timeToExpiry = dailyAnalyzer.getDaysToExpiry(expiry) / 365.0;
-        if (timeToExpiry <= 0) timeToExpiry = 1.0 / 365.0;
-
-        return chain.values().stream()
-            .filter(q -> q.optionType() == type)
-            .filter(q -> {
-                double d = Math.abs(q.delta());
-                if ("PUT".equals(side)) d = 1.0 - d;
-                return Math.abs(d - targetDelta) < 0.15;
-            })
-            .min(Comparator.comparingDouble(q -> {
-                double d = Math.abs(q.delta());
-                if ("PUT".equals(side)) d = 1.0 - d;
-                return Math.abs(d - targetDelta);
-            }))
-            .map(StrikeQuote::strike)
-            .orElseGet(() -> {
-                int atm = (int) Math.round(spot / 50) * 50;
-                return "CALL".equals(side) ? atm + 100 : atm - 100;
-            });
+    private int determineStrikeStep(String underlying, double spot) {
+        if (underlying != null) {
+            String u = underlying.toUpperCase();
+            if (u.contains("BANKNIFTY")) return 100;
+            if (u.contains("NIFTY") || u.contains("FINNIFTY")) return 50;
+        }
+        if (spot >= 10000) return 100;
+        if (spot >= 5000) return 50;
+        if (spot >= 2000) return 20;
+        if (spot >= 1000) return 10;
+        if (spot >= 500) return 5;
+        return 50;
     }
 
-    private void sendDailyStatus(String underlying, IronFlyPosition position) {
-        BigDecimal mtm = position.getTotalMtm();
-        BigDecimal credit = position.getCurrentNetCredit();
-        double mtmPct = credit.doubleValue() != 0 ? mtm.doubleValue() / Math.abs(credit.doubleValue()) * 100 : 0;
-        String msg = String.format(
-            "\ud83d\udcca *IRON FLY STATUS \u2014 %s*\n\n*ATM:* %d | *Credit:* \u20b9%.2f\n*MTM:* \u20b9%.2f (%.1f%%)\n*BE:* \u20b9%.2f / \u20b9%.2f\n*Adjustments:* %d",
-            underlying, position.getAtmStrike(), credit, mtm, mtmPct,
-            position.getUpperBreakeven(), position.getLowerBreakeven(), position.getAdjustmentCount());
-        telegramBot.sendAlert(msg).subscribe();
-    }
-
-    private String formatRecommendation(String underlying, int atmStrike, double spot,
-                                          double straddlePremium, int longCallStrike, int longPutStrike,
-                                          double netCredit, LocalDate expiry) {
+    private String formatRecommendation(
+        String underlying, int atmStrike, double spot, double straddlePremium,
+        int longCallStrike, int longPutStrike, double netCredit, LocalDate expiry
+    ) {
         return String.format(
-            "\ud83c\udfaf *IRON FLY \u2014 %s*\n\n*Expiry:* %s\n*ATM:* %d (Spot: \u20b9%.2f)\n*Straddle:* \u20b9%.2f\n\n*Entry:*\n\u2022 Sell %d CE\n\u2022 Sell %d PE\n\u2022 Buy %d CE\n\u2022 Buy %d PE\n\n*Net Credit:* \u20b9%.2f\n*BE:* \u20b9%.2f / \u20b9%.2f\n\n_Execute manually on your broker._",
+            "🦅 *IRON FLY RECOMMENDATION — %s*\n*Expiry:* %s\n*ATM Strike:* %d (Spot: ₹%.2f)\n*Straddle:* ₹%.2f\n\n*Entry:*\n• Sell %d CE\n• Sell %d PE\n• Buy %d CE\n• Buy %d PE\n\n*Net Credit:* ₹%.2f\n*BE:* ₹%.2f / ₹%.2f\n\n_Execute manually on your broker._",
             underlying, expiry.format(DateTimeFormatter.ofPattern("dd MMM yyyy")),
             atmStrike, spot, straddlePremium,
             atmStrike, atmStrike, longCallStrike, longPutStrike,

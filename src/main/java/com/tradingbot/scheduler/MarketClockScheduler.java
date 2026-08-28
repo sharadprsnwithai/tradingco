@@ -62,8 +62,7 @@ public class MarketClockScheduler {
     // Injectable clock for testing — defaults to real IST clock
     private Supplier<LocalDate> clock = () -> LocalDate.now(IST_ZONE);
 
-    // NSE trading holidays — configured via NSE_HOLIDAYS (comma-separated YYYY-MM-DD),
-    // defaults to the official NSE 2026 trading holiday list
+    // NSE trading holidays (default official 2026 calendar; configurable via bot.calendar.holidays)
     private final Set<LocalDate> nseHolidays = new HashSet<>();
 
     public MarketClockScheduler(
@@ -76,10 +75,10 @@ public class MarketClockScheduler {
         @Autowired(required = false) KiteHistoricalDataService kiteHistoricalDataService,
         InstrumentMasterService instrumentMaster,
         InstrumentSyncService instrumentSyncService,
-        ShoonyaInstrumentSyncService shoonyaInstrumentSyncService,
+        @Autowired(required = false) ShoonyaInstrumentSyncService shoonyaInstrumentSyncService,
         TelegramBotService telegramBot,
-        IronFlyService ironFlyService,
-        @Value("${bot.calendar.holidays:2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25}") String holidaysCsv
+        @Autowired(required = false) IronFlyService ironFlyService,
+        @Value("${bot.calendar.holidays:2026-01-15,2026-01-26,2026-03-03,2026-03-26,2026-03-31,2026-04-03,2026-04-14,2026-05-01,2026-05-28,2026-06-26,2026-09-14,2026-10-02,2026-10-20,2026-11-10,2026-11-24,2026-12-25}") String holidaysConfig
     ) {
         this.strategyEngine = strategyEngine;
         this.positionManager = positionManager;
@@ -94,33 +93,19 @@ public class MarketClockScheduler {
         this.telegramBot = telegramBot;
         this.ironFlyService = ironFlyService;
 
-        initHolidays(holidaysCsv);
-    }
-
-    /** Package-private clock setter for testing. */
-    void setClock(Supplier<LocalDate> clock) {
-        this.clock = clock;
-    }
-
-    /**
-     * Initializes the set of NSE trading holidays from configuration
-     * (comma-separated YYYY-MM-DD dates, defaults to the official 2026 list:
-     * Jan 15 Municipal Elections, Jan 26 Republic Day, Mar 03 Holi, Mar 26 Ram Navami,
-     * Mar 31 Mahavir Jayanti, Apr 03 Good Friday, Apr 14 Ambedkar Jayanti, May 01
-     * Maharashtra Day, May 28 Bakri Eid, Jun 26 Muharram, Sep 14 Ganesh Chaturthi,
-     * Oct 02 Gandhi Jayanti, Oct 20 Dussehra, Nov 10 Diwali Balipratipada,
-     * Nov 24 Guru Nanak Jayanti, Dec 25 Christmas).
-     */
-    private void initHolidays(String holidaysCsv) {
-        if (holidaysCsv == null || holidaysCsv.isBlank()) return;
-        for (String d : holidaysCsv.split(",")) {
-            try {
-                nseHolidays.add(LocalDate.parse(d.trim()));
-            } catch (Exception e) {
-                log.warn("Ignoring unparseable holiday date '{}'", d.trim());
+        if (holidaysConfig != null && !holidaysConfig.isBlank()) {
+            for (String h : holidaysConfig.split(",")) {
+                String trimmed = h.trim();
+                if (!trimmed.isEmpty()) {
+                    try {
+                        nseHolidays.add(LocalDate.parse(trimmed));
+                    } catch (Exception ex) {
+                        log.warn("Failed to parse NSE holiday date: {}", trimmed);
+                    }
+                }
             }
         }
-        log.info("Loaded {} NSE trading holidays from configuration", nseHolidays.size());
+        log.info("Initialized Master Market Clock with {} NSE holidays from configuration", nseHolidays.size());
     }
 
     /**
@@ -141,9 +126,6 @@ public class MarketClockScheduler {
 
     /**
      * 08:30 AM IST: Pre-Market Authentication & Master Download.
-     * After brokers authenticate, downloads the Kite instrument master dump into SQLite
-     * (required for WebSocket token resolution and option strike lookups), then dispatches
-     * the pre-market scan and re-syncs market data subscriptions.
      */
     @Scheduled(cron = "0 30 8 * * MON-FRI", zone = "Asia/Kolkata")
     public void onPreMarketAuth() {
@@ -174,7 +156,6 @@ public class MarketClockScheduler {
             })
             .doOnTerminate(() -> {
                 strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.PRE_MARKET_SCAN));
-                // Re-sync subscriptions now that instrument tokens exist
                 reactor.core.publisher.Mono.delay(java.time.Duration.ofSeconds(2))
                     .subscribe(t -> strategyEngine.syncSubscriptions());
             })
@@ -184,7 +165,7 @@ public class MarketClockScheduler {
     }
 
     /**
-     * 09:05 AM IST: Pre-Market Indicator Warm-Up via Shoonya TPSeries (350ms throttle).
+     * 09:05 AM IST: Pre-Market Indicator Warm-Up (5m, 15m, 60m).
      */
     @Scheduled(cron = "0 5 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onPreMarketWarmup() {
@@ -213,32 +194,50 @@ public class MarketClockScheduler {
         }
 
         // 2. Shoonya Warmup (if enabled)
-        List<ShoonyaHistoricalDataService.HistoricalWarmupRequest> requests = new ArrayList<>();
+        List<String> allSymbols = new ArrayList<>();
         for (Strategy s : strategyEngine.getRegisteredStrategies()) {
             if (s.isEnabled()) {
-                for (String sym : s.getSubscribedSymbols()) {
-                    String token = instrumentMaster.findByCanonicalSymbol(sym)
-                        .map(Instrument::shoonyaToken)
-                        .block();
-                    if (token != null && !token.isBlank()) {
-                        String exchange = sym.startsWith("NSE:") ? "NSE" : "NFO";
-                        requests.add(new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "5", 50));
-                        requests.add(new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "15", 50));
-                        requests.add(new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "60", 30));
-                    } else {
-                        log.warn("No Shoonya token found for {}, skipping Shoonya warmup", sym);
-                    }
-                }
+                allSymbols.addAll(s.getSubscribedSymbols());
             }
         }
 
-        historicalDataService.warmupSequentially(requests)
-            .doOnNext(res -> {
-                if (res.success()) {
-                    marketDataHub.getCandleAggregator().seedCandles(res.symbol(), res.timeframe(), res.candles());
-                }
-            })
-            .subscribe();
+        if (historicalDataService != null && !allSymbols.isEmpty()) {
+            reactor.core.publisher.Flux.fromIterable(allSymbols)
+                .distinct()
+                .flatMap(sym -> instrumentMaster.findByCanonicalSymbol(sym)
+                    .map(inst -> {
+                        String token = inst.shoonyaToken();
+                        if (token != null && !token.isBlank()) {
+                            String exchange = sym.startsWith("NSE:") ? "NSE" : "NFO";
+                            return List.of(
+                                new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "5", 50),
+                                new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "15", 50),
+                                new ShoonyaHistoricalDataService.HistoricalWarmupRequest(sym, exchange, token, "60", 30)
+                            );
+                        }
+                        return List.<ShoonyaHistoricalDataService.HistoricalWarmupRequest>of();
+                    })
+                    .defaultIfEmpty(List.of())
+                )
+                .flatMapIterable(list -> list)
+                .collectList()
+                .flatMap(requests -> {
+                    if (!requests.isEmpty()) {
+                        return historicalDataService.warmupSequentially(requests)
+                            .doOnNext(res -> {
+                                if (res.success()) {
+                                    marketDataHub.getCandleAggregator().seedCandles(res.symbol(), res.timeframe(), res.candles());
+                                }
+                            })
+                            .then();
+                    }
+                    return reactor.core.publisher.Mono.empty();
+                })
+                .subscribe(
+                    null,
+                    err -> log.warn("Shoonya warmup encountered error: {}", err.getMessage())
+                );
+        }
 
         telegramBot.sendAlert("⏰ *Indicator Warm-Up Initiated (09:05 IST)*\n• Warming up multi-timeframe candle buffers (5m, 15m, 1h) for indicators (SuperTrend, RSI, VWAP)").subscribe();
     }
@@ -268,29 +267,25 @@ public class MarketClockScheduler {
 
     /**
      * 09:26 AM IST: Stock Selection Scan for Lowest Volume Reversal Strategy.
-     * Fetches NSE Top Gainers/Losers and dispatches STOCK_SELECTION_SCAN event.
-     * Then syncs subscriptions to pick up new symbols.
      */
     @Scheduled(cron = "0 26 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onStockSelectionScan() {
         if (!isTradingDay(clock.get())) return;
-        log.info("📊 09:26 IST: Triggering Stock Selection Scan (Gainers/Losers)");
+        log.info("📈 09:26 IST: Triggering Stock Selection Scan (Gainers/Losers)");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.STOCK_SELECTION_SCAN));
 
-        // Delay sync to allow async NSE API calls to complete, then sync new symbols
         reactor.core.publisher.Mono.delay(java.time.Duration.ofSeconds(5))
             .subscribe(tick -> {
                 strategyEngine.syncSubscriptions();
-                log.info("📊 09:26 IST: Subscription sync completed after stock selection");
+                log.info("📈 09:26 IST: Subscription sync completed after stock selection");
             });
 
-        telegramBot.sendAlert("📊 *Stock Selection Scan (09:26 IST)*\n• Fetching NSE Top Gainers & Losers\n• Identifying reversal candidates for Lowest Volume Reversal strategy").subscribe();
+        telegramBot.sendAlert("📈 *Stock Selection Scan (09:26 IST)*\n• Fetching NSE Top Gainers & Losers\n• Identifying reversal candidates for Lowest Volume Reversal strategy").subscribe();
     }
 
     /**
      * 09:30 AM IST: VWAP Strategy Baseline Snapshot.
-     * Captures Nifty Futures price and PCR for VWAP strategy bias determination.
      */
     @Scheduled(cron = "0 30 9 * * MON-FRI", zone = "Asia/Kolkata")
     public void onVwapBaseline() {
@@ -303,7 +298,6 @@ public class MarketClockScheduler {
 
     /**
      * 11:00 AM IST: VWAP Strategy Bias Check.
-     * Captures 11:00 Nifty Futures price and PCR, determines bullish/bearish/neutral bias.
      */
     @Scheduled(cron = "0 0 11 * * MON-FRI", zone = "Asia/Kolkata")
     public void onVwapBiasCheck() {
@@ -316,8 +310,6 @@ public class MarketClockScheduler {
 
     /**
      * 15:00 PM IST: Hard Exit for Lowest Volume Reversal Strategy.
-     * Uses a strategy-specific event so it does not force VWAP / Option-Selling
-     * strategies to exit at 15:00 (those follow the 15:14 intraday square-off).
      */
     @Scheduled(cron = "0 0 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onHardExit() {
@@ -334,14 +326,14 @@ public class MarketClockScheduler {
     @Scheduled(cron = "0 10 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onIntradayEntryCutoff() {
         if (!isTradingDay(clock.get())) return;
-        log.warn("🔒 15:10 IST: INTRADAY ENTRY CUTOFF — Locking all new trade entries");
+        log.warn("🛑 15:10 IST: INTRADAY ENTRY CUTOFF — Locking all new trade entries");
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.INTRADAY_ENTRY_CUTOFF));
-        telegramBot.sendAlert("🔒 *Intraday Entry Lock (15:10 IST)*\n• All new entry signals are now LOCKED\n• Managing open positions toward 15:14 square-off").subscribe();
+        telegramBot.sendAlert("🛑 *Intraday Entry Lock (15:10 IST)*\n• All new entry signals are now LOCKED\n• Managing open positions toward 15:14 square-off").subscribe();
     }
 
     /**
-     * 15:14 PM IST: Automated Intraday Square-Off (User Requirement: 15:14 IST).
+     * 15:14 PM IST: Automated Intraday Square-Off.
      */
     @Scheduled(cron = "0 14 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onIntradaySquareOff() {
@@ -362,97 +354,69 @@ public class MarketClockScheduler {
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.MARKET_CLOSE));
         riskManager.resetDailyStats();
-        telegramBot.sendAlert("\ud83c\udfc1 *Market Closed (15:30 IST)*\n\u2022 Trading session ended\n\u2022 Daily risk metrics & strategy states reset").subscribe();
+
+        telegramBot.sendAlert("🌙 *Market Closed (15:30 IST)*\n• Strategy Engine Event Loop DISARMED\n• Daily Risk Limits & Trade Counters RESET").subscribe();
     }
 
     /**
-     * 09:30 AM IST: Iron Fly Entry Recommendations.
-     * Sends Telegram recommendations for configured underlyings.
+     * Sets the internal clock supplier (used in tests for deterministic simulation).
+     *
+     * @param clockSupplier supplier providing simulated local dates
      */
-    @Scheduled(cron = "0 30 9 * * MON-FRI", zone = "Asia/Kolkata")
-    public void onIronFlyRecommendation() {
-        if (!isTradingDay(clock.get())) return;
-        log.info("09:30 IST: Iron Fly - Sending entry recommendations");
-        ironFlyService.sendRecommendations().subscribe();
+    public void setClock(Supplier<LocalDate> clockSupplier) {
+        this.clock = clockSupplier;
     }
 
-    /**
-     * 10:00 AM IST: Iron Fly Position Discovery.
-     * Fetches broker positions and starts tracking discovered Iron Fly legs.
-     */
-    @Scheduled(cron = "0 0 10 * * MON-FRI", zone = "Asia/Kolkata")
-    public void onIronFlyDiscovery() {
-        if (!isTradingDay(clock.get())) return;
-        log.info("10:00 IST: Iron Fly - Discovering positions from broker");
-        ironFlyService.discoverPositions().subscribe();
+    public boolean isWarmupSufficient(String symbol) {
+        var buf1m = marketDataHub.getCandleAggregator().getBuffer(symbol, "1");
+        var buf5m = marketDataHub.getCandleAggregator().getBuffer(symbol, "5");
+        var buf15m = marketDataHub.getCandleAggregator().getBuffer(symbol, "15");
+        var buf60m = marketDataHub.getCandleAggregator().getBuffer(symbol, "60");
+
+        int c1 = buf1m.map(b -> b.getLast(50).size()).orElse(0);
+        int c5 = buf5m.map(b -> b.getLast(50).size()).orElse(0);
+        int c15 = buf15m.map(b -> b.getLast(50).size()).orElse(0);
+        int c60 = buf60m.map(b -> b.getLast(30).size()).orElse(0);
+
+        return c1 >= 50 && c5 >= 50 && c15 >= 50 && c60 >= 30;
     }
 
-    /**
-     * 15:00 PM IST: Iron Fly Daily Evaluation.
-     * Evaluates all tracked positions for profit target, stop loss, expiry, and decay triggers.
-     */
-    @Scheduled(cron = "0 0 15 * * MON-FRI", zone = "Asia/Kolkata")
-    public void onIronFlyEvaluation() {
-        if (!isTradingDay(clock.get())) return;
-        log.info("15:00 IST: Iron Fly - Running daily evaluation");
-        ironFlyService.runDailyEvaluation().subscribe();
+    public Mono<Double> get1hRsi(String symbol) {
+        return fetchCandlesWithFallback(symbol, "60", 30)
+            .map(candles -> {
+                if (candles == null || candles.size() < 15) return 50.0;
+                double[] c = closes(candles);
+                double rsi = TechnicalIndicators.calculateRsi(c, 14);
+                return Double.isNaN(rsi) ? 50.0 : rsi;
+            })
+            .defaultIfEmpty(50.0);
     }
 
-    /**
-     * Every 15 minutes during market hours: broadcast NIFTY 50 status to Telegram and
-     * logs it — current LTP, 1-hour RSI(14), and 15-minute SuperTrend direction/level.
-     */
-    @Scheduled(cron = "0 0/15 9-15 * * MON-FRI", zone = "Asia/Kolkata")
-    public void onNiftyStatusBroadcast() {
-        if (!isTradingDay(clock.get())) return;
-        broadcastNiftyStatus();
+    public Mono<Double> get15mSuperTrend(String symbol, int atrLength, double multiplier) {
+        return fetchCandlesWithFallback(symbol, "15", 50)
+            .map(candles -> {
+                if (candles == null || candles.size() < atrLength + 2) return Double.NaN;
+                double[] h = highs(candles);
+                double[] l = lows(candles);
+                double[] c = closes(candles);
+                double[] st = TechnicalIndicators.calculateSuperTrend(h, l, c, atrLength, multiplier);
+                return st[st.length - 1];
+            })
+            .defaultIfEmpty(Double.NaN);
     }
 
-    private void broadcastNiftyStatus() {
-        // Resolve the Nifty instrument: prefer the NIFTY 50 index, fall back to the
-        // nearest NIFTY futures contract (the index canonical "NSE:NIFTY 50" is what the
-        // Kite master stores; the bare "NSE:NIFTY" does not resolve and yields no candles).
-        Mono<String> symbolMono = instrumentMaster.findByCanonicalSymbol("NSE:NIFTY 50")
-            .map(Instrument::canonicalSymbol)
-            .switchIfEmpty(instrumentMaster.findNearestExpiring("NIFTY", "FUT").map(Instrument::canonicalSymbol))
-            .defaultIfEmpty("NSE:NIFTY 50");
-
-        symbolMono.flatMap(symbol ->
-                Mono.zip(fetchNiftyCandles(symbol, "60", 60), fetchNiftyCandles(symbol, "15", 60))
-                    .doOnNext(tuple -> emitNiftyStatus(symbol, tuple.getT1(), tuple.getT2())))
-            .subscribe(v -> {}, err -> log.error("[NIFTY-STATUS] broadcast failed: {}", err.getMessage()));
-    }
-
-    private void emitNiftyStatus(String symbol, List<Candle> h1, List<Candle> m15) {
-        if (h1.isEmpty() || m15.isEmpty()) {
-            log.warn("[NIFTY-STATUS] Insufficient candle data for {} (1h={}, 15m={}) — skipping broadcast",
-                symbol, h1.size(), m15.size());
-            return;
+    private Mono<List<Candle>> fetchCandlesWithFallback(String symbol, String timeframe, int numCandles) {
+        var buffer = marketDataHub.getCandleAggregator().getBuffer(symbol, timeframe);
+        if (buffer.isPresent()) {
+            List<Candle> cached = buffer.get().getLast(numCandles);
+            if (cached != null && cached.size() >= numCandles) {
+                return Mono.just(cached);
+            }
         }
-        double[] c1 = closes(h1);
-        double[] c15 = closes(m15);
-        double[] hi15 = highs(m15);
-        double[] lo15 = lows(m15);
 
-        double rsi1h = TechnicalIndicators.calculateRsi(c1, 14);
-        double[] st = TechnicalIndicators.calculateSuperTrend(hi15, lo15, c15, 7, 3.0);
-        double stLast = st[st.length - 1];
-        double current = c15[c15.length - 1];
-
-        String stDir = Double.isNaN(stLast) ? "n/a" : (stLast > 0 ? "BULLISH" : "BEARISH");
-        String msg = String.format(
-            "📈 *NIFTY 50 Status*\n• LTP: *%.2f*\n• 1H RSI(14): *%.2f*\n• 15m SuperTrend: *%s* (level %.2f)",
-            current, rsi1h, stDir, Math.abs(stLast));
-
-        log.info("[NIFTY-STATUS] {} LTP={} | 1H RSI(14)={} | 15m SuperTrend={} (level {})",
-            symbol, current, rsi1h, stDir, Math.abs(stLast));
-        telegramBot.sendAlert(msg).subscribe();
-    }
-
-    private Mono<List<Candle>> fetchNiftyCandles(String symbol, String timeframe, int numCandles) {
         if (kiteHistoricalDataService != null) {
             return kiteHistoricalDataService.fetchHistoricalCandles(symbol, timeframe, numCandles)
-                .filter(list -> !list.isEmpty())
+                .filter(list -> list != null && list.size() >= numCandles)
                 .switchIfEmpty(fallbackShoonyaCandles(symbol, timeframe, numCandles));
         }
         return fallbackShoonyaCandles(symbol, timeframe, numCandles);

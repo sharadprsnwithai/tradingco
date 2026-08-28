@@ -25,6 +25,7 @@ import org.springframework.web.reactive.function.BodyInserters;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.Disposable;
 import reactor.core.publisher.Mono;
+import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
 
 import java.math.BigDecimal;
@@ -60,10 +61,14 @@ public class TelegramBotService {
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
 
+    private record QueuedAlert(String message, List<List<Map<String, String>>> buttons) {}
+    private final Sinks.Many<QueuedAlert> alertQueue = Sinks.many().multicast().onBackpressureBuffer(1024);
+
     private final AtomicLong updateOffset = new AtomicLong(0);
     private final AtomicBoolean running = new AtomicBoolean(false);
     private Disposable pollingDisposable;
     private Disposable signalSub;
+    private Disposable alertQueueSub;
 
     /**
      * Constructs the Telegram Bot Service with required dependencies.
@@ -73,6 +78,7 @@ public class TelegramBotService {
      * @param positionManager   position manager for P&L retrieval
      * @param killSwitch        kill switch for panic operations
      * @param marketDataHub     market data hub for broker status
+     * @param ironFlyService    Iron Fly strategy service for options
      * @param botToken          Telegram bot API token
      * @param chatId            target Telegram chat ID for alerts
      * @param webClientBuilder  Spring WebClient builder for HTTP calls
@@ -118,12 +124,26 @@ public class TelegramBotService {
 
         log.info("Telegram Bot ENABLED — alerts will be delivered to chat id '{}'", chatId);
 
-        // 1. Subscribe to StrategyEngine signals to push trade alerts
+        // 1. Start rate-limited alert queue processor with 429 backoff retry
+        this.alertQueueSub = alertQueue.asFlux()
+            .delayElements(Duration.ofMillis(300))
+            .flatMap(alert -> executeSend(alert.message(), alert.buttons())
+                .retryWhen(reactor.util.retry.Retry.backoff(3, Duration.ofSeconds(1))
+                    .filter(ex -> ex instanceof org.springframework.web.reactive.function.client.WebClientResponseException wcre
+                        && (wcre.getStatusCode().value() == 429 || wcre.getStatusCode().is5xxServerError())))
+                .onErrorResume(e -> {
+                    log.error("Telegram message delivery failed after retries: {}", e.getMessage());
+                    return Mono.empty();
+                }), 1)
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe(null, err -> log.error("Telegram alert queue processor error: {}", err.getMessage()));
+
+        // 2. Subscribe to StrategyEngine signals to push trade alerts
         this.signalSub = strategyEngine.getSignalStream()
             .subscribeOn(Schedulers.boundedElastic())
             .subscribe(this::sendSignalAlert, err -> log.error("Error in Telegram signal listener: {}", err.getMessage()));
 
-        // 2. Start reactive long-polling for commands
+        // 3. Start reactive long-polling for commands
         startPolling();
         sendAlert("🚀 *Trading Bot Online*\nEnvironment: Multi-Broker Reactive\nType /help or /status for controls.")
             .doOnError(e -> log.error("Initial Telegram 'Online' alert failed (check host egress to api.telegram.org): {}", e.getMessage()))
@@ -134,15 +154,33 @@ public class TelegramBotService {
      * Sends a markdown formatted message to the configured Telegram chat.
      */
     public Mono<Void> sendAlert(String message) {
-        if (!enabled) {
-            log.debug("Telegram alert (disabled): {}", message);
+        if (!enabled || message == null || message.isBlank()) {
             return Mono.empty();
         }
+        alertQueue.tryEmitNext(new QueuedAlert(message, null));
+        return Mono.empty();
+    }
 
+    /**
+     * Sends an interactive message with inline keyboard buttons.
+     */
+    public Mono<Void> sendMessageWithButtons(String message, List<List<Map<String, String>>> inlineKeyboard) {
+        if (!enabled || message == null || message.isBlank()) {
+            return Mono.empty();
+        }
+        alertQueue.tryEmitNext(new QueuedAlert(message, inlineKeyboard));
+        return Mono.empty();
+    }
+
+    private Mono<Void> executeSend(String message, List<List<Map<String, String>>> inlineKeyboard) {
+        String sanitized = sanitizeMarkdown(message);
         Map<String, Object> payload = new HashMap<>();
         payload.put("chat_id", chatId);
-        payload.put("text", message);
+        payload.put("text", sanitized);
         payload.put("parse_mode", "Markdown");
+        if (inlineKeyboard != null) {
+            payload.put("reply_markup", Map.of("inline_keyboard", inlineKeyboard));
+        }
 
         return webClient.post()
             .uri("/bot" + botToken + "/sendMessage")
@@ -155,7 +193,10 @@ public class TelegramBotService {
                 log.warn("Failed to send Telegram markdown alert ({}), retrying without markdown...", e.getMessage());
                 Map<String, Object> plainPayload = new HashMap<>();
                 plainPayload.put("chat_id", chatId);
-                plainPayload.put("text", message);
+                plainPayload.put("text", message != null ? message.replace("\uFFFD", "•") : "");
+                if (inlineKeyboard != null) {
+                    plainPayload.put("reply_markup", Map.of("inline_keyboard", inlineKeyboard));
+                }
                 return webClient.post()
                     .uri("/bot" + botToken + "/sendMessage")
                     .contentType(MediaType.APPLICATION_JSON)
@@ -170,44 +211,9 @@ public class TelegramBotService {
             });
     }
 
-    /**
-     * Sends a message with interactive inline buttons.
-     */
-    public Mono<Void> sendMessageWithButtons(String message, List<List<Map<String, String>>> inlineKeyboard) {
-        if (!enabled) return Mono.empty();
-
-        Map<String, Object> replyMarkup = Map.of("inline_keyboard", inlineKeyboard);
-        Map<String, Object> payload = new HashMap<>();
-        payload.put("chat_id", chatId);
-        payload.put("text", message);
-        payload.put("parse_mode", "Markdown");
-        payload.put("reply_markup", replyMarkup);
-
-        return webClient.post()
-            .uri("/bot" + botToken + "/sendMessage")
-            .contentType(MediaType.APPLICATION_JSON)
-            .body(BodyInserters.fromValue(payload))
-            .retrieve()
-            .bodyToMono(String.class)
-            .then()
-            .onErrorResume(e -> {
-                log.warn("Failed to send Telegram button message with markdown ({}), retrying without markdown...", e.getMessage());
-                Map<String, Object> plainPayload = new HashMap<>();
-                plainPayload.put("chat_id", chatId);
-                plainPayload.put("text", message);
-                plainPayload.put("reply_markup", replyMarkup);
-                return webClient.post()
-                    .uri("/bot" + botToken + "/sendMessage")
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .body(BodyInserters.fromValue(plainPayload))
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .then()
-                    .onErrorResume(e2 -> {
-                        log.error("Failed to send Telegram button message (plain fallback): {}", e2.getMessage());
-                        return Mono.empty();
-                    });
-            });
+    private String sanitizeMarkdown(String text) {
+        if (text == null) return "";
+        return text.replace("\uFFFD", "•");
     }
 
     /**
@@ -267,21 +273,13 @@ public class TelegramBotService {
                 log.debug("Telegram polling timeout or retry: {}", e.getMessage());
                 return Mono.empty();
             })
-            .delayElement(Duration.ofMillis(500))
             .subscribeOn(Schedulers.boundedElastic())
-            .subscribe(
-                v -> {
-                    if (running.get()) {
-                        pollLoop();
-                    }
-                },
-                err -> {
-                    log.debug("Telegram poll loop error: {}", err.getMessage());
-                    if (running.get()) {
-                        Schedulers.boundedElastic().schedule(this::pollLoop, 2, TimeUnit.SECONDS);
-                    }
+            .doFinally(signalType -> {
+                if (running.get()) {
+                    Schedulers.boundedElastic().schedule(this::pollLoop, 500, TimeUnit.MILLISECONDS);
                 }
-            );
+            })
+            .subscribe();
     }
 
     /**
@@ -329,54 +327,42 @@ public class TelegramBotService {
             handlePanicPrompt();
         } else if (cmd.startsWith("/strategies")) {
             handleStrategiesCommand();
+        } else if (cmd.startsWith("/help") || cmd.startsWith("/start")) {
+            handleHelpCommand();
         } else if (cmd.startsWith("/ironfly")) {
             handleIronFlyCommand(text.trim());
-        } else if (cmd.startsWith("/help") || cmd.startsWith("/start")) {
-            sendAlert("""
-                \ud83d\udccb *Available Commands:*
-                \u2022 /status - System & broker connectivity overview
-                \u2022 /pnl - Live MTM & Realized P&L breakdown
-                \u2022 /strategies - Manage & toggle active strategies
-                \u2022 /ironfly - Iron Fly positions & breakevens
-                \u2022 /ironfly book RELIANCE credit=47 spot=1390 lot=250 - Book manual entry
-                \u2022 /panic - Emergency L3 Global Panic Liquidation
-                \u2022 /help - Show this command menu
-            """).subscribe();
         }
     }
 
     /**
-     * Handles a callback query from inline keyboard buttons.
-     * Acknowledges the query and dispatches actions such as panic, pause, or resume.
+     * Handles inline button callback queries from Telegram interactive keyboards.
      *
-     * @param callbackNode JSON node containing the callback query data
+     * @param queryNode JSON node containing the callback query data
      */
-    public void handleCallbackQuery(JsonNode callbackNode) {
-        String data = callbackNode.path("data").asText("");
-        String callbackId = callbackNode.path("id").asText("");
+    public void handleCallbackQuery(JsonNode queryNode) {
+        String data = queryNode.path("data").asText("");
+        String callbackId = queryNode.path("id").asText("");
 
-        // Acknowledge callback query
+        // Acknowledge callback immediately to clear loading state
         webClient.post()
             .uri("/bot" + botToken + "/answerCallbackQuery")
             .contentType(MediaType.APPLICATION_JSON)
             .body(BodyInserters.fromValue(Map.of("callback_query_id", callbackId)))
             .retrieve()
             .bodyToMono(String.class)
-            .onErrorResume(e -> {
-                log.debug("Failed to answer callback query: {}", e.getMessage());
-                return Mono.empty();
-            })
             .subscribe();
 
-        if ("CONFIRM_PANIC".equalsIgnoreCase(data)) {
+        if ("CONFIRM_PANIC".equals(data)) {
             killSwitch.activateGlobalPanic("Triggered by Telegram Operator").subscribe();
-            sendAlert("🚨 *GLOBAL PANIC ACTIVATED via Telegram* | All orders cancelled and intraday positions liquidated.").subscribe();
-        } else if (data.startsWith("PAUSE_STRAT:")) {
-            String stratId = data.substring("PAUSE_STRAT:".length());
+            sendAlert("🚨 *GLOBAL PANIC ACTIVATED VIA TELEGRAM*\n• All active strategies PAUSED\n• All open orders CANCELLED\n• Market liquidation triggered across all accounts").subscribe();
+        } else if (data.startsWith("PAUSE_")) {
+            String rawId = data.substring("PAUSE_".length());
+            String stratId = rawId.startsWith("STRAT:") ? rawId.substring("STRAT:".length()) : rawId;
             strategyEngine.pauseStrategy(stratId);
             sendAlert("⏸ *Strategy Paused:* `" + stratId + "`").subscribe();
-        } else if (data.startsWith("RESUME_STRAT:")) {
-            String stratId = data.substring("RESUME_STRAT:".length());
+        } else if (data.startsWith("RESUME_")) {
+            String rawId = data.substring("RESUME_".length());
+            String stratId = rawId.startsWith("STRAT:") ? rawId.substring("STRAT:".length()) : rawId;
             strategyEngine.resumeStrategy(stratId);
             sendAlert("▶️ *Strategy Resumed:* `" + stratId + "`").subscribe();
         }
@@ -445,84 +431,129 @@ public class TelegramBotService {
      * Sends an interactive strategy controller with pause/resume buttons for each registered strategy.
      */
     private void handleStrategiesCommand() {
-        StringBuilder sb = new StringBuilder("\u2699\ufe0f *STRATEGY DASHBOARD*\n\n");
+        StringBuilder sb = new StringBuilder("⚙️ *STRATEGY DASHBOARD*\n\n");
 
         // 1. Registered strategies (VWAP, LVR, etc.)
         List<Strategy> list = strategyEngine.getRegisteredStrategies();
         if (!list.isEmpty()) {
             sb.append("*Intraday Strategies:*\n");
             for (Strategy s : list) {
-                sb.append("\u2022 `").append(s.getStrategyId()).append("` ")
-                  .append(s.isEnabled() ? "\u2705 RUNNING" : "\u23f8 PAUSED")
+                sb.append("• `").append(s.getStrategyId()).append("` ")
+                  .append(s.isEnabled() ? "✅ RUNNING" : "⏸ PAUSED")
                   .append(" (").append(s.getAssignedAccountId()).append(")\n");
             }
             sb.append("\n");
         }
 
-        // 2. Iron Fly status
-        Map<String, IronFlyPosition> ironFlyPositions = ironFlyService.getActivePositions();
-        sb.append("*Iron Fly (Monthly Option Selling):*\n");
-        if (ironFlyPositions.isEmpty()) {
-            sb.append("  No active positions\n");
-        } else {
-            for (Map.Entry<String, IronFlyPosition> entry : ironFlyPositions.entrySet()) {
-                IronFlyPosition p = entry.getValue();
-                sb.append("\u2022 `").append(entry.getKey()).append("` [").append(p.status()).append("]\n");
-                sb.append("  Credit: \u20b9").append(p.getCurrentNetCredit())
-                  .append(" | MTM: \u20b9").append(p.getTotalMtm()).append("\n");
+        // 2. Iron Fly positions
+        if (ironFlyService != null) {
+            Map<String, IronFlyPosition> ifPositions = ironFlyService.getActivePositions();
+            if (!ifPositions.isEmpty()) {
+                sb.append("*Iron Fly Positions:*\n");
+                for (Map.Entry<String, IronFlyPosition> entry : ifPositions.entrySet()) {
+                    IronFlyPosition pos = entry.getValue();
+                    sb.append("• `").append(entry.getKey()).append("` [").append(pos.status()).append("] ")
+                      .append("Credit: ₹").append(pos.getCurrentNetCredit())
+                      .append(" | MTM: ₹").append(pos.getTotalMtm()).append("\n");
+                }
+                sb.append("\n");
             }
         }
-        sb.append("\n");
 
-        // 3. Pause/Resume buttons for registered strategies
         List<List<Map<String, String>>> buttons = new ArrayList<>();
         for (Strategy s : list) {
-            String btnText = (s.isEnabled() ? "\u23f8 Pause " : "\u25b6\ufe0f Resume ") + s.getStrategyId();
-            String cbData = (s.isEnabled() ? "PAUSE_STRAT:" : "RESUME_STRAT:") + s.getStrategyId();
-            buttons.add(List.of(Map.of("text", btnText, "callback_data", cbData)));
+            String btnText = (s.isEnabled() ? "⏸ Pause " : "▶️ Resume ") + s.getStrategyId();
+            String callbackData = (s.isEnabled() ? "PAUSE_" : "RESUME_") + s.getStrategyId();
+            buttons.add(List.of(Map.of("text", btnText, "callback_data", callbackData)));
         }
 
-        if (buttons.isEmpty()) {
-            sendAlert(sb.toString()).subscribe();
-        } else {
-            sendMessageWithButtons(sb.toString(), buttons).subscribe();
+        sendMessageWithButtons(sb.toString(), buttons).subscribe();
+    }
+
+    /**
+     * Sends the command help manual to the user.
+     */
+    private void handleHelpCommand() {
+        String help = """
+            📖 *TRADING BOT CONTROL MANUAL*
+
+            *Monitoring Commands:*
+            • `/status` - Live broker feed status, failover state & strategies
+            • `/pnl` - Real-time portfolio P&L (Intraday & Positional)
+            • `/strategies` - Interactive dashboard to Pause/Resume strategies
+            • `/help` - View this command manual
+
+            *Iron Fly Commands:*
+            • `/ironfly status` - View all active Iron Fly positions & breakevens
+            • `/ironfly recommend` - Run entry scan & generate recommendations
+            • `/ironfly evaluate` - Run daily 15:00 evaluation (TP/SL/adjustments)
+            • `/ironfly book <SYMBOL> credit=<VAL> spot=<VAL> lot=<VAL>` - Book manual entry
+              _Example:_ `/ironfly book RELIANCE credit=47.26 spot=1390 lot=250`
+
+            *Emergency Commands:*
+            • `/panic` - Cancel all orders & market-liquidate all open intraday positions
+            """;
+        sendAlert(help).subscribe();
+    }
+
+    /**
+     * Handles /ironfly subcommands from Telegram chat.
+     */
+    private void handleIronFlyCommand(String fullText) {
+        if (ironFlyService == null) {
+            sendAlert("Iron Fly service is not available.").subscribe();
+            return;
+        }
+
+        String[] parts = fullText.split("\\s+");
+        if (parts.length < 2) {
+            sendAlert("Usage: /ironfly <status|recommend|evaluate|book>").subscribe();
+            return;
+        }
+
+        String sub = parts[1].toLowerCase();
+        switch (sub) {
+            case "status" -> {
+                Map<String, IronFlyPosition> positions = ironFlyService.getActivePositions();
+                if (positions.isEmpty()) {
+                    sendAlert("🦅 *Iron Fly:* No active positions.").subscribe();
+                    return;
+                }
+                StringBuilder sb = new StringBuilder("🦅 *ACTIVE IRON FLY POSITIONS*\n\n");
+                for (Map.Entry<String, IronFlyPosition> entry : positions.entrySet()) {
+                    IronFlyPosition pos = entry.getValue();
+                    sb.append(String.format("*%s* [%s]\n  Credit: ₹%.2f | MTM: ₹%.2f\n  BE: ₹%.2f / ₹%.2f\n  Adjustments: %d\n\n",
+                        entry.getKey(), pos.status(),
+                        pos.getCurrentNetCredit(), pos.getTotalMtm(),
+                        pos.getUpperBreakeven(), pos.getLowerBreakeven(),
+                        pos.getAdjustmentCount()));
+                }
+                sendAlert(sb.toString()).subscribe();
+            }
+            case "recommend" -> {
+                sendAlert("🦅 Triggering Iron Fly entry recommendations scan...").subscribe();
+                ironFlyService.sendRecommendations().subscribe();
+            }
+            case "evaluate" -> {
+                sendAlert("🦅 Triggering daily Iron Fly position evaluation...").subscribe();
+                ironFlyService.runDailyEvaluation().subscribe();
+            }
+            case "book" -> handleIronFlyBook(parts);
+            default -> sendAlert("Unknown /ironfly subcommand. Use: status, recommend, evaluate, book").subscribe();
         }
     }
 
     /**
-     * Builds and displays Iron Fly position status with breakevens, decay, and adjustment history.
+     * Handles /ironfly book RELIANCE credit=47.26 spot=1390 lot=250
      */
-    private void handleIronFlyCommand(String fullCmd) {
-        String[] parts = fullCmd.split("\\s+");
-        if (parts.length >= 2 && "book".equalsIgnoreCase(parts[1])) {
-            handleIronFlyBook(parts);
-            return;
-        }
-        Map<String, IronFlyPosition> positions = ironFlyService.getActivePositions();
-        if (positions.isEmpty()) {
-            sendAlert("No active Iron Fly positions.\n\nUsage: /ironfly book RELIANCE credit=47.26 spot=1390 lot=250").subscribe();
-            return;
-        }
-        StringBuilder sb = new StringBuilder("\ud83e\udde9 *IRON FLY POSITIONS*\n\n");
-        for (Map.Entry<String, IronFlyPosition> entry : positions.entrySet()) {
-            IronFlyPosition p = entry.getValue();
-            sb.append("*").append(entry.getKey()).append("* [").append(p.status()).append("]\n");
-            sb.append("  ATM: `").append(p.getAtmStrike()).append("`\n");
-            sb.append("  Credit: `\u20b9").append(p.getCurrentNetCredit()).append("`\n");
-            sb.append("  MTM: `\u20b9").append(p.getTotalMtm()).append("`\n");
-            sb.append("  BE: `\u20b9").append(p.getUpperBreakeven()).append(" / \u20b9").append(p.getLowerBreakeven()).append("`\n");
-            sb.append("  Adjustments: `").append(p.getAdjustmentCount()).append("`\n\n");
-        }
-        sendAlert(sb.toString()).subscribe();
-    }
-
     private void handleIronFlyBook(String[] parts) {
-        if (parts.length < 5) {
-            sendAlert("Usage: /ironfly book RELIANCE credit=47.26 spot=1390 lot=250").subscribe();
+        if (parts.length < 3) {
+            sendAlert("Usage: /ironfly book <SYMBOL> credit=<VAL> spot=<VAL> lot=<VAL>\nExample: /ironfly book RELIANCE credit=47.26 spot=1390 lot=250").subscribe();
             return;
         }
         String underlying = parts[2].toUpperCase();
-        double credit = 0, spot = 0;
+        double credit = 0;
+        double spot = 0;
         int lot = 250;
         for (int i = 3; i < parts.length; i++) {
             String[] kv = parts[i].split("=");
@@ -553,6 +584,9 @@ public class TelegramBotService {
         }
         if (signalSub != null && !signalSub.isDisposed()) {
             signalSub.dispose();
+        }
+        if (alertQueueSub != null && !alertQueueSub.isDisposed()) {
+            alertQueueSub.dispose();
         }
     }
 }

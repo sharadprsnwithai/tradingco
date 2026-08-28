@@ -31,46 +31,61 @@ public class GenericOptionChainProvider implements OptionChainProvider {
     }
 
     @Override
-    public Mono<Map<Integer, StrikeQuote>> getOptionChain(String underlying, String expiry) {
+    public Mono<OptionChain> getOptionChain(String underlying, String expiry) {
         return getSpotPrice(underlying)
             .flatMap(spot -> instrumentMaster.findOptionContracts(underlying, expiry, null, null)
                 .collectList()
                 .map(instruments -> {
-                    Map<Integer, StrikeQuote> chain = new HashMap<>();
+                    Map<Integer, StrikeQuote> calls = new HashMap<>();
+                    Map<Integer, StrikeQuote> puts = new HashMap<>();
                     for (Instrument inst : instruments) {
                         if (inst.strike() == null) continue;
                         int strike = inst.strike().intValue();
-                        OptionType type = "CE".equals(inst.instrumentType()) ? OptionType.CE : OptionType.PE;
+                        OptionType type = "CE".equalsIgnoreCase(inst.instrumentType()) ? OptionType.CE : OptionType.PE;
                         double delta = approximateDelta(strike, spot, type);
-                        chain.put(strike, new StrikeQuote(
+                        StrikeQuote quote = new StrikeQuote(
                             strike, type,
                             BigDecimal.ZERO, BigDecimal.ZERO, BigDecimal.ZERO,
                             0, 0,
                             delta, 0.0, 0.0, 0.0
-                        ));
+                        );
+                        if (type == OptionType.CE) {
+                            calls.put(strike, quote);
+                        } else {
+                            puts.put(strike, quote);
+                        }
                     }
-                    return chain;
-                }));
+                    return new OptionChain(underlying, expiry, calls, puts);
+                }))
+            .switchIfEmpty(Mono.just(OptionChain.empty(underlying, expiry)));
     }
 
     @Override
     public Mono<Double> getSpotPrice(String underlying) {
-        return instrumentMaster.findNearestAtmOption(underlying, 0, "CE")
+        return instrumentMaster.findOptionContracts(underlying, null, null, "CE")
             .map(inst -> inst.strike() != null ? inst.strike().doubleValue() : 0.0)
+            .filter(s -> s > 0)
+            .collectList()
+            .map(strikes -> {
+                if (strikes.isEmpty()) return 0.0;
+                strikes.sort(Double::compareTo);
+                return strikes.get(strikes.size() / 2);
+            })
             .switchIfEmpty(Mono.just(0.0));
     }
 
     /**
      * Approximates delta from moneyness.
-     * ATM ≈ 0.5, 2% OTM ≈ 0.35, 5% OTM ≈ 0.2
+     * For CE: OTM (strike > spot) has delta < 0.5; ITM (strike < spot) has delta > 0.5.
+     * For PE: OTM (strike < spot) has delta < 0.5; ITM (strike > spot) has delta > 0.5.
      */
     private double approximateDelta(int strike, double spot, OptionType type) {
         if (spot <= 0) return 0.5;
         double moneyness = (strike - spot) / spot;
         if (type == OptionType.CE) {
-            return Math.max(0.05, Math.min(0.95, 0.5 + moneyness * 10));
+            return Math.max(0.05, Math.min(0.95, 0.5 - moneyness * 8.0));
         } else {
-            return Math.max(0.05, Math.min(0.95, 0.5 - moneyness * 10));
+            return Math.max(0.05, Math.min(0.95, 0.5 + moneyness * 8.0));
         }
     }
 }

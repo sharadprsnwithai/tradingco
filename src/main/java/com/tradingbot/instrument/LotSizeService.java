@@ -40,22 +40,47 @@ public class LotSizeService {
 
     /**
      * Gets the lot size for a given stock symbol.
-     * Returns 1 if not found (fallback to quantity-based trading).
+     * Returns default index lot size or 1 if not found.
      *
-     * @param symbol the stock symbol (e.g., "RELIANCE", "TCS")
+     * @param symbol the stock symbol (e.g., "RELIANCE", "TCS", "NIFTY")
      * @return lot size for F&O trading
      */
     public int getLotSize(String symbol) {
         if (!loaded) {
             loadLotSizes();
         }
-        // Strip exchange prefix if present (e.g., "NSE:RELIANCE" → "RELIANCE")
+        if (symbol == null || symbol.isBlank()) return 1;
+        // Strip exchange prefix if present (e.g., "NSE:RELIANCE" → "RELIANCE", "NFO:NIFTY_50" → "NIFTY")
         String cleanSymbol = symbol.contains(":") ? symbol.split(":")[1] : symbol;
-        return lotSizeCache.getOrDefault(cleanSymbol, 1);
+        cleanSymbol = cleanSymbol.toUpperCase().trim();
+
+        int size = lotSizeCache.getOrDefault(cleanSymbol, 0);
+        if (size > 0) return size;
+
+        // Standard index lot size defaults for Indian derivatives
+        if (cleanSymbol.startsWith("NIFTY")) return 65;
+        if (cleanSymbol.startsWith("BANKNIFTY")) return 15;
+        if (cleanSymbol.startsWith("FINNIFTY")) return 25;
+        if (cleanSymbol.startsWith("MIDCPNIFTY")) return 50;
+        if (cleanSymbol.startsWith("SENSEX")) return 10;
+        if (cleanSymbol.startsWith("BANKEX")) return 15;
+
+        return 1;
     }
 
     /**
-     * Gets order quantity for 2 lots.
+     * Gets order quantity for specified number of lots.
+     *
+     * @param symbol the stock symbol
+     * @param lots   number of lots (minimum 1)
+     * @return lot_size × lots
+     */
+    public int getOrderQuantity(String symbol, int lots) {
+        return getLotSize(symbol) * Math.max(1, lots);
+    }
+
+    /**
+     * Gets order quantity for 2 lots (legacy default).
      *
      * @param symbol the stock symbol
      * @return 2 × lot_size
@@ -68,23 +93,28 @@ public class LotSizeService {
      * Loads all NFO instrument lot sizes from Kite API.
      * CSV format: instrument_token,exchange_token,tradingsymbol,name,expiry,strike,tick_size,lot_size,instrument_type,segment,exchange
      */
-    private void loadLotSizes() {
-        if (!config.isEnabled() || !authenticator.hasValidSession()) {
-            log.debug("Kite not enabled or not authenticated, cannot load lot sizes");
-            return;
-        }
-
+    public void loadLotSizes() {
         try {
-            String response = authenticator.getAccessToken()
-                .flatMap(token -> webClient.get()
-                    .uri("/instruments/NFO")
-                    .header("Authorization", "token " + config.getApiKey() + ":" + token)
-                    .retrieve()
-                    .bodyToMono(String.class))
+            String response = webClient.get()
+                .uri("/instruments/NFO")
+                .retrieve()
+                .bodyToMono(String.class)
+                .onErrorResume(e -> {
+                    if (config.isEnabled() && authenticator.hasValidSession()) {
+                        return authenticator.getAccessToken()
+                            .flatMap(token -> webClient.get()
+                                .uri("/instruments/NFO")
+                                .header("Authorization", "token " + config.getApiKey() + ":" + token)
+                                .retrieve()
+                                .bodyToMono(String.class));
+                    }
+                    return reactor.core.publisher.Mono.empty();
+                })
                 .block();
 
             if (response == null || response.isEmpty()) {
-                log.warn("Empty response from Kite instruments API");
+                log.debug("Empty or unavailable response from Kite instruments API, using default lot sizes");
+                loaded = true;
                 return;
             }
 
