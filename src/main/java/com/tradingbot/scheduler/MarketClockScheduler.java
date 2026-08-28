@@ -297,6 +297,17 @@ public class MarketClockScheduler {
     }
 
     /**
+     * 09:45 AM IST: Iron Fly Entry Scan & Recommendation Generator.
+     * Evaluates monthly candidate underlyings at 09:45 AM after opening volatility settles.
+     */
+    @Scheduled(cron = "0 45 9 * * MON-FRI", zone = "Asia/Kolkata")
+    public void onIronFlyMonthlyScan() {
+        if (!isTradingDay(clock.get()) || ironFlyService == null) return;
+        log.info("🦅 09:45 IST: Iron Fly Entry Scan & Recommendation Generator");
+        ironFlyService.sendRecommendations().subscribe();
+    }
+
+    /**
      * 11:00 AM IST: VWAP Strategy Bias Check.
      */
     @Scheduled(cron = "0 0 11 * * MON-FRI", zone = "Asia/Kolkata")
@@ -309,7 +320,7 @@ public class MarketClockScheduler {
     }
 
     /**
-     * 15:00 PM IST: Hard Exit for Lowest Volume Reversal Strategy.
+     * 15:00 PM IST: Hard Exit for Lowest Volume Reversal Strategy & Daily Iron Fly Position Evaluation.
      */
     @Scheduled(cron = "0 0 15 * * MON-FRI", zone = "Asia/Kolkata")
     public void onHardExit() {
@@ -318,6 +329,11 @@ public class MarketClockScheduler {
 
         strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.LVR_HARD_EXIT));
         telegramBot.sendAlert("⚡ *Hard Exit (15:00 IST)*\n• Closing all open positions for Lowest Volume Reversal strategy").subscribe();
+
+        if (ironFlyService != null) {
+            log.info("🦅 15:00 IST: Running Iron Fly Daily Position Evaluation");
+            ironFlyService.runDailyEvaluation().subscribe();
+        }
     }
 
     /**
