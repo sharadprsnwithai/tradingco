@@ -12,6 +12,7 @@ import java.time.Instant;
 public record Position(
     String accountId,
     String brokerId,
+    String strategyId,
     String symbol,
     String exchange,
     String instrumentToken,
@@ -44,6 +45,7 @@ public record Position(
     public static class Builder {
         private String accountId;
         private String brokerId;
+        private String strategyId;
         private String symbol;
         private String exchange = "NFO";
         private String instrumentToken;
@@ -65,6 +67,8 @@ public record Position(
         public Builder accountId(String accountId) { this.accountId = accountId; return this; }
         /** Sets the broker identifier. */
         public Builder brokerId(String brokerId) { this.brokerId = brokerId; return this; }
+        /** Sets the strategy identifier that originated this position. */
+        public Builder strategyId(String strategyId) { this.strategyId = strategyId; return this; }
         /** Sets the trading symbol. */
         public Builder symbol(String symbol) { this.symbol = symbol; return this; }
         /** Sets the exchange (defaults to "NFO"). */
@@ -106,7 +110,7 @@ public record Position(
          */
         public Position build() {
             return new Position(
-                accountId, brokerId, symbol, exchange, instrumentToken,
+                accountId, brokerId, strategyId, symbol, exchange, instrumentToken,
                 productType, bookType, netQuantity, buyQuantity, sellQuantity,
                 buyAveragePrice, sellAveragePrice, ltp, mtmPnl, realizedPnl, unrealizedPnl,
                 autoSquareOff,

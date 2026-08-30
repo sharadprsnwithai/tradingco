@@ -7,6 +7,7 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -47,6 +48,7 @@ public class AdjustmentHandler {
         BigDecimal currentNetCredit,
         int lotSize
     ) {
+        int stepSize = deriveStrikeStep(chain, currentSpot);
         OptionType targetOptionType = (side == AdjustmentSide.CALL) ? OptionType.CE : OptionType.PE;
         Map<Integer, StrikeQuote> quotes = (side == AdjustmentSide.CALL) ? chain.calls() : chain.puts();
 
@@ -58,13 +60,13 @@ public class AdjustmentHandler {
         if (targetStrike.isEmpty()) {
             log.warn("[IronFly] No strike found near target delta {} for {} side, falling back to OTM",
                 targetDelta, side);
-            return selectByMoneyness(chain, side, currentSpot, currentNetCredit, lotSize);
+            return selectByMoneyness(chain, side, currentSpot, currentNetCredit, lotSize, stepSize);
         }
 
         int newShortStrike = targetStrike.get().strike();
 
         // Select hedge strike to maintain positive net credit
-        int newLongStrike = selectHedgeStrike(chain, side, newShortStrike, currentNetCredit, lotSize);
+        int newLongStrike = selectHedgeStrike(chain, side, newShortStrike, currentNetCredit, lotSize, stepSize);
 
         BigDecimal shortPremium = targetStrike.get().ltp();
         StrikeQuote hedgeQuote = chain.getQuote(newLongStrike, targetOptionType);
@@ -79,10 +81,30 @@ public class AdjustmentHandler {
         return new AdjustmentStrikeSelection(newShortStrike, newLongStrike, shortPremium, hedgePremium, creditDelta);
     }
 
+    private int deriveStrikeStep(OptionChain chain, double spot) {
+        if (chain != null && chain.calls() != null && chain.calls().size() >= 2) {
+            List<Integer> sortedStrikes = chain.calls().keySet().stream().sorted().toList();
+            int minDiff = Integer.MAX_VALUE;
+            for (int i = 1; i < sortedStrikes.size(); i++) {
+                int diff = sortedStrikes.get(i) - sortedStrikes.get(i - 1);
+                if (diff > 0 && diff < minDiff) {
+                    minDiff = diff;
+                }
+            }
+            if (minDiff < Integer.MAX_VALUE && minDiff > 0) {
+                return minDiff;
+            }
+        }
+        if (spot >= 30000) return 100;
+        if (spot >= 10000) return 50;
+        if (spot >= 1000) return 10;
+        return 5;
+    }
+
     private int selectHedgeStrike(OptionChain chain, AdjustmentSide side,
-                                  int shortStrike, BigDecimal currentNetCredit, int lotSize) {
+                                  int shortStrike, BigDecimal currentNetCredit, int lotSize, int stepSize) {
         OptionType type = (side == AdjustmentSide.CALL) ? OptionType.CE : OptionType.PE;
-        int step = (side == AdjustmentSide.CALL) ? 50 : -50;
+        int step = (side == AdjustmentSide.CALL) ? stepSize : -stepSize;
 
         // Walk away from ATM to find hedge where credit stays positive
         for (int i = 1; i <= 10; i++) {
@@ -103,21 +125,21 @@ public class AdjustmentHandler {
 
     private AdjustmentStrikeSelection selectByMoneyness(OptionChain chain,
                                                         AdjustmentSide side, double spot,
-                                                        BigDecimal currentNetCredit, int lotSize) {
+                                                        BigDecimal currentNetCredit, int lotSize, int stepSize) {
         OptionType type = (side == AdjustmentSide.CALL) ? OptionType.CE : OptionType.PE;
         double offset = spot * 0.02;
 
         int targetStrike;
         if (type == OptionType.CE) {
-            targetStrike = (int) Math.round((spot + offset) / 50.0) * 50;
+            targetStrike = (int) (Math.round((spot + offset) / (double) stepSize) * stepSize);
         } else {
-            targetStrike = (int) Math.round((spot - offset) / 50.0) * 50;
+            targetStrike = (int) (Math.round((spot - offset) / (double) stepSize) * stepSize);
         }
 
         StrikeQuote quote = chain.getQuote(targetStrike, type);
         BigDecimal shortPremium = quote != null ? quote.ltp() : BigDecimal.ZERO;
 
-        int hedgeStrike = targetStrike + ((type == OptionType.CE) ? 50 : -50);
+        int hedgeStrike = targetStrike + ((type == OptionType.CE) ? stepSize : -stepSize);
         StrikeQuote hedgeQuote = chain.getQuote(hedgeStrike, type);
         BigDecimal hedgePremium = hedgeQuote != null ? hedgeQuote.ltp() : BigDecimal.ZERO;
 

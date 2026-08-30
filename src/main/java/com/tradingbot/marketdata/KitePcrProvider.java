@@ -12,6 +12,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.math.BigDecimal;
 import java.time.Duration;
@@ -72,124 +73,128 @@ public class KitePcrProvider {
      * @param strikeRange strike offset range around ATM (e.g., 3 for ATM ± 3 strikes)
      * @return PCR value (Total Put OI / Total Call OI), or 0.0 if unavailable
      */
-    public double fetchPcr(double spotPrice, int strikeRange) {
+    public Mono<Double> fetchPcrAsync(double spotPrice, int strikeRange) {
         if (!config.isEnabled() || !authenticator.hasValidSession()) {
-            log.debug("Kite not enabled or not authenticated, returning default PCR 1.0");
-            return 1.0;
+            return Mono.just(1.0);
         }
-
         int range = strikeRange > 0 ? strikeRange : 4;
 
-        try {
-            return authenticator.getAccessToken()
-                .flatMap(token -> {
-                    // Get nearest expiry date
-                    String nearestExpiry = getNearestExpiry(token);
-                    if (nearestExpiry == null) {
-                        return Mono.just(1.0);
-                    }
+        return authenticator.getAccessToken()
+            .flatMap(token -> {
+                String nearestExpiry = getNearestExpiry(token);
+                if (nearestExpiry == null) {
+                    return Mono.just(1.0);
+                }
 
-                    // Calculate ATM strike (round to nearest 50)
-                    int atmStrike = (int) Math.round(spotPrice / 50.0) * 50;
+                int atmStrike = (int) Math.round(spotPrice / 50.0) * 50;
 
-                    if (instrumentMaster != null) {
-                        // Resolve the exact option instruments from the instrument master (which already
-                        // carries the correct Kite trading symbols). This avoids (a) the ~20MB
-                        // /instruments/NFO CSV download and (b) hand-built weekly/monthly expiry symbol
-                        // strings that produced 404s and a fallback PCR of 1.0 (AUD-04).
-                        List<String> instruments = instrumentMaster
-                            .findOptionContracts("NIFTY", nearestExpiry, null, null)
-                            .filter(inst -> {
-                                if (inst.strike() == null) return false;
-                                int strike = (int) Math.round(inst.strike().doubleValue());
-                                return Math.abs(strike - atmStrike) <= range * 50;
-                            })
-                            .map(Instrument::canonicalSymbol)
-                            .filter(s -> s != null && (s.endsWith("CE") || s.endsWith("PE")))
-                            .collectList()
-                            .block();
-
-                        if (instruments == null || instruments.isEmpty()) {
-                            log.warn("[PCR] No NIFTY option instruments in master for expiry={}, atm={} — returning PCR 1.0",
-                                nearestExpiry, atmStrike);
-                            return Mono.just(1.0);
-                        }
-
-                        String queryParams = String.join("&", instruments.stream()
-                            .map(i -> "i=" + i)
-                            .toArray(String[]::new));
-
-                        return webClient.get()
-                            .uri("/quote?" + queryParams)
-                            .header("Authorization", "token " + config.getApiKey() + ":" + token)
-                            .retrieve()
-                            .bodyToMono(String.class)
-                            .map(this::parsePcr)
-                            .onErrorResume(ex -> {
-                                log.warn("Failed to fetch Kite quotes for PCR: {}", ex.getMessage());
+                if (instrumentMaster != null) {
+                    return instrumentMaster
+                        .findOptionContracts("NIFTY", nearestExpiry, null, null)
+                        .filter(inst -> {
+                            if (inst.strike() == null) return false;
+                            int strike = (int) Math.round(inst.strike().doubleValue());
+                            return Math.abs(strike - atmStrike) <= range * 50;
+                        })
+                        .map(Instrument::canonicalSymbol)
+                        .filter(s -> s != null && (s.endsWith("CE") || s.endsWith("PE")))
+                        .collectList()
+                        .flatMap(instruments -> {
+                            if (instruments.isEmpty()) {
+                                log.warn("[PCR] No NIFTY option instruments in master for expiry={}, atm={} — returning PCR 1.0",
+                                    nearestExpiry, atmStrike);
                                 return Mono.just(1.0);
-                            });
-                    }
+                            }
 
-                    // Fallback (no instrument master): build symbols manually using the expiry date part.
-                    List<String> instruments = new ArrayList<>();
-                    for (int offset = -range; offset <= range; offset++) {
-                        int strike = atmStrike + offset * 50;
-                        String datePart = formatExpiryForKite(nearestExpiry);
-                        instruments.add("NFO:NIFTY" + datePart + strike + "CE");
-                        instruments.add("NFO:NIFTY" + datePart + strike + "PE");
-                    }
-                    String queryParams = String.join("&", instruments.stream()
-                        .map(i -> "i=" + i)
-                        .toArray(String[]::new));
-                    return webClient.get()
-                        .uri("/quote?" + queryParams)
-                        .header("Authorization", "token " + config.getApiKey() + ":" + token)
-                        .retrieve()
-                        .bodyToMono(String.class)
-                        .map(this::parsePcr)
-                        .onErrorResume(ex -> {
-                            log.warn("Failed to fetch Kite quotes for PCR: {}", ex.getMessage());
-                            return Mono.just(1.0);
+                            String queryParams = String.join("&", instruments.stream()
+                                .map(i -> "i=" + i)
+                                .toArray(String[]::new));
+
+                            return webClient.get()
+                                .uri("/quote?" + queryParams)
+                                .header("Authorization", "token " + config.getApiKey() + ":" + token)
+                                .retrieve()
+                                .bodyToMono(String.class)
+                                .map(this::parsePcr)
+                                .onErrorResume(ex -> {
+                                    log.warn("Failed to fetch Kite quotes for PCR: {}", ex.getMessage());
+                                    return Mono.just(1.0);
+                                });
                         });
-                })
-                .block();
+                }
+
+                List<String> instruments = new ArrayList<>();
+                for (int offset = -range; offset <= range; offset++) {
+                    int strike = atmStrike + offset * 50;
+                    String datePart = formatExpiryForKite(nearestExpiry);
+                    instruments.add("NFO:NIFTY" + datePart + strike + "CE");
+                    instruments.add("NFO:NIFTY" + datePart + strike + "PE");
+                }
+                String queryParams = String.join("&", instruments.stream()
+                    .map(i -> "i=" + i)
+                    .toArray(String[]::new));
+                return webClient.get()
+                    .uri("/quote?" + queryParams)
+                    .header("Authorization", "token " + config.getApiKey() + ":" + token)
+                    .retrieve()
+                    .bodyToMono(String.class)
+                    .map(this::parsePcr)
+                    .onErrorResume(ex -> {
+                        log.warn("Failed to fetch Kite quotes for PCR: {}", ex.getMessage());
+                        return Mono.just(1.0);
+                    });
+            })
+            .onErrorResume(e -> {
+                log.warn("Error fetching PCR from Kite: {}", e.getMessage());
+                return Mono.just(1.0);
+            });
+    }
+
+    public double fetchPcr(double spotPrice, int strikeRange) {
+        try {
+            Double pcr = fetchPcrAsync(spotPrice, strikeRange)
+                .subscribeOn(Schedulers.boundedElastic())
+                .block(Duration.ofSeconds(4));
+            return pcr != null ? pcr : 1.0;
         } catch (Exception e) {
             log.warn("Error fetching PCR from Kite: {}", e.getMessage());
             return 1.0;
         }
     }
 
-    /**
-     * Fetches the last traded price for a single instrument via Kite's /quote/ltp endpoint.
-     * Used by strategies to get the option premium at entry time (before the first
-     * WebSocket tick arrives for a freshly subscribed contract).
-     *
-     * @param canonicalSymbol canonical instrument key, e.g. "NFO:NIFTY26AUG24500CE"
-     * @return the last traded price, or 0.0 if unavailable
-     */
+    public Mono<Double> fetchLtpAsync(String canonicalSymbol) {
+        if (!config.isEnabled() || !authenticator.hasValidSession()) {
+            return Mono.just(0.0);
+        }
+        return authenticator.getAccessToken()
+            .flatMap(token -> webClient.get()
+                .uri("/quote/ltp?i=" + canonicalSymbol)
+                .header("Authorization", "token " + config.getApiKey() + ":" + token)
+                .retrieve()
+                .bodyToMono(String.class)
+                .map(json -> {
+                    try {
+                        JsonNode root = objectMapper.readTree(json);
+                        return root.path("data").path(canonicalSymbol).path("last_price").asDouble(0.0);
+                    } catch (Exception e) {
+                        log.warn("Failed to parse LTP response for {}: {}", canonicalSymbol, e.getMessage());
+                        return 0.0;
+                    }
+                })
+                .onErrorReturn(0.0)
+            )
+            .onErrorReturn(0.0);
+    }
+
     public double fetchLtp(String canonicalSymbol) {
         if (!config.isEnabled() || !authenticator.hasValidSession()) {
             log.debug("Kite not enabled/authenticated - LTP unavailable for {}", canonicalSymbol);
             return 0.0;
         }
         try {
-            Double ltp = authenticator.getAccessToken()
-                .flatMap(token -> webClient.get()
-                    .uri("/quote/ltp?i=" + canonicalSymbol)
-                    .header("Authorization", "token " + config.getApiKey() + ":" + token)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .map(json -> {
-                        try {
-                            JsonNode root = objectMapper.readTree(json);
-                            return root.path("data").path(canonicalSymbol).path("last_price").asDouble(0.0);
-                        } catch (Exception e) {
-                            log.warn("Failed to parse LTP response for {}: {}", canonicalSymbol, e.getMessage());
-                            return 0.0;
-                        }
-                    }))
-                .block();
+            Double ltp = fetchLtpAsync(canonicalSymbol)
+                .subscribeOn(Schedulers.boundedElastic())
+                .block(Duration.ofSeconds(3));
             return ltp != null ? ltp : 0.0;
         } catch (Exception e) {
             log.warn("Failed to fetch LTP for {}: {}", canonicalSymbol, e.getMessage());

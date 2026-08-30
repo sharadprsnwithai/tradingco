@@ -92,7 +92,8 @@ class LowestVolumeReversalStrategyTest {
         assertEquals(SignalType.EXIT_PARTIAL_LONG, emittedSignals.get(1).signalType());
         assertEquals(250, emittedSignals.get(1).quantity()); // 500 / 2 = 250 (2 lots of 250)
         assertTrue(st.partialExitBooked);
-        assertEquals(st.entryPrice, st.trailingStopLoss);
+        assertTrue(st.trailingStopLoss.compareTo(st.entryPrice) >= 0);
+        assertEquals(0, new BigDecimal("3072").compareTo(st.trailingStopLoss));
 
         // Trailing stop hit
         strategy.onTick(Tick.builder().symbol(sym).ltp(new BigDecimal("3045")).timestamp(t0.plusSeconds(1260)).build());

@@ -293,7 +293,10 @@ public class ShoonyaAuthenticator {
                 String createdAtStr = root.path("createdAt").asText(null);
                 if (token != null && createdAtStr != null) {
                     Instant createdAt = Instant.parse(createdAtStr);
-                    if (createdAt.plus(12, ChronoUnit.HOURS).isAfter(Instant.now())) {
+                    java.time.ZoneId istZone = java.time.ZoneId.of("Asia/Kolkata");
+                    java.time.LocalDate tokenDate = createdAt.atZone(istZone).toLocalDate();
+                    java.time.LocalDate today = java.time.LocalDate.now(istZone);
+                    if (tokenDate.equals(today) && createdAt.plus(12, ChronoUnit.HOURS).isAfter(Instant.now())) {
                         sUserToken.set(userToken != null ? userToken : token);
                         return token;
                     }

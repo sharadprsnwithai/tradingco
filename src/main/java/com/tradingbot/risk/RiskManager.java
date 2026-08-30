@@ -6,9 +6,12 @@ import com.tradingbot.marketdata.MarketDataHub;
 import com.tradingbot.model.Candle;
 import com.tradingbot.model.Signal;
 import com.tradingbot.model.enums.SignalType;
+import com.tradingbot.position.PositionManagerService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Mono;
 
@@ -32,6 +35,7 @@ public class RiskManager {
 
     private final TradingDbService dbService;
     private final MarketDataHub marketDataHub;
+    private final PositionManagerService positionManager;
 
     private final BigDecimal maxDailyLossPerStrategy;
     private final BigDecimal maxDailyLossGlobal;
@@ -52,6 +56,7 @@ public class RiskManager {
     public RiskManager(
         TradingDbService dbService,
         MarketDataHub marketDataHub,
+        @Lazy @Autowired(required = false) PositionManagerService positionManager,
         @Value("${bot.risk.max-daily-loss-per-strategy:5000}") double maxDailyLossPerStrategy,
         @Value("${bot.risk.max-daily-loss-global:15000}") double maxDailyLossGlobal,
         @Value("${bot.risk.max-open-positions-per-strategy:3}") int maxOpenPositionsPerStrategy,
@@ -62,6 +67,7 @@ public class RiskManager {
     ) {
         this.dbService = dbService;
         this.marketDataHub = marketDataHub;
+        this.positionManager = positionManager;
         this.maxDailyLossPerStrategy = BigDecimal.valueOf(maxDailyLossPerStrategy);
         this.maxDailyLossGlobal = BigDecimal.valueOf(maxDailyLossGlobal);
         this.maxOpenPositionsPerStrategy = maxOpenPositionsPerStrategy;
@@ -69,6 +75,21 @@ public class RiskManager {
         this.maxOrderQuantity = maxOrderQuantity;
         this.maxOrderValue = BigDecimal.valueOf(maxOrderValue);
         this.maxPriceDeviationPercent = maxPriceDeviationPercent;
+    }
+
+    public RiskManager(
+        TradingDbService dbService,
+        MarketDataHub marketDataHub,
+        double maxDailyLossPerStrategy,
+        double maxDailyLossGlobal,
+        int maxOpenPositionsPerStrategy,
+        int maxOpenPositionsGlobal,
+        int maxOrderQuantity,
+        double maxOrderValue,
+        double maxPriceDeviationPercent
+    ) {
+        this(dbService, marketDataHub, null, maxDailyLossPerStrategy, maxDailyLossGlobal,
+            maxOpenPositionsPerStrategy, maxOpenPositionsGlobal, maxOrderQuantity, maxOrderValue, maxPriceDeviationPercent);
     }
 
     /**
@@ -98,20 +119,28 @@ public class RiskManager {
             return Mono.just(RiskCheckResult.pass());
         }
 
-        // 3. Guardrail 1: Max Daily Loss Checks
+        // 3. Guardrail 1: Max Daily Loss Checks (Realized Loss + Open Unrealized MTM Drawdown)
         String strategyId = signal.strategyId();
-        BigDecimal currentStratLoss = dailyLossByStrategy.getOrDefault(strategyId, BigDecimal.ZERO);
-        if (currentStratLoss.compareTo(maxDailyLossPerStrategy) >= 0) {
-            String msg = String.format("Strategy %s exceeded max daily loss: ₹%s >= ₹%s", strategyId, currentStratLoss, maxDailyLossPerStrategy);
+        BigDecimal realizedStratLoss = dailyLossByStrategy.getOrDefault(strategyId, BigDecimal.ZERO);
+        BigDecimal openStratLoss = positionManager != null ? positionManager.getTotalUnrealizedLossForStrategy(strategyId) : BigDecimal.ZERO;
+        BigDecimal totalStratLoss = realizedStratLoss.add(openStratLoss);
+
+        if (totalStratLoss.compareTo(maxDailyLossPerStrategy) >= 0) {
+            String msg = String.format("Strategy %s exceeded max daily loss (Realized: ₹%s + Unrealized: ₹%s = ₹%s >= ₹%s)",
+                strategyId, realizedStratLoss, openStratLoss, totalStratLoss, maxDailyLossPerStrategy);
             log.warn(msg);
-            dbService.logRiskAudit(strategyId, signal.targetAccountId(), "REJECT_ENTRY", "L1", msg).subscribe();
+            dbService.logRiskAudit(strategyId, signal.targetAccountId(), "REJECT_ENTRY", "L1", msg).subscribe(null, e -> {});
             return Mono.just(RiskCheckResult.reject("MAX_STRATEGY_LOSS_LIMIT", msg));
         }
 
-        if (dailyLossGlobal.compareTo(maxDailyLossGlobal) >= 0) {
-            String msg = String.format("Global portfolio exceeded max daily loss: ₹%s >= ₹%s", dailyLossGlobal, maxDailyLossGlobal);
+        BigDecimal openGlobalLoss = positionManager != null ? positionManager.getTotalUnrealizedLossGlobal() : BigDecimal.ZERO;
+        BigDecimal totalGlobalLoss = dailyLossGlobal.add(openGlobalLoss);
+
+        if (totalGlobalLoss.compareTo(maxDailyLossGlobal) >= 0) {
+            String msg = String.format("Global portfolio exceeded max daily loss (Realized: ₹%s + Unrealized: ₹%s = ₹%s >= ₹%s)",
+                dailyLossGlobal, openGlobalLoss, totalGlobalLoss, maxDailyLossGlobal);
             log.warn(msg);
-            dbService.logRiskAudit(strategyId, signal.targetAccountId(), "REJECT_ENTRY", "L3", msg).subscribe();
+            dbService.logRiskAudit(strategyId, signal.targetAccountId(), "REJECT_ENTRY", "L3", msg).subscribe(null, e -> {});
             return Mono.just(RiskCheckResult.reject("MAX_GLOBAL_LOSS_LIMIT", msg));
         }
 

@@ -138,7 +138,7 @@ public class MarketClockScheduler {
                 .doOnSuccess(v -> log.info("Authenticated broker: {}", adapter.getBrokerId()))
                 .onErrorResume(e -> {
                     log.error("Failed to authenticate {}: {}", adapter.getBrokerId(), e.getMessage());
-                    return null;
+                    return Mono.empty();
                 }))
             .then(instrumentSyncService.syncFromKite())
             .doOnNext(count -> log.info("Instrument master synced: {} instruments", count))

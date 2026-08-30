@@ -40,6 +40,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
@@ -68,6 +69,9 @@ public class OrderManagerService {
     // In-memory hot order book: orderId -> Order
     private final Map<String, Order> orderBook = new ConcurrentHashMap<>();
     private final Sinks.Many<Order> orderSink = Sinks.many().multicast().onBackpressureBuffer(1024);
+
+    // In-flight entry order deduplication: strategyId_symbol -> lock
+    private final Set<String> inFlightEntryOrders = ConcurrentHashMap.newKeySet();
 
     // Resting exchange-side protective stops: strategyId|tradingSymbol -> local SL order id
     private final Map<String, String> restingStops = new ConcurrentHashMap<>();
@@ -210,6 +214,13 @@ public class OrderManagerService {
         String tradingSymbol = stripExchangePrefix(signal.symbol());
         String exchange = deriveExchange(signal.symbol(), signal.exchange());
 
+        boolean isEntry = signal.signalType() == SignalType.ENTRY_LONG || signal.signalType() == SignalType.ENTRY_SHORT;
+        String inFlightKey = signal.strategyId() + "_" + tradingSymbol;
+        if (isEntry && !inFlightEntryOrders.add(inFlightKey)) {
+            log.warn("Duplicate in-flight entry order suppressed for {}", inFlightKey);
+            return Mono.empty();
+        }
+
         return instrumentMaster.findByCanonicalSymbol(signal.symbol())
             .defaultIfEmpty(Instrument.builder().canonicalSymbol(signal.symbol()).tickSize(new BigDecimal("0.05")).build())
             .flatMap(instrument -> {
@@ -299,6 +310,11 @@ public class OrderManagerService {
                                 return Mono.just(failed);
                             });
                     });
+            })
+            .doFinally(sigType -> {
+                if (isEntry) {
+                    inFlightEntryOrders.remove(inFlightKey);
+                }
             });
     }
 
@@ -430,12 +446,19 @@ public class OrderManagerService {
             }
         }
 
-        if (localOrder != null && localOrder.status() != brokerOrder.status()) {
-            log.info("RECONCILER STATE SYNC: Order {} status changed from {} -> {}",
-                localOrder.id(), localOrder.status(), brokerOrder.status());
+        boolean statusChanged = localOrder != null && localOrder.status() != brokerOrder.status();
+        boolean fillsChanged = localOrder != null && brokerOrder.filledQuantity() != localOrder.filledQuantity();
+        boolean priceChanged = localOrder != null && brokerOrder.averagePrice() != null
+            && brokerOrder.averagePrice().compareTo(localOrder.averagePrice()) != 0;
+
+        if (localOrder != null && (statusChanged || fillsChanged || priceChanged)) {
+            log.info("RECONCILER STATE SYNC: Order {} status={}->{}, filledQty={}->{}, avgPrice={}->{}",
+                localOrder.id(), localOrder.status(), brokerOrder.status(),
+                localOrder.filledQuantity(), brokerOrder.filledQuantity(),
+                localOrder.averagePrice(), brokerOrder.averagePrice());
             Order updated = Order.builder()
                 .id(localOrder.id())
-                .brokerOrderId(brokerOrder.brokerOrderId())
+                .brokerOrderId(brokerOrder.brokerOrderId() != null ? brokerOrder.brokerOrderId() : localOrder.brokerOrderId())
                 .accountId(localOrder.accountId())
                 .brokerId(localOrder.brokerId())
                 .strategyId(localOrder.strategyId())
@@ -452,7 +475,7 @@ public class OrderManagerService {
                 .productType(localOrder.productType())
                 .bookType(localOrder.bookType())
                 .status(brokerOrder.status())
-                .statusMessage(brokerOrder.statusMessage())
+                .statusMessage(brokerOrder.statusMessage() != null ? brokerOrder.statusMessage() : localOrder.statusMessage())
                 .tag(localOrder.tag())
                 .createdAt(localOrder.createdAt())
                 .updatedAt(Instant.now())
@@ -460,7 +483,7 @@ public class OrderManagerService {
 
             orderBook.put(localOrder.id(), updated);
             emitOrderSafe(updated);
-            dbService.saveOrder(updated).subscribe();
+            dbService.saveOrder(updated).subscribe(null, err -> log.error("Failed to save reconciled order: {}", err.getMessage()));
         }
     }
 
@@ -486,6 +509,13 @@ public class OrderManagerService {
 
         TransactionType slTxn = entryTxn == TransactionType.BUY ? TransactionType.SELL : TransactionType.BUY;
         String slOrderId = generateOrderId();
+        BigDecimal triggerPrice = signal.protectiveStopTrigger();
+        BigDecimal tickSize = new BigDecimal("0.05");
+
+        // Use SL_L (Stop Loss Limit) with 3% buffer from trigger to comply with NSE F&O SL-M ban
+        BigDecimal limitPrice = (slTxn == TransactionType.SELL)
+            ? roundToTick(triggerPrice.multiply(BigDecimal.valueOf(0.97)), tickSize)
+            : roundToTick(triggerPrice.multiply(BigDecimal.valueOf(1.03)), tickSize);
 
         OrderRequest slReq = OrderRequest.builder()
             .accountId(signal.targetAccountId())
@@ -493,8 +523,9 @@ public class OrderManagerService {
             .exchange(exchange)
             .transactionType(slTxn)
             .quantity(signal.quantity())
-            .triggerPrice(signal.protectiveStopTrigger())
-            .orderType(OrderType.SL_M)
+            .price(limitPrice)
+            .triggerPrice(triggerPrice)
+            .orderType(OrderType.SL_L)
             .productType(signal.productType() != null ? signal.productType() : ProductType.MIS)
             .tag(signal.tag() + "_SL")
             .strategyId(signal.strategyId())
@@ -504,27 +535,31 @@ public class OrderManagerService {
             .doOnNext(slResult -> {
                 if (slResult.success()) {
                     restingStops.put(stopKey(signal.strategyId(), tradingSymbol), slOrderId);
-                    registerRestingStopOrder(slOrderId, slResult.brokerOrderId(), signal, exchange, slTxn);
-                    log.info("EXCHANGE-SIDE SL-M ARMED: {} x {} trigger={} (slOrderId={}, brokerOrderId={})",
-                        tradingSymbol, signal.quantity(), signal.protectiveStopTrigger(), slOrderId, slResult.brokerOrderId());
+                    registerRestingStopOrder(slOrderId, slResult.brokerOrderId(), signal, exchange, slTxn, limitPrice, triggerPrice);
+                    log.info("EXCHANGE-SIDE SL-L ARMED: {} x {} trigger={} limit={} (slOrderId={}, brokerOrderId={})",
+                        tradingSymbol, signal.quantity(), triggerPrice, limitPrice, slOrderId, slResult.brokerOrderId());
                 } else {
                     log.error("EXCHANGE-SIDE SL PLACEMENT FAILED for {}: {} — POSITION IS UNPROTECTED",
                         tradingSymbol, slResult.message());
+                    dbService.logRiskAudit(signal.strategyId(), signal.targetAccountId(), "SL_PLACEMENT_FAILED", "CRITICAL",
+                        "Exchange SL-L placement failed for " + tradingSymbol + ": " + slResult.message()).subscribe(null, err -> {});
                 }
             })
             .onErrorResume(e -> {
                 log.error("EXCHANGE-SIDE SL placement error for {}: {} — POSITION IS UNPROTECTED", tradingSymbol, e.getMessage());
+                dbService.logRiskAudit(signal.strategyId(), signal.targetAccountId(), "SL_PLACEMENT_ERROR", "CRITICAL",
+                    "Exchange SL-L exception for " + tradingSymbol + ": " + e.getMessage()).subscribe(null, err -> {});
                 return Mono.empty();
             })
             .thenReturn(entryOrder);
     }
 
     /**
-     * Registers the resting SL-M order in the local order book so the 4-second
+     * Registers the resting SL-L order in the local order book so the 4-second
      * reconciler tracks its lifecycle (TRIGGER_PENDING → FILLED on stop-out).
      */
     private void registerRestingStopOrder(String slOrderId, String brokerOrderId, Signal signal,
-                                          String exchange, TransactionType slTxn) {
+                                          String exchange, TransactionType slTxn, BigDecimal limitPrice, BigDecimal triggerPrice) {
         Order slOrder = Order.builder()
             .id(slOrderId)
             .brokerOrderId(brokerOrderId)
@@ -535,10 +570,10 @@ public class OrderManagerService {
             .transactionType(slTxn)
             .quantity(signal.quantity())
             .filledQuantity(0)
-            .price(BigDecimal.ZERO)
-            .triggerPrice(signal.protectiveStopTrigger())
+            .price(limitPrice)
+            .triggerPrice(triggerPrice)
             .averagePrice(BigDecimal.ZERO)
-            .orderType(OrderType.SL_M)
+            .orderType(OrderType.SL_L)
             .productType(signal.productType() != null ? signal.productType() : ProductType.MIS)
             .bookType(signal.bookType() != null ? signal.bookType() : BookType.INTRADAY)
             .status(OrderStatus.TRIGGER_PENDING)
@@ -548,7 +583,7 @@ public class OrderManagerService {
             .build();
         orderBook.put(slOrderId, slOrder);
         emitOrderSafe(slOrder);
-        dbService.saveOrder(slOrder).subscribe();
+        dbService.saveOrder(slOrder).subscribe(null, err -> log.error("Failed to save resting stop order: {}", err.getMessage()));
     }
 
     private static String stopKey(String strategyId, String tradingSymbol) {

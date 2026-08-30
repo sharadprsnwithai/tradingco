@@ -16,9 +16,11 @@ import com.tradingbot.model.enums.OrderStatus;
 import com.tradingbot.model.enums.OrderType;
 import com.tradingbot.model.enums.ProductType;
 import com.tradingbot.model.enums.TransactionType;
+import com.tradingbot.resilience.BrokerBulkheadManager;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
@@ -58,6 +60,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
     private final InstrumentMasterService instrumentMaster;
+    private final BrokerBulkheadManager bulkheadManager;
 
     // --- Live WebSocket (NorenWS) state ---
     private final Sinks.Many<Tick> tickSink = Sinks.many().multicast().onBackpressureBuffer();
@@ -81,11 +84,20 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      * @param objectMapper     the Jackson ObjectMapper for JSON serialization/deserialization
      * @param instrumentMaster the instrument master for symbol ↔ token resolution
      */
-    public ShoonyaBrokerAdapter(ShoonyaConfig config, ShoonyaAuthenticator authenticator, WebClient.Builder webClientBuilder, ObjectMapper objectMapper, InstrumentMasterService instrumentMaster) {
+    @Autowired
+    public ShoonyaBrokerAdapter(
+        ShoonyaConfig config,
+        ShoonyaAuthenticator authenticator,
+        WebClient.Builder webClientBuilder,
+        ObjectMapper objectMapper,
+        InstrumentMasterService instrumentMaster,
+        @Autowired(required = false) BrokerBulkheadManager bulkheadManager
+    ) {
         this.config = config;
         this.authenticator = authenticator;
         this.objectMapper = objectMapper;
         this.instrumentMaster = instrumentMaster;
+        this.bulkheadManager = bulkheadManager;
 
         // Backoff retry for transient upstream outages (Shoonya 502/503/504 + timeouts).
         // This is the fix for the "502/504 storm": instead of hammering Shoonya on every
@@ -114,6 +126,16 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
             .baseUrl("https://api.shoonya.com")
             .filter(backoffRetryFilter)
             .build();
+    }
+
+    public ShoonyaBrokerAdapter(
+        ShoonyaConfig config,
+        ShoonyaAuthenticator authenticator,
+        WebClient.Builder webClientBuilder,
+        ObjectMapper objectMapper,
+        InstrumentMasterService instrumentMaster
+    ) {
+        this(config, authenticator, webClientBuilder, objectMapper, instrumentMaster, null);
     }
 
     /**
@@ -225,8 +247,13 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                 payload.put("uid", config.getUserId());
                 payload.put("actid", config.getAccountId());
                 payload.put("norenordno", request.brokerOrderId() != null ? request.brokerOrderId() : orderId);
+                if (request.symbol() != null && !request.symbol().isBlank()) {
+                    payload.put("tsym", request.symbol());
+                }
+                payload.put("exch", request.exchange() != null ? request.exchange() : "NFO");
                 payload.put("qty", String.valueOf(request.quantity()));
                 payload.put("prctyp", mapOrderTypeToShoonya(request.orderType()));
+                payload.put("ret", "DAY");
 
                 if (request.price() != null && request.price().compareTo(BigDecimal.ZERO) > 0) {
                     payload.put("prc", request.price().toPlainString());
@@ -278,10 +305,22 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .body(BodyInserters.fromValue(formBody))
                 .retrieve()
-                .bodyToMono(Void.class);
-        }).onErrorResume(ex -> {
-            log.error("Failed to cancel Shoonya order {}: {}", orderId, ex.getMessage());
-            return Mono.empty();
+                .bodyToMono(String.class)
+                .flatMap(json -> {
+                    try {
+                        JsonNode root = objectMapper.readTree(json);
+                        String stat = root.path("stat").asText();
+                        if ("Ok".equalsIgnoreCase(stat)) {
+                            return Mono.empty();
+                        } else {
+                            String emsg = root.path("emsg").asText("Shoonya order cancellation failed");
+                            if (isSessionError(emsg)) throw new ShoonyaSessionException(emsg);
+                            return Mono.error(new RuntimeException("Shoonya cancelOrder failed: " + emsg));
+                        }
+                    } catch (Exception e) {
+                        return Mono.error(new RuntimeException("Failed to parse Shoonya cancel response: " + e.getMessage(), e));
+                    }
+                });
         });
     }
 
@@ -840,7 +879,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
      * @return a reactive Mono containing the API response
      */
     private <T> Mono<T> withTokenRetry(java.util.function.Function<String, Mono<T>> apiCall) {
-        return authenticator.getAccessToken()
+        Mono<T> op = authenticator.getAccessToken()
             .flatMap(apiCall)
             .onErrorResume(ShoonyaBrokerAdapter::isTokenError, ex -> {
                 log.warn("Shoonya rejected session token - re-authenticating and retrying once");
@@ -853,6 +892,7 @@ public class ShoonyaBrokerAdapter implements BrokerAdapter {
                     .then(authenticator.getAccessToken())
                     .flatMap(apiCall);
             });
+        return bulkheadManager != null ? bulkheadManager.executeShoonya(op) : op;
     }
 
     /**

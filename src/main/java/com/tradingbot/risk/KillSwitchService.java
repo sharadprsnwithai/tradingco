@@ -82,8 +82,10 @@ public class KillSwitchService {
             .flatMap(o -> oms.cancelOrder(o.id()))
             .then();
 
-        // 3. Liquidate strategy open intraday positions
-        List<Position> strategyPositions = positionManager.getOpenIntradayPositions();
+        // 3. Liquidate strategy open intraday positions (only those belonging to this strategy)
+        List<Position> strategyPositions = positionManager.getOpenIntradayPositions().stream()
+            .filter(pos -> strategyId.equalsIgnoreCase(pos.strategyId()) || isPositionOfStrategy(strategyId, pos))
+            .toList();
 
         Mono<Void> exitPositionsMono = Flux.fromIterable(strategyPositions)
             .flatMap(pos -> {
@@ -96,7 +98,7 @@ public class KillSwitchService {
                     .signalType(sig)
                     .quantity(Math.abs(pos.netQuantity()))
                     .price(pos.ltp())
-                    .orderType(OrderType.LIMIT)
+                    .orderType(OrderType.MARKET)
                     .productType(pos.productType())
                     .bookType(BookType.INTRADAY)
                     .tag("KILL_SWITCH_L1_EXIT")
@@ -198,5 +200,24 @@ public class KillSwitchService {
      */
     public boolean isGlobalPanicActive() {
         return globalPanic.get();
+    }
+
+    private boolean isPositionOfStrategy(String strategyId, Position pos) {
+        if (pos == null || strategyId == null) return false;
+        if (strategyId.equalsIgnoreCase(pos.strategyId())) return true;
+        List<Strategy> registered = strategyEngine.getRegisteredStrategies();
+        if (registered == null || registered.isEmpty()) {
+            return true; // Fallback when strategy engine has no registered beans (e.g. unit tests or standalone execution)
+        }
+        for (Strategy s : registered) {
+            if (strategyId.equalsIgnoreCase(s.getStrategyId())) {
+                if (pos.accountId() != null && pos.accountId().equalsIgnoreCase(s.getAssignedAccountId())) {
+                    if (s.getSubscribedSymbols() == null || s.getSubscribedSymbols().isEmpty() || s.getSubscribedSymbols().contains(pos.symbol())) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
     }
 }

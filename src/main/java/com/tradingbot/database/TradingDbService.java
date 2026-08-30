@@ -110,6 +110,7 @@ public class TradingDbService {
                     id TEXT PRIMARY KEY,
                     account_id TEXT,
                     broker_id TEXT,
+                    strategy_id TEXT,
                     symbol TEXT,
                     exchange TEXT,
                     instrument_token TEXT,
@@ -130,9 +131,12 @@ public class TradingDbService {
             """);
             stmt.execute("CREATE INDEX IF NOT EXISTS idx_positions_book ON positions(account_id, book_type);");
 
-            // Migrate: add auto_square_off if missing
+            // Migrate: add auto_square_off and strategy_id if missing
             try {
                 stmt.execute("ALTER TABLE positions ADD COLUMN auto_square_off INTEGER DEFAULT 1");
+            } catch (Exception ignored) { /* column already exists */ }
+            try {
+                stmt.execute("ALTER TABLE positions ADD COLUMN strategy_id TEXT");
             } catch (Exception ignored) { /* column already exists */ }
 
             // 3. Authentic Historical Candles table (for deterministic replay backtesting)
@@ -334,32 +338,33 @@ public class TradingDbService {
             String id = pos.accountId() + "_" + pos.symbol() + "_" + pos.productType();
             String sql = """
                 INSERT OR REPLACE INTO positions (
-                    id, account_id, broker_id, symbol, exchange, instrument_token,
+                    id, account_id, broker_id, strategy_id, symbol, exchange, instrument_token,
                     product_type, book_type, net_quantity, buy_quantity, sell_quantity,
                     buy_average_price, sell_average_price, ltp, mtm_pnl, realized_pnl, unrealized_pnl,
                     auto_square_off, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """;
             try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, id);
                 ps.setString(2, pos.accountId());
                 ps.setString(3, pos.brokerId());
-                ps.setString(4, pos.symbol());
-                ps.setString(5, pos.exchange());
-                ps.setString(6, pos.instrumentToken());
-                ps.setString(7, pos.productType() != null ? pos.productType().name() : "MIS");
-                ps.setString(8, pos.bookType() != null ? pos.bookType().name() : "INTRADAY");
-                ps.setInt(9, pos.netQuantity());
-                ps.setInt(10, pos.buyQuantity());
-                ps.setInt(11, pos.sellQuantity());
-                ps.setDouble(12, pos.buyAveragePrice() != null ? pos.buyAveragePrice().doubleValue() : 0.0);
-                ps.setDouble(13, pos.sellAveragePrice() != null ? pos.sellAveragePrice().doubleValue() : 0.0);
-                ps.setDouble(14, pos.ltp() != null ? pos.ltp().doubleValue() : 0.0);
-                ps.setDouble(15, pos.mtmPnl() != null ? pos.mtmPnl().doubleValue() : 0.0);
-                ps.setDouble(16, pos.realizedPnl() != null ? pos.realizedPnl().doubleValue() : 0.0);
-                ps.setDouble(17, pos.unrealizedPnl() != null ? pos.unrealizedPnl().doubleValue() : 0.0);
-                ps.setInt(18, pos.autoSquareOff() ? 1 : 0);
-                ps.setLong(19, pos.updatedAt() != null ? pos.updatedAt().toEpochMilli() : System.currentTimeMillis());
+                ps.setString(4, pos.strategyId());
+                ps.setString(5, pos.symbol());
+                ps.setString(6, pos.exchange());
+                ps.setString(7, pos.instrumentToken());
+                ps.setString(8, pos.productType() != null ? pos.productType().name() : "MIS");
+                ps.setString(9, pos.bookType() != null ? pos.bookType().name() : "INTRADAY");
+                ps.setInt(10, pos.netQuantity());
+                ps.setInt(11, pos.buyQuantity());
+                ps.setInt(12, pos.sellQuantity());
+                ps.setDouble(13, pos.buyAveragePrice() != null ? pos.buyAveragePrice().doubleValue() : 0.0);
+                ps.setDouble(14, pos.sellAveragePrice() != null ? pos.sellAveragePrice().doubleValue() : 0.0);
+                ps.setDouble(15, pos.ltp() != null ? pos.ltp().doubleValue() : 0.0);
+                ps.setDouble(16, pos.mtmPnl() != null ? pos.mtmPnl().doubleValue() : 0.0);
+                ps.setDouble(17, pos.realizedPnl() != null ? pos.realizedPnl().doubleValue() : 0.0);
+                ps.setDouble(18, pos.unrealizedPnl() != null ? pos.unrealizedPnl().doubleValue() : 0.0);
+                ps.setInt(19, pos.autoSquareOff() ? 1 : 0);
+                ps.setLong(20, pos.updatedAt() != null ? pos.updatedAt().toEpochMilli() : System.currentTimeMillis());
                 ps.executeUpdate();
             } catch (SQLException e) {
                 log.error("Failed to persist position for {}", pos.symbol(), e);
@@ -572,6 +577,7 @@ public class TradingDbService {
         return Position.builder()
             .accountId(rs.getString("account_id"))
             .brokerId(rs.getString("broker_id"))
+            .strategyId(rs.getString("strategy_id"))
             .symbol(rs.getString("symbol"))
             .exchange(rs.getString("exchange"))
             .instrumentToken(rs.getString("instrument_token"))

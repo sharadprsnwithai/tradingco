@@ -6,7 +6,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
+import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -93,58 +96,72 @@ public class LotSizeService {
      * Loads all NFO instrument lot sizes from Kite API.
      * CSV format: instrument_token,exchange_token,tradingsymbol,name,expiry,strike,tick_size,lot_size,instrument_type,segment,exchange
      */
-    public void loadLotSizes() {
-        try {
-            String response = webClient.get()
-                .uri("/instruments/NFO")
-                .retrieve()
-                .bodyToMono(String.class)
-                .onErrorResume(e -> {
-                    if (config.isEnabled() && authenticator.hasValidSession()) {
-                        return authenticator.getAccessToken()
-                            .flatMap(token -> webClient.get()
-                                .uri("/instruments/NFO")
-                                .header("Authorization", "token " + config.getApiKey() + ":" + token)
-                                .retrieve()
-                                .bodyToMono(String.class));
-                    }
-                    return reactor.core.publisher.Mono.empty();
-                })
-                .block();
+    public Mono<Void> loadLotSizesAsync() {
+        return webClient.get()
+            .uri("/instruments/NFO")
+            .retrieve()
+            .bodyToMono(String.class)
+            .onErrorResume(e -> {
+                if (config.isEnabled() && authenticator.hasValidSession()) {
+                    return authenticator.getAccessToken()
+                        .flatMap(token -> webClient.get()
+                            .uri("/instruments/NFO")
+                            .header("Authorization", "token " + config.getApiKey() + ":" + token)
+                            .retrieve()
+                            .bodyToMono(String.class));
+                }
+                return Mono.empty();
+            })
+            .doOnNext(response -> {
+                if (response == null || response.isEmpty()) {
+                    log.debug("Empty or unavailable response from Kite instruments API, using default lot sizes");
+                    loaded = true;
+                    return;
+                }
 
-            if (response == null || response.isEmpty()) {
-                log.debug("Empty or unavailable response from Kite instruments API, using default lot sizes");
-                loaded = true;
-                return;
-            }
+                String[] lines = response.split("\n");
+                int count = 0;
 
-            String[] lines = response.split("\n");
-            int count = 0;
+                for (int i = 1; i < lines.length; i++) {
+                    String[] parts = lines[i].split(",");
+                    if (parts.length < 8) continue;
 
-            for (int i = 1; i < lines.length; i++) {
-                String[] parts = lines[i].split(",");
-                if (parts.length < 8) continue;
+                    String symbol = parts[2];    // tradingsymbol
+                    int lotSize = Integer.parseInt(parts[7].trim()); // lot_size
+                    String segment = parts.length > 9 ? parts[9] : "";
 
-                String symbol = parts[2];    // tradingsymbol
-                int lotSize = Integer.parseInt(parts[7].trim()); // lot_size
-                String segment = parts.length > 9 ? parts[9] : "";
-
-                // Only store NFO segment instruments (F&O)
-                if (segment.contains("NFO") && lotSize > 0) {
-                    // Store with base symbol (e.g., "RELIANCE26AUG1200CE" → extract "RELIANCE")
-                    String baseSymbol = extractBaseSymbol(symbol);
-                    if (baseSymbol != null) {
-                        lotSizeCache.put(baseSymbol, lotSize);
-                        count++;
+                    // Only store NFO segment instruments (F&O)
+                    if (segment.contains("NFO") && lotSize > 0) {
+                        String baseSymbol = extractBaseSymbol(symbol);
+                        if (baseSymbol != null) {
+                            lotSizeCache.put(baseSymbol, lotSize);
+                            count++;
+                        }
                     }
                 }
-            }
 
-            loaded = true;
-            log.info("Loaded {} F&O lot sizes from Kite instruments", lotSizeCache.size());
+                loaded = true;
+                log.info("Loaded {} F&O lot sizes from Kite instruments", lotSizeCache.size());
+            })
+            .then()
+            .onErrorResume(e -> {
+                log.warn("Failed to load lot sizes from Kite: {}", e.getMessage());
+                loaded = true;
+                return Mono.empty();
+            });
+    }
 
+    /**
+     * Loads all NFO instrument lot sizes from Kite API synchronously on a background thread if needed.
+     */
+    public void loadLotSizes() {
+        try {
+            loadLotSizesAsync()
+                .subscribeOn(Schedulers.boundedElastic())
+                .block(Duration.ofSeconds(5));
         } catch (Exception e) {
-            log.warn("Failed to load lot sizes from Kite: {}", e.getMessage());
+            log.warn("Failed to load lot sizes synchronously: {}", e.getMessage());
+            loaded = true;
         }
     }
 

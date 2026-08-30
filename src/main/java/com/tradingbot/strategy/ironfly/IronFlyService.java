@@ -467,8 +467,57 @@ public class IronFlyService {
                         // Persist adjustment and update status
                         Long dbId = positionDbIds.get(key);
                         if (dbId != null && pos != null) {
+                            OptionLeg newShortCall = pos.shortCall();
+                            OptionLeg newLongCallHedge = pos.longCallHedge();
+                            OptionLeg newShortPut = pos.shortPut();
+                            OptionLeg newLongPutHedge = pos.longPutHedge();
+
+                            if (adjSide == AdjustmentSide.CALL) {
+                                newShortCall = new OptionLeg(
+                                    underlying + "_" + selection.newShortStrike() + "CE",
+                                    selection.newShortStrike(),
+                                    OptionType.CE,
+                                    true,
+                                    selection.shortPremium(),
+                                    selection.shortPremium(),
+                                    0.25,
+                                    lotSize
+                                );
+                                newLongCallHedge = new OptionLeg(
+                                    underlying + "_" + selection.newLongStrike() + "CE",
+                                    selection.newLongStrike(),
+                                    OptionType.CE,
+                                    false,
+                                    selection.hedgePremium(),
+                                    selection.hedgePremium(),
+                                    0.10,
+                                    lotSize
+                                );
+                            } else {
+                                newShortPut = new OptionLeg(
+                                    underlying + "_" + selection.newShortStrike() + "PE",
+                                    selection.newShortStrike(),
+                                    OptionType.PE,
+                                    true,
+                                    selection.shortPremium(),
+                                    selection.shortPremium(),
+                                    -0.25,
+                                    lotSize
+                                );
+                                newLongPutHedge = new OptionLeg(
+                                    underlying + "_" + selection.newLongStrike() + "PE",
+                                    selection.newLongStrike(),
+                                    OptionType.PE,
+                                    false,
+                                    selection.hedgePremium(),
+                                    selection.hedgePremium(),
+                                    -0.10,
+                                    lotSize
+                                );
+                            }
+
                             IronFlyPosition adjustedPos = new IronFlyPosition(
-                                pos.underlying(), pos.shortCall(), pos.shortPut(), pos.longCallHedge(), pos.longPutHedge(),
+                                pos.underlying(), newShortCall, newShortPut, newLongCallHedge, newLongPutHedge,
                                 pos.entrySpotPrice(), pos.netCredit().add(selection.creditDelta()), pos.originalCredit(),
                                 pos.totalLotSize(), IronFlyStatus.ADJUSTED, pos.createdAt(), pos.closedAt(), pos.adjustmentHistory()
                             );

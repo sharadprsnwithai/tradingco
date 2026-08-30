@@ -22,8 +22,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import reactor.core.scheduler.Schedulers;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
@@ -31,9 +33,12 @@ import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -104,7 +109,7 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         @Value("${st-intraday.rsi.lower-threshold:45.0}") double rsiLowerThreshold,
         @Value("${st-intraday.option-selection.target-delta:0.20}") double targetDelta,
         @Value("${st-intraday.option-selection.min-premium:70.0}") double minPremium,
-        @Value("${st-intraday.risk.stop-loss-pct:60.0}") double stopLossPct,
+        @Value("${st-intraday.risk.stop-loss-pct:30.0}") double stopLossPct,
         @Value("${st-intraday.risk.profit-target-pct:50.0}") double profitTargetPct,
         @Value("${st-intraday.lots:1}") int lots,
         @Value("${st-intraday.eod-exit-time:15:00}") String eodExitTime,
@@ -184,7 +189,7 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         this.rsiLowerThreshold = 45.0;
         this.targetDelta = 0.20;
         this.minPremium = 70.0;
-        this.stopLossPct = 60.0;
+        this.stopLossPct = 30.0;
         this.profitTargetPct = 50.0;
         this.lots = 1;
         this.eodExitTime = "15:00";
@@ -243,16 +248,26 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
 
             // In backtest mode, simulate option price movement based on underlying
             if (!isLiveMode() && daily.lastTickPrice > 0 && daily.tradeDirection != null) {
-                double tickPrice = tick.ltp().doubleValue();
-                double priceChange = tickPrice - daily.lastTickPrice;
-                if (daily.tradeDirection == Direction.BULLISH) {
-                    // Selling PE: underlying up = PE premium down (profit)
-                    daily.currentPremium = Math.max(0.1, daily.currentPremium - priceChange * 0.3);
-                } else if (daily.tradeDirection == Direction.BEARISH) {
-                    // Selling CE: underlying down = CE premium down (profit)
-                    daily.currentPremium = Math.max(0.1, daily.currentPremium + priceChange * 0.3);
+                double spotPrice = tick.ltp().doubleValue();
+                double tte = calculateTimeToExpiryYears(null);
+                double strike = daily.selectedStrike > 0 ? daily.selectedStrike
+                    : (daily.tradeDirection == Direction.BULLISH ? daily.entrySpot * 0.985 : daily.entrySpot * 1.015);
+
+                double modelPrice = daily.tradeDirection == Direction.BULLISH
+                    ? BlackScholesPricer.putPrice(spotPrice, strike, tte, 0.07, 0.14)
+                    : BlackScholesPricer.callPrice(spotPrice, strike, tte, 0.07, 0.14);
+
+                if (!Double.isNaN(modelPrice) && modelPrice > 0) {
+                    daily.currentPremium = Math.max(0.5, modelPrice);
+                } else {
+                    double priceChange = spotPrice - daily.lastTickPrice;
+                    if (daily.tradeDirection == Direction.BULLISH) {
+                        daily.currentPremium = Math.max(0.5, daily.currentPremium - priceChange * 0.20);
+                    } else {
+                        daily.currentPremium = Math.max(0.5, daily.currentPremium + priceChange * 0.20);
+                    }
                 }
-                daily.lastTickPrice = tickPrice;
+                daily.lastTickPrice = spotPrice;
             }
 
             if (daily.position == Position.IN_TRADE) {
@@ -289,9 +304,16 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         // Process 15m candles for SuperTrend and entry/exit evaluation
         if (!TIMEFRAME_15M.equals(candle.timeframe())) return;
 
-        // In live mode, scan for entries on 15m candles starting from 09:30 AM IST
-        if (isLiveMode() && candleTime.toLocalTime().isBefore(java.time.LocalTime.of(9, 30))) {
+        // Scan for entries on 15m candles starting from 09:30 AM IST (after first 15m candle closes)
+        if (candleTime.toLocalTime().isBefore(java.time.LocalTime.of(9, 30))) {
             return;
+        }
+
+        // Lock entry for the day after 14:45 IST
+        if (!candleTime.toLocalTime().isBefore(java.time.LocalTime.of(14, 45))) {
+            synchronized (daily) {
+                daily.entryLocked = true;
+            }
         }
 
         synchronized (daily) {
@@ -392,16 +414,11 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             closes15m[i] = c.close().doubleValue();
         }
 
-        // Get 1h candles for RSI (fallback to resampling 15m closes if 1h buffer is cold)
+        // Get 1h candles for RSI (fallback to session-aware resampling of 15m closes if 1h buffer is cold)
         double[] closes1h = context.getClosePrices(underlyingSymbol, TIMEFRAME_1H);
         if (closes1h == null || closes1h.length < rsiPeriod + 2) {
-            if (closes15m.length >= (rsiPeriod + 2) * 4) {
-                int resampledLen = closes15m.length / 4;
-                closes1h = new double[resampledLen];
-                for (int j = 0; j < resampledLen; j++) {
-                    closes1h[j] = closes15m[(j + 1) * 4 - 1];
-                }
-            } else {
+            closes1h = resample15mTo1h(candles15m);
+            if (closes1h.length < rsiPeriod + 2) {
                 return;
             }
         }
@@ -464,16 +481,24 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         if (isLiveMode()) {
             enterLiveTrade(direction, close15m, candle.timestamp());
         } else {
-            // Backtest mode: use underlying price as proxy for option premium
-            // In real trading, this would be the actual option premium
-            double estimatedPremium = close15m * 0.02; // ~2% of spot as rough OTM premium estimate
+            // ATM Strike Selection (rounded to nearest 50 of spot price)
+            double selectedStrike = Math.round(close15m / 50.0) * 50.0;
+            double tte = calculateTimeToExpiryYears(null);
+            double calculatedPremium = direction == Direction.BULLISH
+                ? BlackScholesPricer.putPrice(close15m, selectedStrike, tte, 0.07, 0.14)
+                : BlackScholesPricer.callPrice(close15m, selectedStrike, tte, 0.07, 0.14);
+
+            double estimatedPremium = (calculatedPremium >= 50.0 && !Double.isNaN(calculatedPremium)) ? calculatedPremium : 140.0;
+
+            daily.selectedStrike = selectedStrike;
+            daily.entrySpot = close15m;
             daily.entryPremium = estimatedPremium;
             daily.slPrice = estimatedPremium * (1.0 + stopLossPct / 100.0);
             daily.tradeDirection = direction;
             daily.position = Position.IN_TRADE;
             daily.entriesToday++;
-            daily.positionQty = lotSizeService != null ? lotSizeService.getOrderQuantity("NIFTY") : 25 * lots;
-            daily.entryTime = candle.timestamp();
+            daily.positionQty = lotSizeService != null ? lotSizeService.getOrderQuantity("NIFTY", this.lots) : 65 * this.lots;
+            daily.entryTime = candle.timestamp().plusSeconds(900);
             daily.activeShortSymbol = symbol + "_" + direction;
             daily.currentPremium = estimatedPremium;
             daily.lastTickPrice = close15m;
@@ -494,9 +519,32 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
                 .build();
             context.emitSignal(entrySignal);
 
-            log.info("[{}] BACKTEST ENTRY: {} @ ₹{} (est) | SL: ₹{} | Direction: {}",
-                strategyId, symbol, estimatedPremium, daily.slPrice, direction);
+            log.info("[{}] BACKTEST ENTRY (ATM): {} {} @ ₹{} (strike {}) | SL: ₹{} | Direction: {} | Qty: {}",
+                strategyId, symbol, optionType, estimatedPremium, selectedStrike, daily.slPrice, direction, daily.positionQty);
         }
+    }
+
+    /**
+     * Resamples a list of 15m candles into 1h closes, respecting NSE daily session boundaries
+     * (09:15–15:30 IST) to prevent cross-day phase drift in multi-day buffers.
+     */
+    private double[] resample15mTo1h(List<Candle> candles15m) {
+        if (candles15m == null || candles15m.isEmpty()) return new double[0];
+        List<Double> resampled = new ArrayList<>();
+        Map<LocalDate, List<Candle>> byDay = new LinkedHashMap<>();
+        for (Candle c : candles15m) {
+            LocalDate d = c.timestamp().atZone(IST_ZONE).toLocalDate();
+            byDay.computeIfAbsent(d, k -> new ArrayList<>()).add(c);
+        }
+        for (List<Candle> dayCandles : byDay.values()) {
+            for (int i = 3; i < dayCandles.size(); i += 4) {
+                resampled.add(dayCandles.get(i).close().doubleValue());
+            }
+            if (!dayCandles.isEmpty() && (dayCandles.size() % 4 != 0)) {
+                resampled.add(dayCandles.get(dayCandles.size() - 1).close().doubleValue());
+            }
+        }
+        return resampled.stream().mapToDouble(Double::doubleValue).toArray();
     }
 
     /**
@@ -708,12 +756,15 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         try {
             List<String> expiries = instrumentMaster.findUpcomingExpiries("NIFTY", optionType, 3)
                 .collectList()
-                .block();
+                .subscribeOn(Schedulers.boundedElastic())
+                .block(Duration.ofSeconds(3));
             log.info("[{}] selectOptionForTrading: kitePcrProvider={}, expiries={}", strategyId,
                 kitePcrProvider != null, expiries);
 
             if (expiries == null || expiries.isEmpty()) {
-                var nearestOpt = instrumentMaster.findNearestExpiring("NIFTY", optionType).blockOptional();
+                var nearestOpt = instrumentMaster.findNearestExpiring("NIFTY", optionType)
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .blockOptional(Duration.ofSeconds(3));
                 if (nearestOpt.isPresent() && nearestOpt.get().expiry() != null) {
                     expiries = List.of(nearestOpt.get().expiry());
                 } else {
@@ -834,7 +885,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             double spotPrice, String optionType, double targetDelta) {
         if (instrumentMaster == null) return Optional.empty();
         try {
-            var nearestOpt = instrumentMaster.findNearestExpiring("NIFTY", optionType).blockOptional();
+            var nearestOpt = instrumentMaster.findNearestExpiring("NIFTY", optionType)
+                .subscribeOn(Schedulers.boundedElastic())
+                .blockOptional(Duration.ofSeconds(3));
             if (nearestOpt.isEmpty()) return Optional.empty();
             return findOtmOptionForExpiry(spotPrice, optionType, targetDelta, nearestOpt.get().expiry());
         } catch (Exception e) {
@@ -850,7 +903,8 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         try {
             List<Instrument> options = instrumentMaster.findOptionContracts("NIFTY", expiry, null, optionType)
                 .collectList()
-                .block();
+                .subscribeOn(Schedulers.boundedElastic())
+                .block(Duration.ofSeconds(3));
 
             if (options == null || options.isEmpty()) {
                 return Optional.empty();
@@ -899,6 +953,23 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
     // ========== Exit Logic ==========
 
     private void checkCandleExits(Candle candle) {
+        Instant now = candle.timestamp() != null ? candle.timestamp() : Instant.now();
+        double currentPremium = isLiveMode()
+            ? (daily.lastPremiumLtp > 0 ? daily.lastPremiumLtp : daily.entryPremium)
+            : daily.currentPremium;
+
+        // Check if trade has moved into profit (premium dropped by at least 1 point)
+        if (currentPremium < daily.entryPremium - 1.0) {
+            daily.movedInProfit = true;
+        }
+
+        // Breakeven SL if entry price is touched again after 10 mins (and trade had moved into profit)
+        long minutesSinceEntry = daily.entryTime != null ? Duration.between(daily.entryTime, now).toMinutes() : 0;
+        if (minutesSinceEntry >= 10 && daily.movedInProfit && currentPremium >= daily.entryPremium) {
+            exitTrade(daily.entryPremium, "ENTRY_PRICE_TOUCH_EXIT", now);
+            return;
+        }
+
         // 1. Cut position immediately if 15m SuperTrend flips against active trade
         if (context != null && daily.tradeDirection != null) {
             List<Candle> candles15m = context.getHistoricalCandles(underlyingSymbol, TIMEFRAME_15M, 100);
@@ -916,15 +987,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
                 double lastSt = st[st.length - 1];
                 if (!Double.isNaN(lastSt)) {
                     if (daily.tradeDirection == Direction.BULLISH && lastSt < 0) {
-                        double currentPremium = isLiveMode()
-                            ? (daily.lastPremiumLtp > 0 ? daily.lastPremiumLtp : daily.entryPremium)
-                            : daily.currentPremium;
                         exitTrade(currentPremium, "SUPERTREND_FLIP_EXIT", candle.timestamp());
                         return;
                     } else if (daily.tradeDirection == Direction.BEARISH && lastSt > 0) {
-                        double currentPremium = isLiveMode()
-                            ? (daily.lastPremiumLtp > 0 ? daily.lastPremiumLtp : daily.entryPremium)
-                            : daily.currentPremium;
                         exitTrade(currentPremium, "SUPERTREND_FLIP_EXIT", candle.timestamp());
                         return;
                     }
@@ -934,9 +999,6 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
 
         // 2. Check EOD exit
         if (isEodTime()) {
-            double currentPremium = isLiveMode()
-                ? (daily.lastPremiumLtp > 0 ? daily.lastPremiumLtp : daily.entryPremium)
-                : daily.currentPremium;
             exitTrade(currentPremium, "EOD_EXIT", candle.timestamp());
         }
     }
@@ -946,6 +1008,18 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         double currentPremium = isLiveMode()
             ? (daily.lastPremiumLtp > 0 ? daily.lastPremiumLtp : daily.entryPremium)
             : daily.currentPremium;
+
+        // Check if trade has moved into profit (premium dropped by at least 1 point)
+        if (currentPremium < daily.entryPremium - 1.0) {
+            daily.movedInProfit = true;
+        }
+
+        // Breakeven SL if entry price is touched again after 10 mins (and trade had moved into profit)
+        long minutesSinceEntry = daily.entryTime != null ? Duration.between(daily.entryTime, now).toMinutes() : 0;
+        if (minutesSinceEntry >= 10 && daily.movedInProfit && currentPremium >= daily.entryPremium) {
+            exitTrade(daily.entryPremium, "ENTRY_PRICE_TOUCH_EXIT", now);
+            return;
+        }
 
         // Check stop loss
         if (currentPremium >= daily.slPrice) {
@@ -1040,6 +1114,8 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             daily.position = Position.IN_TRADE;
             daily.candlesSinceEntry = 0;
             daily.entriesToday++;
+            daily.entryTime = candle.timestamp().plusSeconds(900);
+            daily.movedInProfit = false;
 
             // Emit re-entry signal
             String optionType = daily.tradeDirection == Direction.BULLISH ? "PE" : "CE";
@@ -1135,12 +1211,15 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             daily.entryPremium, pnl, reason);
 
         // Set re-entry state if stopped out
-        if ("SL_HIT".equals(reason)) {
+        if ("SL_HIT".equals(reason) || "ENTRY_PRICE_TOUCH_EXIT".equals(reason)) {
             daily.position = Position.WAIT_FOR_REENTRY;
             daily.candlesSinceExit = 0;
-            log.info("[{}] Entering WAIT_FOR_REENTRY state, cooldown: {} candles",
-                strategyId, reEntryCooldownCandles);
+            log.info("[{}] Entering WAIT_FOR_REENTRY state after {}, cooldown: {} candles",
+                strategyId, reason, reEntryCooldownCandles);
         } else {
+            if (reason != null && reason.contains("EOD")) {
+                daily.entryLocked = true;
+            }
             daily.exitTrade();
         }
     }
@@ -1184,6 +1263,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
         // Backtest mode tracking
         volatile double lastTickPrice = 0;
         volatile double currentPremium = 0;
+        volatile double selectedStrike = 0;
+        volatile double entrySpot = 0;
+        volatile boolean movedInProfit = false;
 
         void exitTrade() {
             position = Position.FLAT;
@@ -1200,6 +1282,9 @@ public class IntradayTrendMomentumOptionSellingStrategy implements Strategy {
             hedgePremium = 0;
             lastTickPrice = 0;
             currentPremium = 0;
+            selectedStrike = 0;
+            entrySpot = 0;
+            movedInProfit = false;
         }
 
         void reset() {

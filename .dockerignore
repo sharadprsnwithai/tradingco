@@ -1,0 +1,16 @@
+.git
+.gradle
+build
+.idea
+.pi
+.ruff_cache
+logs
+data
+graphify-out
+docs
+scripts
+.env
+.env.example
+test_output.txt
+*.md
+*.pdf

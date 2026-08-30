@@ -16,12 +16,14 @@ import com.tradingbot.model.enums.OrderStatus;
 import com.tradingbot.model.enums.OrderType;
 import com.tradingbot.model.enums.ProductType;
 import com.tradingbot.model.enums.TransactionType;
+import com.tradingbot.resilience.BrokerBulkheadManager;
 import com.zerodhatech.kiteconnect.kitehttp.exceptions.KiteException;
 import com.zerodhatech.ticker.KiteTicker;
 import com.zerodhatech.ticker.OnError;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
@@ -54,6 +56,7 @@ public class KiteBrokerAdapter implements BrokerAdapter {
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
     private final InstrumentMasterService instrumentMaster;
+    private final BrokerBulkheadManager bulkheadManager;
 
     // --- Live WebSocket (KiteTicker) state ---
     private final Sinks.Many<Tick> tickSink = Sinks.many().multicast().onBackpressureBuffer();
@@ -75,11 +78,20 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      * @param objectMapper      the Jackson ObjectMapper for JSON parsing
      * @param instrumentMaster  the instrument master for symbol ↔ token resolution
      */
-    public KiteBrokerAdapter(KiteConfig config, KiteAuthenticator authenticator, WebClient.Builder webClientBuilder, ObjectMapper objectMapper, InstrumentMasterService instrumentMaster) {
+    @Autowired
+    public KiteBrokerAdapter(
+        KiteConfig config,
+        KiteAuthenticator authenticator,
+        WebClient.Builder webClientBuilder,
+        ObjectMapper objectMapper,
+        InstrumentMasterService instrumentMaster,
+        @Autowired(required = false) BrokerBulkheadManager bulkheadManager
+    ) {
         this.config = config;
         this.authenticator = authenticator;
         this.objectMapper = objectMapper;
         this.instrumentMaster = instrumentMaster;
+        this.bulkheadManager = bulkheadManager;
         this.webClient = webClientBuilder
             .baseUrl(config.getBaseUrl())
             .defaultHeader("X-Kite-Version", "3")
@@ -87,6 +99,16 @@ public class KiteBrokerAdapter implements BrokerAdapter {
         // Re-key the live WebSocket whenever a fresh access token is minted (e.g. after
         // daily expiry), otherwise SDK auto-reconnect keeps using the stale token → 403.
         authenticator.setTokenRenewedListener(this::rekeyTickerOnTokenRenewal);
+    }
+
+    public KiteBrokerAdapter(
+        KiteConfig config,
+        KiteAuthenticator authenticator,
+        WebClient.Builder webClientBuilder,
+        ObjectMapper objectMapper,
+        InstrumentMasterService instrumentMaster
+    ) {
+        this(config, authenticator, webClientBuilder, objectMapper, instrumentMaster, null);
     }
 
     /**
@@ -267,14 +289,9 @@ public class KiteBrokerAdapter implements BrokerAdapter {
             .onErrorResume(ex -> {
                 if (isTokenError(ex)) return Mono.error(ex); // propagate so withTokenRetry re-authenticates
                 log.error("Failed to cancel Kite order {}: {}", orderId, ex.getMessage());
-                return Mono.empty();
+                return Mono.error(new RuntimeException("Kite cancelOrder failed for " + orderId + ": " + ex.getMessage(), ex));
             })
-        )
-        // Token retry also failed: fail gracefully, never throw
-        .onErrorResume(ex -> {
-            log.error("Failed to cancel Kite order {} after token retry: {}", orderId, ex.getMessage());
-            return Mono.empty();
-        });
+        );
     }
 
     /**
@@ -702,13 +719,14 @@ public class KiteBrokerAdapter implements BrokerAdapter {
      * @return a reactive Mono containing the API response
      */
     private <T> Mono<T> withTokenRetry(java.util.function.Function<String, Mono<T>> apiCall) {
-        return authenticator.getAccessToken()
+        Mono<T> op = authenticator.getAccessToken()
             .flatMap(apiCall)
             .onErrorResume(KiteBrokerAdapter::isTokenError, ex -> {
                 log.warn("Kite rejected access token (401/403) - re-authenticating and retrying once");
                 authenticator.invalidateToken();
                 return authenticator.getAccessToken().flatMap(apiCall);
             });
+        return bulkheadManager != null ? bulkheadManager.executeKite(op) : op;
     }
 
     /**

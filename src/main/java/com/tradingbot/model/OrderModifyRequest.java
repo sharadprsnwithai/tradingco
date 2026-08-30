@@ -20,5 +20,18 @@ public record OrderModifyRequest(
     int quantity,
     BigDecimal price,
     BigDecimal triggerPrice,
-    OrderType orderType
-) {}
+    OrderType orderType,
+    String symbol,
+    String exchange
+) {
+    public OrderModifyRequest(
+        String orderId,
+        String brokerOrderId,
+        int quantity,
+        BigDecimal price,
+        BigDecimal triggerPrice,
+        OrderType orderType
+    ) {
+        this(orderId, brokerOrderId, quantity, price, triggerPrice, orderType, null, "NFO");
+    }
+}

@@ -7,6 +7,7 @@ import com.tradingbot.strategy.impl.NiftyVwapMomentumReversalStrategy;
 import org.apache.commons.codec.digest.DigestUtils;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.FileReader;
 import java.io.InputStreamReader;
 import java.math.BigDecimal;
@@ -25,6 +26,7 @@ import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
@@ -53,46 +55,54 @@ public class VwapBacktestRunner {
 
     public static void main(String[] args) throws Exception {
         loadEnv();
+        int daysBack = args.length > 0 ? Integer.parseInt(args[0]) : 30;
+
         System.out.println("=".repeat(80));
-        System.out.println("  NIFTY VWAP MOMENTUM REVERSAL - BACKTEST WITH REAL KITE DATA");
+        System.out.printf("  NIFTY VWAP MOMENTUM REVERSAL - BACKTEST (LAST %d DAYS)%n", daysBack);
         System.out.println("=".repeat(80));
 
-        // Step 1: Authenticate with Kite
-        System.out.println("\n[1/5] Authenticating with Kite Connect...");
-        CookieManager cookieManager = new CookieManager(null, CookiePolicy.ACCEPT_ALL);
-        java.net.CookieHandler.setDefault(cookieManager);
+        List<Candle> allCandles = new ArrayList<>();
 
-        String accessToken = executeKiteHeadlessLogin();
-        System.out.println("  -> Kite authentication successful");
+        // Try Kite API first if configured
+        try {
+            System.out.println("\n[1/4] Attempting authentication with Kite Connect...");
+            CookieManager cookieManager = new CookieManager(null, CookiePolicy.ACCEPT_ALL);
+            java.net.CookieHandler.setDefault(cookieManager);
 
-        // Step 2: Discover Nifty Futures instrument token
-        System.out.println("\n[2/5] Discovering Nifty Futures instrument token...");
-        String niftyToken = searchNiftyFuturesToken(accessToken);
-        if (niftyToken == null) {
-            System.err.println("ERROR: Could not find Nifty Futures instrument token.");
-            return;
+            String accessToken = executeKiteHeadlessLogin();
+            System.out.println("  -> Kite authentication successful");
+
+            System.out.println("\n[2/4] Discovering Nifty Futures instrument token...");
+            String niftyToken = searchNiftyFuturesToken(accessToken);
+            if (niftyToken != null) {
+                System.out.printf("  -> Nifty Futures token: %s%n", niftyToken);
+                LocalDate toDate = LocalDate.now(IST);
+                LocalDate fromDate = toDate.minusDays(daysBack);
+                allCandles = fetchKiteHistoricalCandles(accessToken, niftyToken, "5minute", fromDate, toDate, "NIFTY_FUT");
+            }
+        } catch (Exception e) {
+            System.out.printf("  -> Kite Connect live fetch unavailable (%s). Falling back to local data.%n", e.getMessage());
         }
-        System.out.printf("  -> Nifty Futures token: %s%n", niftyToken);
 
-        // Step 3: Fetch 3 months of 5m historical candles
-        System.out.println("\n[3/5] Fetching 3-month historical 5m candles from Kite...");
-        LocalDate toDate = LocalDate.now(IST);
-        LocalDate fromDate = toDate.minusDays(90);
-
-        List<Candle> allCandles = fetchKiteHistoricalCandles(accessToken, niftyToken, "5minute", fromDate, toDate, "NIFTY_FUT");
+        // Fallback to local historical data file if Kite fetch yielded no candles
         if (allCandles.isEmpty()) {
-            System.err.println("ERROR: No historical data fetched. Cannot run backtest.");
+            System.out.println("\n[2/4] Loading real Nifty 5m data from data/nifty_5m_6months.json...");
+            allCandles = loadCandlesFromJson("data/nifty_5m_6months.json", daysBack);
+        }
+
+        if (allCandles.isEmpty()) {
+            System.err.println("ERROR: No historical data available for backtesting.");
             return;
         }
 
         LocalDateTime first = LocalDateTime.ofInstant(allCandles.get(0).timestamp(), IST);
         LocalDateTime last = LocalDateTime.ofInstant(allCandles.get(allCandles.size() - 1).timestamp(), IST);
-        System.out.printf("  -> Nifty Futures: %d candles (%s to %s)%n", allCandles.size(),
+        System.out.printf("  -> Dataset: %d candles (%s to %s)%n", allCandles.size(),
             first.format(DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm")),
             last.format(DateTimeFormatter.ofPattern("dd-MM-yyyy HH:mm")));
 
-        // Step 4: Split into trading days and run backtest
-        System.out.println("\n[4/5] Running backtests...");
+        // Split into trading days and run backtest
+        System.out.println("\n[3/4] Running backtests...");
         Map<LocalDate, List<Candle>> candlesByDay = splitIntoTradingDays(allCandles);
         System.out.printf("  -> %d trading days found%n", candlesByDay.size());
 
@@ -135,7 +145,7 @@ public class VwapBacktestRunner {
 
         // Summary
         System.out.println("\n" + "=".repeat(80));
-        System.out.println("  BACKTEST SUMMARY");
+        System.out.println("  BACKTEST SUMMARY (1 MONTH)");
         System.out.println("=".repeat(80));
         System.out.printf("  Period:            %s to %s%n",
             candlesByDay.keySet().stream().min(LocalDate::compareTo).get(),
@@ -149,6 +159,53 @@ public class VwapBacktestRunner {
         System.out.printf("  Avg P&L/Day:       ₹%.2f%n", candlesByDay.isEmpty() ? 0 : totalPnl.doubleValue() / candlesByDay.size());
         System.out.printf("  Avg P&L/Trade:     ₹%.2f%n", totalTrades > 0 ? totalPnl.doubleValue() / totalTrades : 0);
         System.out.println("=".repeat(80));
+    }
+
+    private static List<Candle> loadCandlesFromJson(String filePath, int daysBack) {
+        File f = new File(filePath);
+        if (!f.exists()) {
+            System.err.println("File not found: " + filePath);
+            return List.of();
+        }
+        try {
+            JsonNode root = mapper.readTree(f);
+            List<Candle> list = new ArrayList<>();
+            DateTimeFormatter fmt = DateTimeFormatter.ISO_OFFSET_DATE_TIME;
+            for (JsonNode row : root) {
+                if (row.isArray() && row.size() >= 6) {
+                    String timeStr = row.get(0).asText();
+                    Instant ts = ZonedDateTime.parse(timeStr, fmt).toInstant();
+                    BigDecimal open = BigDecimal.valueOf(row.get(1).asDouble());
+                    BigDecimal high = BigDecimal.valueOf(row.get(2).asDouble());
+                    BigDecimal low = BigDecimal.valueOf(row.get(3).asDouble());
+                    BigDecimal close = BigDecimal.valueOf(row.get(4).asDouble());
+                    long volume = row.get(5).asLong();
+                    list.add(new Candle(
+                        "NIFTY_FUT",
+                        "5",
+                        ts,
+                        open,
+                        high,
+                        low,
+                        close,
+                        volume
+                    ));
+                }
+            }
+            if (list.isEmpty()) return list;
+
+            LocalDate maxDate = list.stream()
+                .map(c -> c.timestamp().atZone(IST).toLocalDate())
+                .max(LocalDate::compareTo).orElse(LocalDate.now(IST));
+            LocalDate cutoff = maxDate.minusDays(daysBack);
+
+            return list.stream()
+                .filter(c -> !c.timestamp().atZone(IST).toLocalDate().isBefore(cutoff))
+                .toList();
+        } catch (Exception e) {
+            System.err.println("Error reading JSON candles: " + e.getMessage());
+            return List.of();
+        }
     }
 
     // ========== Snapshot & PCR Simulation ==========

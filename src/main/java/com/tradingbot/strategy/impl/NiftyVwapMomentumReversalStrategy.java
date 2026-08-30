@@ -19,6 +19,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import reactor.core.scheduler.Schedulers;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
@@ -495,7 +496,9 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     private void enterLiveTrade(Direction dir, double futuresClose, Instant time) {
         String optionType = dir == Direction.LONG ? "CE" : "PE";
         try {
-            var opt = instrumentMaster.findNearestAtmOption("NIFTY", getSpotPrice(futuresClose), optionType).blockOptional();
+            var opt = instrumentMaster.findNearestAtmOption("NIFTY", getSpotPrice(futuresClose), optionType)
+                .subscribeOn(Schedulers.boundedElastic())
+                .blockOptional(java.time.Duration.ofSeconds(3));
             if (opt.isEmpty()) {
                 log.warn("[{}] No ATM {} option found near futures price {} - entry skipped", strategyId, optionType, futuresClose);
                 return;

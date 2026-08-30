@@ -671,8 +671,8 @@ public class LowestVolumeReversalStrategy implements Strategy {
                     if (partialQty > 0) {
                         state.partialExitBooked = true;
                         state.remainingQuantity -= partialQty;
-                        // Move SL to breakeven after partial exit
-                        state.trailingStopLoss = state.entryPrice;
+                        // Move SL to at least breakeven after partial exit (never demote if already higher)
+                        state.trailingStopLoss = state.trailingStopLoss != null ? state.trailingStopLoss.max(state.entryPrice) : state.entryPrice;
                         context.emitSignal(Signal.builder()
                             .strategyId(strategyId)
                             .targetAccountId(assignedAccountId)
@@ -707,8 +707,8 @@ public class LowestVolumeReversalStrategy implements Strategy {
                     if (partialQty > 0) {
                         state.partialExitBooked = true;
                         state.remainingQuantity -= partialQty;
-                        // Move SL to breakeven after partial exit
-                        state.trailingStopLoss = state.entryPrice;
+                        // Move SL to at least breakeven after partial exit (never demote if already lower)
+                        state.trailingStopLoss = state.trailingStopLoss != null ? state.trailingStopLoss.min(state.entryPrice) : state.entryPrice;
                         context.emitSignal(Signal.builder()
                             .strategyId(strategyId)
                             .targetAccountId(assignedAccountId)

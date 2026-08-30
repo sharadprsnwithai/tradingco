@@ -131,6 +131,7 @@ public class PositionManagerService {
             Position newPos = Position.builder()
                 .accountId(order.accountId())
                 .brokerId(order.brokerId())
+                .strategyId(order.strategyId())
                 .symbol(order.symbol())
                 .exchange(order.exchange())
                 .instrumentToken(order.instrumentToken())
@@ -149,7 +150,7 @@ public class PositionManagerService {
                 .build();
 
             targetBook.put(key, newPos);
-            dbService.savePosition(newPos).subscribe();
+            dbService.savePosition(newPos).subscribe(null, err -> log.error("Failed to save new position: {}", err.getMessage()));
             log.info("Opened new {} position: {} x {} @ {}", order.bookType(), order.symbol(), netQty, price);
         } else {
             // Update existing position
@@ -169,22 +170,34 @@ public class PositionManagerService {
             }
 
             BigDecimal buyAvg = current.buyAveragePrice();
-            if (order.transactionType() == TransactionType.BUY && prevNet >= 0) {
-                BigDecimal totalBuyCost = (current.buyAveragePrice().multiply(BigDecimal.valueOf(current.buyQuantity())))
-                    .add(price.multiply(BigDecimal.valueOf(fillQty)));
-                buyAvg = buyQty > 0 ? totalBuyCost.divide(BigDecimal.valueOf(buyQty), 2, RoundingMode.HALF_UP) : price;
+            if (order.transactionType() == TransactionType.BUY) {
+                if (prevNet >= 0) {
+                    BigDecimal totalBuyCost = (current.buyAveragePrice().multiply(BigDecimal.valueOf(current.buyQuantity())))
+                        .add(price.multiply(BigDecimal.valueOf(fillQty)));
+                    buyAvg = buyQty > 0 ? totalBuyCost.divide(BigDecimal.valueOf(buyQty), 2, RoundingMode.HALF_UP) : price;
+                } else if (newNet > 0) {
+                    // Position flipped from SHORT to LONG: cost basis of remaining long quantity is the execution price
+                    buyAvg = price;
+                }
             }
 
             BigDecimal sellAvg = current.sellAveragePrice();
-            if (order.transactionType() == TransactionType.SELL && prevNet <= 0) {
-                BigDecimal totalSellCost = (current.sellAveragePrice().multiply(BigDecimal.valueOf(current.sellQuantity())))
-                    .add(price.multiply(BigDecimal.valueOf(fillQty)));
-                sellAvg = sellQty > 0 ? totalSellCost.divide(BigDecimal.valueOf(sellQty), 2, RoundingMode.HALF_UP) : price;
+            if (order.transactionType() == TransactionType.SELL) {
+                if (prevNet <= 0) {
+                    BigDecimal totalSellCost = (current.sellAveragePrice().multiply(BigDecimal.valueOf(current.sellQuantity())))
+                        .add(price.multiply(BigDecimal.valueOf(fillQty)));
+                    sellAvg = sellQty > 0 ? totalSellCost.divide(BigDecimal.valueOf(sellQty), 2, RoundingMode.HALF_UP) : price;
+                } else if (newNet < 0) {
+                    // Position flipped from LONG to SHORT: cost basis of remaining short quantity is the execution price
+                    sellAvg = price;
+                }
             }
 
+            String stratId = order.strategyId() != null ? order.strategyId() : current.strategyId();
             Position updated = Position.builder()
                 .accountId(current.accountId())
                 .brokerId(current.brokerId())
+                .strategyId(stratId)
                 .symbol(current.symbol())
                 .exchange(current.exchange())
                 .instrumentToken(current.instrumentToken())
@@ -203,7 +216,7 @@ public class PositionManagerService {
                 .build();
 
             targetBook.put(key, updated);
-            dbService.savePosition(updated).subscribe();
+            dbService.savePosition(updated).subscribe(null, err -> log.error("Failed to save updated position: {}", err.getMessage()));
             log.info("Updated {} position: {} netQty={} (realized P&L: ₹{})",
                 current.bookType(), current.symbol(), newNet, realized);
         }
@@ -296,7 +309,7 @@ public class PositionManagerService {
                     .signalType(sigType)
                     .quantity(qty)
                     .price(pos.ltp())
-                    .orderType(OrderType.LIMIT)
+                    .orderType(OrderType.MARKET)
                     .productType(pos.productType())
                     .bookType(BookType.INTRADAY)
                     .tag("EOD_15:14_AUTO_SQUARE_OFF")
@@ -366,6 +379,57 @@ public class PositionManagerService {
         List<Position> all = new ArrayList<>(intradayBook.values());
         all.addAll(positionalBook.values());
         return Collections.unmodifiableList(all);
+    }
+
+    /**
+     * Retrieves all open positions across both intraday and positional books.
+     */
+    public List<Position> getAllOpenPositions() {
+        List<Position> list = new ArrayList<>();
+        intradayBook.values().stream().filter(p -> p.netQuantity() != 0).forEach(list::add);
+        positionalBook.values().stream().filter(p -> p.netQuantity() != 0).forEach(list::add);
+        return Collections.unmodifiableList(list);
+    }
+
+    /**
+     * Retrieves all open positions belonging to a specific strategy.
+     */
+    public List<Position> getOpenPositionsByStrategy(String strategyId) {
+        if (strategyId == null) return List.of();
+        return getAllOpenPositions().stream()
+            .filter(p -> strategyId.equalsIgnoreCase(p.strategyId()))
+            .toList();
+    }
+
+    /**
+     * Calculates the sum of all negative unrealized MTM P&L for a strategy.
+     */
+    public BigDecimal getTotalUnrealizedLossForStrategy(String strategyId) {
+        if (strategyId == null) return BigDecimal.ZERO;
+        BigDecimal totalLoss = BigDecimal.ZERO;
+        for (Position p : getAllOpenPositions()) {
+            if (strategyId.equalsIgnoreCase(p.strategyId())) {
+                BigDecimal unPnl = p.unrealizedPnl();
+                if (unPnl != null && unPnl.compareTo(BigDecimal.ZERO) < 0) {
+                    totalLoss = totalLoss.add(unPnl.abs());
+                }
+            }
+        }
+        return totalLoss;
+    }
+
+    /**
+     * Calculates the global sum of all negative unrealized MTM P&L across all open positions.
+     */
+    public BigDecimal getTotalUnrealizedLossGlobal() {
+        BigDecimal totalLoss = BigDecimal.ZERO;
+        for (Position p : getAllOpenPositions()) {
+            BigDecimal unPnl = p.unrealizedPnl();
+            if (unPnl != null && unPnl.compareTo(BigDecimal.ZERO) < 0) {
+                totalLoss = totalLoss.add(unPnl.abs());
+            }
+        }
+        return totalLoss;
     }
 
     /**
