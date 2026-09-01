@@ -228,6 +228,21 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
             // Update VWAP accumulator
             updateVwap(candle);
 
+            // Late baseline recovery (live mode): if the scheduled 9:30 / 11:00 snapshot
+            // events fired while the feed was stale or dead (history buffer frozen on the
+            // previous trading day), capture them from the first fresh candles after the
+            // feed recovers instead of leaving the bias NEUTRAL (or poisoned by stale
+            // prices) for the rest of the day.
+            if (isLiveMode()) {
+                LocalTime candleIst = candle.timestamp().atZone(IST_ZONE).toLocalTime();
+                if (!daily.snapshot930Done && !candleIst.isBefore(LocalTime.of(9, 30))) {
+                    captureBaseline930();
+                }
+                if (!daily.snapshot1100Done && !candleIst.isBefore(LocalTime.of(11, 0))) {
+                    captureBiasCheck1100();
+                }
+            }
+
             // Check exits first if in trade
             if (daily.position == Position.IN_TRADE) {
                 daily.candlesSinceEntry++;
@@ -837,15 +852,26 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
     // ========== Live Mode: Baseline Capture ==========
 
     /**
-     * Returns the most recent available candle for the underlying (live first, then
-     * historical fallback) so baseline snapshots still compute if the live feed is late.
+     * Returns the most recent FRESH (today's) candle for the underlying (live first, then
+     * historical fallback) so baseline snapshots never capture a stale previous-day close
+     * from a frozen history buffer (which silently poisons the 9:30→11:00 bias decision).
      */
     private Optional<Candle> lastAvailableCandle() {
+        LocalDate today = LocalDate.now(IST_ZONE);
         var last = context.getLastCandle(underlyingSymbol, TIMEFRAME);
-        if (last.isPresent()) return last;
+        if (last.isPresent() && isCandleOnDate(last.get(), today)) return last;
         List<Candle> hist = context.getHistoricalCandles(underlyingSymbol, TIMEFRAME, 1);
-        if (hist != null && !hist.isEmpty()) return Optional.of(hist.get(hist.size() - 1));
+        if (hist != null && !hist.isEmpty()) {
+            Candle c = hist.get(hist.size() - 1);
+            if (isCandleOnDate(c, today)) return Optional.of(c);
+        }
         return Optional.empty();
+    }
+
+    /** True if the candle's timestamp (IST) falls on the given trade date. */
+    private static boolean isCandleOnDate(Candle c, LocalDate date) {
+        return c.timestamp() != null
+            && c.timestamp().atZone(IST_ZONE).toLocalDate().equals(date);
     }
 
     /**
@@ -914,9 +940,20 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
             log.warn("[{}] Baseline recovery skipped — no 5m history available for {}", strategyId, underlyingSymbol);
             return;
         }
+        // Only use TODAY's candles — a stale (pre-market) history buffer would otherwise
+        // reconstruct the 9:30 / 11:00 baselines from the previous trading day and poison
+        // the bias decision with identical stale closes.
+        LocalDate today = now.toLocalDate();
+        List<Candle> todaysHist = hist.stream()
+            .filter(c -> isCandleOnDate(c, today))
+            .toList();
+        if (todaysHist.isEmpty()) {
+            log.warn("[{}] Baseline recovery skipped — history for {} has no candles from today (feed stale?)",
+                strategyId, underlyingSymbol);
+            return;
+        }
 
         double pcr = fetchLivePcr(); // only used if no DB snapshot exists (historical PCR unavailable)
-        LocalDate today = now.toLocalDate();
         String tradeDate = today.format(DATE_FMT);
         Instant t930 = today.atTime(9, 30).atZone(IST_ZONE).toInstant();
         Instant t1100 = today.atTime(11, 0).atZone(IST_ZONE).toInstant();
@@ -930,7 +967,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
                 log.info("[{}] Recovery: rehydrated 9:30 baseline from DB price={} pcr={}",
                     strategyId, stored.price(), stored.pcr());
             } else if (!t.isBefore(LocalTime.of(9, 30))) {
-                Candle c930 = findCandleNear(hist, t930);
+                Candle c930 = findCandleNear(todaysHist, t930);
                 if (c930 != null) {
                     double p = c930.close().doubleValue();
                     setBaseline930(p, pcr);
@@ -950,7 +987,7 @@ public class NiftyVwapMomentumReversalStrategy implements Strategy {
                 log.info("[{}] Recovery: rehydrated 11:00 bias snapshot from DB price={} pcr={}",
                     strategyId, stored.price(), stored.pcr());
             } else if (!t.isBefore(LocalTime.of(11, 0))) {
-                Candle c1100 = findCandleNear(hist, t1100);
+                Candle c1100 = findCandleNear(todaysHist, t1100);
                 if (c1100 != null) {
                     double p = c1100.close().doubleValue();
                     setBaseline1100(p, pcr);

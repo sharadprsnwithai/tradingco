@@ -38,6 +38,27 @@ public class InstrumentMasterService {
     /** Normalizes the stored (possibly quote-wrapped) name column for matching. */
     private static final String NAME_MATCH = "REPLACE(name, '\"', '')";
 
+    /** Normalizes the stored (possibly quote-wrapped) trading_symbol column for matching. */
+    private static final String TRADINGSYMBOL_MATCH = "REPLACE(trading_symbol, '\"', '')";
+
+    /**
+     * Maps spot index names used by strategies (e.g. "NIFTY", "BANKNIFTY") to the Kite
+     * index instrument tradingsymbols (e.g. "NIFTY 50", "NIFTY BANK"). The Kite master
+     * has no "NSE:NIFTY" canonical row — the spot index trades as "NSE:NIFTY 50".
+     */
+    private static final Map<String, String> INDEX_TRADING_SYMBOLS = Map.of(
+        "NIFTY", "NIFTY 50",
+        "BANKNIFTY", "NIFTY BANK",
+        "FINNIFTY", "NIFTY FIN SERVICE",
+        "MIDCPNIFTY", "NIFTY MID SELECT",
+        "NIFTYNXT50", "NIFTY NEXT 50",
+        "NIFTY 50", "NIFTY 50",
+        "NIFTY BANK", "NIFTY BANK",
+        "NIFTY FIN SERVICE", "NIFTY FIN SERVICE",
+        "NIFTY MID SELECT", "NIFTY MID SELECT",
+        "NIFTY NEXT 50", "NIFTY NEXT 50"
+    );
+
     private final String dbUrl;
     private final Map<String, Instrument> activeByCanonical = new ConcurrentHashMap<>();
     private final Map<String, Instrument> activeByKiteToken = new ConcurrentHashMap<>();
@@ -221,7 +242,43 @@ public class InstrumentMasterService {
             return findNearestExpiring(name, "FUT");
         }
 
+        // Spot index names on NSE (e.g. "NSE:NIFTY" from a strategy's spot subscription)
+        // map to the actual index quote instrument (e.g. "NSE:NIFTY 50"). Without this,
+        // token resolution fails ("No Kite token found for NSE:NIFTY") and the spot feed
+        // plus spot historical warmup silently produce no data. NFO-prefixed symbols keep
+        // falling through (NFO abstracts are futures-oriented).
+        String indexTradingsymbol = INDEX_TRADING_SYMBOLS.get(s.toUpperCase());
+        if (indexTradingsymbol != null && !symbol.startsWith("NFO:")) {
+            log.info("[INSTR] '{}' not found as canonical — mapping to spot index '{}'", symbol, indexTradingsymbol);
+            return findIndexInstrument(indexTradingsymbol);
+        }
+
         return Mono.empty();
+    }
+
+    /**
+     * Looks up the NSE spot index instrument by its Kite tradingsymbol (e.g. "NIFTY 50").
+     *
+     * @param tradingSymbol the Kite index tradingsymbol
+     * @return the index instrument, or empty if not present in the master
+     */
+    private Mono<Instrument> findIndexInstrument(String tradingSymbol) {
+        return Mono.fromCallable(() -> {
+            String sql = "SELECT * FROM instruments WHERE exchange = 'NSE' AND instrument_type = 'EQ' AND "
+                + TRADINGSYMBOL_MATCH + " = ?";
+            try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+                ps.setString(1, tradingSymbol);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        Instrument inst = mapRow(rs);
+                        cacheActive(inst);
+                        return Optional.of(inst);
+                    }
+                }
+            }
+            return Optional.<Instrument>empty();
+        }).subscribeOn(Schedulers.boundedElastic())
+          .flatMap(opt -> opt.map(Mono::just).orElseGet(Mono::empty));
     }
 
     /**
@@ -377,11 +434,11 @@ public class InstrumentMasterService {
         return Mono.fromCallable(() -> {
             List<String> expiries = new ArrayList<>();
             String todayStr = LocalDate.now(ZoneId.of("Asia/Kolkata")).toString();
-            String sql = """
-                SELECT DISTINCT expiry FROM instruments
-                WHERE name = ? AND instrument_type = ? AND expiry >= ?
-                ORDER BY expiry ASC LIMIT ?
-                """;
+            // NOTE: name must be matched through NAME_MATCH — the master stores names
+            // quote-wrapped ('"NIFTY"'), so a raw `name = ?` comparison matches 0 rows.
+            // Use the NAME_MATCH constant (REPLACE(name, '\"', '')) to correctly compare.
+            String sql = "SELECT DISTINCT expiry FROM instruments WHERE "
+                + NAME_MATCH + " = ? AND instrument_type = ? AND expiry >= ? ORDER BY expiry ASC LIMIT ?";
             try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, name);
                 ps.setString(2, instrumentType);

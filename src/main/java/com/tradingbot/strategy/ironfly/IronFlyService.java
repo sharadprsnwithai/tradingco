@@ -118,14 +118,19 @@ public class IronFlyService {
     }
 
     private Mono<Void> evaluateAndRecommend(String underlying) {
-        LocalDate expiry = getNextMonthlyExpiry();
+        LocalDate expiry = getNextMonthlyExpiry(underlying);
         return optionChainProvider.getOptionChain(underlying, expiry.toString())
             .zipWith(optionChainProvider.getSpotPrice(underlying))
             .flatMap(tuple -> {
                 OptionChain chain = tuple.getT1();
                 double spot = tuple.getT2();
-                if (chain == null || chain.isEmpty() || spot <= 0) {
-                    log.warn("[IronFly] No chain data or spot for {}", underlying);
+                if (chain == null || chain.isEmpty()) {
+                    log.warn("[IronFly] No option chain data for {} (expiry {}) — no contracts matched; "
+                        + "check instrument master sync / expiry resolution", underlying, expiry);
+                    return Mono.empty();
+                }
+                if (spot <= 0) {
+                    log.warn("[IronFly] No spot price for {} — quote API unavailable", underlying);
                     return Mono.empty();
                 }
 
@@ -142,7 +147,8 @@ public class IronFlyService {
                 BigDecimal straddlePremium = ceQuote.ltp().add(peQuote.ltp());
                 double straddlePct = straddlePremium.doubleValue() / spot * 100.0;
                 if (straddlePct < minStraddlePctOfSpot) {
-                    log.info("[IronFly] {} skipped: straddle {:.1f}% < {:.1f}%", underlying, straddlePct, minStraddlePctOfSpot);
+                    log.info("[IronFly] {} skipped: straddle {}% < {}%",
+                        underlying, String.format("%.1f", straddlePct), String.format("%.1f", minStraddlePctOfSpot));
                     return Mono.empty();
                 }
                 if (ceQuote.openInterest() < minOI || peQuote.openInterest() < minOI) {
@@ -181,7 +187,8 @@ public class IronFlyService {
                 String msg = formatRecommendation(underlying, atmStrike, spot, straddlePremium.doubleValue(),
                     longCallStrike, longPutStrike, netCredit, expiry);
 
-                log.info("[IronFly] Recommendation generated for {}: ATM {} net credit ₹{:.2f}", underlying, atmStrike, netCredit);
+                log.info("[IronFly] Recommendation generated for {}: ATM {} net credit {}",
+                    underlying, atmStrike, String.format("%.2f", netCredit));
                 return telegramBot.sendAlert(msg).then();
             })
             .onErrorResume(e -> {
@@ -293,7 +300,7 @@ public class IronFlyService {
             return Mono.justOrEmpty(position);
         }
 
-        LocalDate expiry = getNextMonthlyExpiry();
+        LocalDate expiry = getNextMonthlyExpiry(position.underlying());
         return optionChainProvider.getOptionChain(position.underlying(), expiry.toString())
             .zipWith(optionChainProvider.getSpotPrice(position.underlying()))
             .map(tuple -> {
@@ -338,7 +345,7 @@ public class IronFlyService {
                 .doOnNext(updatedPos -> {
                     String underlying = entry.getKey();
                     activePositions.put(underlying, updatedPos);
-                    int daysToExpiry = dailyAnalyzer.getDaysToExpiry(getNextMonthlyExpiry());
+                    int daysToExpiry = dailyAnalyzer.getDaysToExpiry(getNextMonthlyExpiry(underlying));
                     DailyAnalyzer.EvaluationResult result = dailyAnalyzer.evaluate(updatedPos, daysToExpiry);
 
                     if (result.isExit()) {
@@ -361,7 +368,7 @@ public class IronFlyService {
             IronFlyPosition position = entry.getValue();
             if (position.status() == IronFlyStatus.CLOSED) continue;
             hasPositions = true;
-            int daysToExpiry = dailyAnalyzer.getDaysToExpiry(getNextMonthlyExpiry());
+            int daysToExpiry = dailyAnalyzer.getDaysToExpiry(getNextMonthlyExpiry(underlying));
             summary.append(String.format("*%s* [%s]\n  Credit: ₹%.2f | MTM: ₹%.2f\n  BE: ₹%.2f / ₹%.2f | DTE: %d\n\n",
                 underlying, position.status(),
                 position.getCurrentNetCredit(), position.getTotalMtm(),
@@ -444,8 +451,8 @@ public class IronFlyService {
 
         optionChainProvider.getSpotPrice(underlying)
             .flatMap(spot -> {
-                LocalDate expiry = getNextMonthlyExpiry();
-                return optionChainProvider.getOptionChain(underlying, expiry.toString())
+                LocalDate expiry = getNextMonthlyExpiry(key);
+                return optionChainProvider.getOptionChain(key, expiry.toString())
                     .doOnNext(chain -> {
                         IronFlyPosition pos = activePositions.get(key);
                         BigDecimal currentNetCredit = pos != null ? pos.getCurrentNetCredit() : BigDecimal.ZERO;
@@ -561,19 +568,65 @@ public class IronFlyService {
             netCredit, atmStrike + netCredit, atmStrike - netCredit);
     }
 
-    private LocalDate getNextMonthlyExpiry() {
+    /**
+     * Monthly expiry resolved from the instrument master (the contract dump is the source
+     * of truth — NSE monthly expiries are the last TUESDAY of the month since Sep 2025,
+     * and a hard-coded weekday silently breaks whenever NSE changes the regime again).
+     * Falls back to the last-Tuesday heuristic when the master is unavailable.
+     */
+    private LocalDate getNextMonthlyExpiry(String underlying) {
         LocalDate today = LocalDate.now(IST_ZONE);
-        LocalDate lastThursday = today.withDayOfMonth(today.lengthOfMonth());
-        while (lastThursday.getDayOfWeek() != java.time.DayOfWeek.THURSDAY) {
-            lastThursday = lastThursday.minusDays(1);
-        }
-        if (today.isAfter(lastThursday)) {
-            LocalDate nextMonth = today.plusMonths(1);
-            lastThursday = nextMonth.withDayOfMonth(nextMonth.lengthOfMonth());
-            while (lastThursday.getDayOfWeek() != java.time.DayOfWeek.THURSDAY) {
-                lastThursday = lastThursday.minusDays(1);
+        if (underlying != null && instrumentMaster != null) {
+            try {
+                List<String> expiries = instrumentMaster.findUpcomingExpiries(underlying.toUpperCase(), "CE", 12)
+                    .collectList()
+                    .block(java.time.Duration.ofSeconds(3));
+                if (expiries != null && !expiries.isEmpty()) {
+                    // Monthly contract = the last expiry of the month (weekly expiries precede it).
+                    LocalDate thisMonth = lastExpiryInMonth(expiries, today);
+                    if (thisMonth != null && !today.isAfter(thisMonth)) {
+                        return thisMonth;
+                    }
+                    LocalDate nextMonth = lastExpiryInMonth(expiries, today.plusMonths(1));
+                    if (nextMonth != null) {
+                        return nextMonth;
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("[IronFly] Monthly expiry lookup failed for {}: {} — using last-Tuesday fallback",
+                    underlying, e.getMessage());
             }
         }
-        return lastThursday;
+        LocalDate expiry = lastWeekdayOfMonth(today, java.time.DayOfWeek.TUESDAY);
+        if (today.isAfter(expiry)) {
+            expiry = lastWeekdayOfMonth(today.plusMonths(1), java.time.DayOfWeek.TUESDAY);
+        }
+        return expiry;
+    }
+
+    /** Returns the latest expiry date in the given month from the list, or null if none. */
+    private static LocalDate lastExpiryInMonth(List<String> expiries, LocalDate month) {
+        LocalDate best = null;
+        for (String e : expiries) {
+            try {
+                LocalDate d = LocalDate.parse(e);
+                if (d.getYear() == month.getYear() && d.getMonth() == month.getMonth()
+                    && (best == null || d.isAfter(best))) {
+                    best = d;
+                }
+            } catch (Exception ignored) {
+                // malformed expiry row — skip
+            }
+        }
+        return best;
+    }
+
+    /** Returns the last occurrence of the given weekday within the month of the supplied date. */
+    private static LocalDate lastWeekdayOfMonth(LocalDate dayInMonth, java.time.DayOfWeek dow) {
+        LocalDate d = dayInMonth.withDayOfMonth(dayInMonth.lengthOfMonth());
+        while (d.getDayOfWeek() != dow) {
+            d = d.minusDays(1);
+        }
+        return d;
     }
 }

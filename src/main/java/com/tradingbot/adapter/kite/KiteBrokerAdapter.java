@@ -69,6 +69,20 @@ public class KiteBrokerAdapter implements BrokerAdapter {
     private final Map<Long, Set<String>> tokenToSymbols = new ConcurrentHashMap<>();
     private final Set<Long> subscribedTokens = ConcurrentHashMap.newKeySet();
 
+    // --- WebSocket liveness tracking ---
+    // The KiteTicker SDK can report isConnectionOpen()==true on a dead/zombie connection
+    // (its auto-reconnect may wedge silently). Track the last WS lifecycle events and the
+    // last received tick so ensureTickerConnected can detect a zombie and rebuild it
+    // instead of subscribing tokens into the void.
+    private volatile long lastWsConnectedEventMillis = 0;
+    private volatile long lastWsDisconnectedEventMillis = 0;
+    private volatile long lastTickReceivedMillis = 0;
+    private volatile long tickerCreatedMillis = 0;
+    /** Grace window in which a freshly created ticker is still completing its first connect. */
+    private static final long TICKER_CONNECT_GRACE_MS = 30_000;
+    /** A ticker that claims to be open but has produced no ticks for this long during market hours is a zombie. */
+    private static final long ZOMBIE_TICK_SILENCE_MS = 120_000;
+
     /**
      * Constructs a new KiteBrokerAdapter with the provided dependencies.
      *
@@ -420,11 +434,14 @@ public class KiteBrokerAdapter implements BrokerAdapter {
 
     /**
      * Creates the KiteTicker on first use and subscribes any new tokens on subsequent calls.
+     * A ticker whose connection is dead (zombie) — the SDK reports open but the socket died
+     * and its auto-reconnect wedged — is torn down and rebuilt so new subscriptions actually
+     * reach a live socket.
      * NOTE: KiteTicker constructor takes (accessToken, apiKey) in that order.
      */
     private synchronized void ensureTickerConnected(String accessToken, List<Long> newTokens) {
         KiteTicker existing = tickerRef.get();
-        if (existing != null && existing.isConnectionOpen()) {
+        if (existing != null && isTickerUsable(existing)) {
             ArrayList<Long> toAdd = new ArrayList<>();
             for (Long t : newTokens) {
                 if (subscribedTokens.add(t)) toAdd.add(t);
@@ -437,12 +454,55 @@ public class KiteBrokerAdapter implements BrokerAdapter {
             return;
         }
 
+        if (existing != null) {
+            log.warn("Kite WebSocket is dead/zombie (open={}, lastConnectedEvent={}, lastDisconnectedEvent={}, "
+                    + "lastTickAgeMs={}) — tearing down and rebuilding ticker",
+                existing.isConnectionOpen(), lastWsConnectedEventMillis, lastWsDisconnectedEventMillis,
+                lastTickReceivedMillis > 0 ? System.currentTimeMillis() - lastTickReceivedMillis : -1);
+            try { existing.disconnect(); } catch (Exception ignore) {}
+            tickerRef.compareAndSet(existing, null);
+        }
+
         log.info("Connecting Kite WebSocket (KiteTicker) for {} tokens...", newTokens.size());
-        KiteTicker ticker = createTicker(accessToken);
         subscribedTokens.addAll(newTokens);
+        KiteTicker ticker = createTicker(accessToken);
         tickerRef.set(ticker);
         tickerToken.set(accessToken);
         ticker.connect();
+    }
+
+    /**
+     * True when the ticker is genuinely usable: either the SDK reports the connection open
+     * AND the last WebSocket lifecycle event was a successful connect AND ticks are still
+     * flowing (or none are expected yet); or the ticker was just created and is still within
+     * its first-connect grace window with no disconnect observed since creation.
+     */
+    private boolean isTickerUsable(KiteTicker ticker) {
+        long now = System.currentTimeMillis();
+        if (ticker.isConnectionOpen()
+                && lastWsConnectedEventMillis > 0
+                && lastWsConnectedEventMillis >= lastWsDisconnectedEventMillis) {
+            if (subscribedTokens.isEmpty()) return true; // nothing subscribed yet — no ticks expected
+            // Open socket + no ticks for a prolonged period during market hours = zombie.
+            boolean ticksStalled = lastTickReceivedMillis == 0
+                ? (now - tickerCreatedMillis) > ZOMBIE_TICK_SILENCE_MS
+                : (now - lastTickReceivedMillis) > ZOMBIE_TICK_SILENCE_MS;
+            if (ticksStalled && isMarketHoursNow()) {
+                return false;
+            }
+            return true;
+        }
+        // Freshly created ticker still completing its first connect — don't churn it.
+        return now - tickerCreatedMillis < TICKER_CONNECT_GRACE_MS
+            && lastWsDisconnectedEventMillis < tickerCreatedMillis;
+    }
+
+    /** True between 09:15 and 15:30 IST on weekdays (ticks are expected only then). */
+    private static boolean isMarketHoursNow() {
+        java.time.ZonedDateTime now = java.time.ZonedDateTime.now(java.time.ZoneId.of("Asia/Kolkata"));
+        if (now.getDayOfWeek().getValue() >= 6) return false;
+        int mins = now.getHour() * 60 + now.getMinute();
+        return mins >= 555 && mins <= 930;
     }
 
     /**
@@ -460,8 +520,10 @@ public class KiteBrokerAdapter implements BrokerAdapter {
         } catch (KiteException e) {
             log.warn("Could not set ticker reconnection params: {}", e.getMessage());
         }
+        tickerCreatedMillis = System.currentTimeMillis();
 
         ticker.setOnConnectedListener(() -> {
+            lastWsConnectedEventMillis = System.currentTimeMillis();
             ArrayList<Long> all = new ArrayList<>(subscribedTokens);
             log.info("Kite WebSocket CONNECTED - subscribing {} tokens in quote mode", all.size());
             if (!all.isEmpty()) {
@@ -471,6 +533,9 @@ public class KiteBrokerAdapter implements BrokerAdapter {
         });
         AtomicLong tickCounter = new AtomicLong();
         ticker.setOnTickerArrivalListener(sdkTicks -> {
+            if (sdkTicks != null && !sdkTicks.isEmpty()) {
+                lastTickReceivedMillis = System.currentTimeMillis();
+            }
             long count = tickCounter.addAndGet(sdkTicks != null ? sdkTicks.size() : 0);
             if (count == 1 || count % 2000 == 0) {
                 log.debug("Kite ticker arrivals: {} ticks received so far", count);
@@ -486,8 +551,10 @@ public class KiteBrokerAdapter implements BrokerAdapter {
                 }
             }
         });
-        ticker.setOnDisconnectedListener(() ->
-            log.warn("Kite WebSocket disconnected - SDK auto-reconnect is active"));
+        ticker.setOnDisconnectedListener(() -> {
+            lastWsDisconnectedEventMillis = System.currentTimeMillis();
+            log.warn("Kite WebSocket disconnected - SDK auto-reconnect is active");
+        });
         ticker.setOnErrorListener(new OnError() {
             @Override public void onError(Exception exception) {
                 String msg = exception != null ? exception.getMessage() : null;
@@ -533,6 +600,80 @@ public class KiteBrokerAdapter implements BrokerAdapter {
             tickerToken.set(newToken);
             fresh.connect();
         }
+    }
+
+    /**
+     * Forces a clean WebSocket reconnect after instrument sync. Resolves fresh tokens for
+     * the given symbols, purges stale tokens from {@code subscribedTokens} and
+     * {@code tokenToSymbols}, disconnects the old ticker, and reconnects with only the
+     * current valid tokens. Called from {@link com.tradingbot.scheduler.MarketClockScheduler}
+     * after the 08:30 pre-market instrument sync to prevent the live feed from being stuck
+     * on expired contract tokens.
+     *
+     * <p>Token resolution performs blocking JDBC lookups and MUST run on boundedElastic —
+     * this method may be invoked from a reactor-netty event-loop thread (via the scheduler's
+     * reactive chain), where {@code blockOptional()} throws
+     * {@code IllegalStateException: blocking ... is not supported in thread reactor-http-epoll-*}
+     * and the reconnect silently aborts ("ticker NOT restarted"), leaving the feed dead.
+     *
+     * @param symbols the canonical symbols to re-subscribe (e.g. NFO:NIFTY_FUT, NSE:RELIANCE)
+     */
+    public void forceReconnectAfterInstrumentSync(List<String> symbols) {
+        if (!config.isEnabled()) return;
+
+        log.info("Force reconnecting Kite WebSocket after instrument sync for {} symbols", symbols.size());
+
+        Mono.fromCallable(() -> resolveTokens(symbols))
+            .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+            .flatMap(freshTokens -> authenticator.getAccessToken()
+                .map(token -> Map.entry(token, freshTokens)))
+            .subscribe(
+                entry -> rebuildTickerWithTokens(entry.getKey(), entry.getValue(), symbols.size()),
+                err -> log.error("Post-instrument-sync reconnect failed: {}", err.getMessage(), err)
+            );
+    }
+
+    /**
+     * Tears down the current ticker and connects a fresh one with the given token set.
+     * Runs on a boundedElastic thread (blocking JDBC / ticker lifecycle is safe there).
+     */
+    private synchronized void rebuildTickerWithTokens(String accessToken, List<Long> freshTokens, int requestedSymbolCount) {
+        if (freshTokens.isEmpty()) {
+            log.warn("No fresh tokens resolved for {} symbols during post-sync reconnect — ticker NOT restarted",
+                requestedSymbolCount);
+            return;
+        }
+
+        // Build the set of currently valid tokens
+        Set<Long> validTokens = new java.util.HashSet<>(freshTokens);
+
+        // Purge stale tokens (tokens in subscribedTokens that are NOT in validTokens)
+        List<Long> staleTokens = subscribedTokens.stream()
+            .filter(t -> !validTokens.contains(t))
+            .toList();
+        if (!staleTokens.isEmpty()) {
+            staleTokens.forEach(t -> {
+                subscribedTokens.remove(t);
+                tokenToSymbols.remove(t);
+            });
+            log.info("Purged {} stale tokens from Kite WebSocket subscription set: {}", staleTokens.size(), staleTokens);
+        }
+
+        // Ensure fresh tokens are in subscribedTokens
+        subscribedTokens.addAll(freshTokens);
+
+        KiteTicker old = tickerRef.getAndSet(null);
+        if (old != null) {
+            try { old.disconnect(); } catch (Exception ignore) {}
+            log.info("Disconnected old Kite WebSocket ticker for post-sync reconnect");
+        }
+
+        KiteTicker fresh = createTicker(accessToken);
+        tickerRef.set(fresh);
+        tickerToken.set(accessToken);
+        fresh.connect();
+        log.info("Kite WebSocket reconnect initiated after instrument sync with {} tokens ({} total subscribed)",
+            freshTokens.size(), subscribedTokens.size());
     }
 
     /**

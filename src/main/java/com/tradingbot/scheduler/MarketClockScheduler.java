@@ -156,7 +156,11 @@ public class MarketClockScheduler {
             })
             .doOnTerminate(() -> {
                 strategyEngine.dispatchSchedule(ScheduledEvent.of(ScheduledEvent.PRE_MARKET_SCAN));
-                reactor.core.publisher.Mono.delay(java.time.Duration.ofSeconds(2))
+                // Force clean Kite WebSocket reconnect with fresh instrument tokens BEFORE
+                // syncSubscriptions re-registers strategy symbols. This purges stale tokens
+                // (e.g. expired monthly FUT contracts) from the live feed subscription set.
+                marketDataHub.reconnectAfterInstrumentSync();
+                reactor.core.publisher.Mono.delay(java.time.Duration.ofSeconds(5))
                     .subscribe(t -> strategyEngine.syncSubscriptions());
             })
             .subscribe();

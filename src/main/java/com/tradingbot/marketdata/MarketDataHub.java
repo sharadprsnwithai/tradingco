@@ -2,6 +2,7 @@ package com.tradingbot.marketdata;
 
 import com.tradingbot.adapter.BrokerAdapter;
 import com.tradingbot.adapter.BrokerAdapterRegistry;
+import com.tradingbot.adapter.kite.KiteBrokerAdapter;
 import com.tradingbot.instrument.InstrumentMasterService;
 import com.tradingbot.model.Candle;
 import com.tradingbot.model.Tick;
@@ -50,6 +51,10 @@ public class MarketDataHub {
     private final AtomicBoolean failoverRefusedLogged = new AtomicBoolean(false);
     private final AtomicBoolean silenceWarned = new AtomicBoolean(false);
     private final AtomicBoolean primaryOnly = new AtomicBoolean(false);
+    /** Timestamp (millis) of the last forced primary-reconnect attempt while parked on a silent primary. */
+    private final java.util.concurrent.atomic.AtomicLong lastPrimaryRecoveryAttempt = new java.util.concurrent.atomic.AtomicLong(0);
+    /** Min interval between forced primary reconnect attempts while the feed is silent. */
+    private static final long PRIMARY_RECOVERY_RETRY_INTERVAL_MS = 60_000;
 
     /**
      * Constructs a MarketDataHub with the given dependencies.
@@ -112,6 +117,10 @@ public class MarketDataHub {
                         lastTickTime.set(Instant.now());
                         failoverRefusedLogged.set(false); // feed healthy again - re-arm refusal logging
                         silenceWarned.set(false);
+                        // Feed is delivering ticks again — re-arm the full watchdog. Without
+                        // this, primaryOnly (set after a failed failover cycle) permanently
+                        // disables silence detection even after the feed recovers.
+                        primaryOnly.set(false);
                         candleAggregator.onTick(tick);
                     })
                     .doOnError(err -> {
@@ -157,7 +166,7 @@ public class MarketDataHub {
      * expected when the exchange is closed, so silence then is not an alarm.
      */
     public void checkSilence() {
-        if (activeSymbols.isEmpty() || primaryOnly.get()) {
+        if (activeSymbols.isEmpty()) {
             return;
         }
         if (!isMarketHours()) {
@@ -177,6 +186,23 @@ public class MarketDataHub {
             failedOver.set(false);
             primaryOnly.set(true);
             connectFeed(PRIMARY_BROKER).subscribe();
+            return;
+        }
+
+        if (primaryOnly.get()) {
+            // Parked on the primary after a failed failover cycle. If the primary also stays
+            // silent, its SDK auto-reconnect may be wedged on a zombie WebSocket — force a
+            // full reconnect periodically so the adapter tears down and rebuilds the ticker
+            // (ensureTickerConnected detects zombie connections). Without this loop the hub
+            // sits on a dead feed for the rest of the day with the watchdog disarmed.
+            long now = System.currentTimeMillis();
+            if (now - lastPrimaryRecoveryAttempt.get() > PRIMARY_RECOVERY_RETRY_INTERVAL_MS) {
+                lastPrimaryRecoveryAttempt.set(now);
+                log.error("Primary feed {} silent (>{}s without ticks) - forcing reconnect attempt",
+                    activeBrokerId.get(), silenceThreshold.toSeconds());
+                lastTickTime.set(Instant.now()); // reset so the next check waits a full cycle
+                connectFeed(PRIMARY_BROKER).subscribe();
+            }
             return;
         }
 
@@ -310,7 +336,33 @@ public class MarketDataHub {
     }
 
     /**
-     * Returns an unmodifiable view of the currently subscribed symbols.
+     * Forces a clean WebSocket reconnect on the active broker adapter after instrument
+     * sync. Resolves fresh tokens for all active symbols, purges stale tokens, and
+     * reconnects the live feed. Called from the scheduler after the 08:30 pre-market
+     * instrument master sync to prevent the feed from being stuck on expired contract
+     * tokens (e.g. previous-month FUT contract that was subscribed before the sync
+     * updated the database with the new contract's token).
+     */
+    public void reconnectAfterInstrumentSync() {
+        if (activeSymbols.isEmpty()) {
+            log.info("No active symbols — skipping post-instrument-sync reconnect");
+            return;
+        }
+        String brokerId = activeBrokerId.get();
+        brokerRegistry.getByBrokerId(brokerId)
+            .subscribe(adapter -> {
+                if (adapter instanceof KiteBrokerAdapter kite) {
+                    log.info("Post-instrument-sync: forcing Kite WebSocket reconnect for {} symbols", activeSymbols.size());
+                    kite.forceReconnectAfterInstrumentSync(new ArrayList<>(activeSymbols));
+                    lastTickTime.set(Instant.now()); // reset silence timer
+                } else {
+                    log.info("Post-instrument-sync: adapter {} does not require explicit reconnect", brokerId);
+                }
+            }, err -> log.error("Post-instrument-sync reconnect failed: {}", err.getMessage()));
+    }
+
+    /**
+     * Returns the list of canonical symbols currently being tracked.
      *
      * @return list of canonical symbol strings being tracked
      */
