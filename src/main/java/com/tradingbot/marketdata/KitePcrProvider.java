@@ -106,12 +106,10 @@ public class KitePcrProvider {
                                 return Mono.just(1.0);
                             }
 
-                            String queryParams = String.join("&", instruments.stream()
-                                .map(i -> "i=" + i)
-                                .toArray(String[]::new));
-
                             return webClient.get()
-                                .uri("/quote?" + queryParams)
+                                .uri(uriBuilder -> uriBuilder.path("/quote")
+                                    .queryParam("i", (Object[]) instruments.toArray(String[]::new))
+                                    .build())
                                 .header("Authorization", "token " + config.getApiKey() + ":" + token)
                                 .retrieve()
                                 .bodyToMono(String.class)
@@ -130,11 +128,10 @@ public class KitePcrProvider {
                     instruments.add("NFO:NIFTY" + datePart + strike + "CE");
                     instruments.add("NFO:NIFTY" + datePart + strike + "PE");
                 }
-                String queryParams = String.join("&", instruments.stream()
-                    .map(i -> "i=" + i)
-                    .toArray(String[]::new));
                 return webClient.get()
-                    .uri("/quote?" + queryParams)
+                    .uri(uriBuilder -> uriBuilder.path("/quote")
+                        .queryParam("i", (Object[]) instruments.toArray(String[]::new))
+                        .build())
                     .header("Authorization", "token " + config.getApiKey() + ":" + token)
                     .retrieve()
                     .bodyToMono(String.class)
@@ -168,7 +165,7 @@ public class KitePcrProvider {
         }
         return authenticator.getAccessToken()
             .flatMap(token -> webClient.get()
-                .uri("/quote/ltp?i=" + canonicalSymbol)
+                .uri(uriBuilder -> uriBuilder.path("/quote/ltp").queryParam("i", canonicalSymbol).build())
                 .header("Authorization", "token " + config.getApiKey() + ":" + token)
                 .retrieve()
                 .bodyToMono(String.class)

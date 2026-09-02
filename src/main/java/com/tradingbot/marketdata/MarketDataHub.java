@@ -56,6 +56,11 @@ public class MarketDataHub {
     /** Min interval between forced primary reconnect attempts while the feed is silent. */
     private static final long PRIMARY_RECOVERY_RETRY_INTERVAL_MS = 60_000;
 
+    /** Max retry attempts when initial feed connection yields no tokens. */
+    private static final int MAX_FEED_RETRIES = 5;
+    /** Delay (seconds) before the first feed-retry check after connection. */
+    private static final int FEED_RETRY_INITIAL_DELAY_SECONDS = 10;
+
     /**
      * Constructs a MarketDataHub with the given dependencies.
      *
@@ -91,14 +96,18 @@ public class MarketDataHub {
         return Flux.fromIterable(canonicalSymbols)
             .flatMap(instrumentMaster::findByCanonicalSymbol)
             .doOnNext(instrumentMaster::cacheActive)
-            .then(Mono.defer(() -> connectFeed(activeBrokerId.get())))
+            .then(Mono.defer(() -> connectFeed(activeBrokerId.get(), true)))
             .doOnSuccess(v -> startWatchdog());
     }
 
     /**
      * Connect to the market data feed of the specified broker.
+     *
+     * @param brokerId the broker to connect to
+     * @param scheduleValidation if true, schedule a delayed retry-validation check
+     *                           (only for the initial connection, not retry-triggered ones)
      */
-    public synchronized Mono<Void> connectFeed(String brokerId) {
+    public synchronized Mono<Void> connectFeed(String brokerId, boolean scheduleValidation) {
         Disposable oldSub = feedSubscription.getAndSet(null);
         if (oldSub != null && !oldSub.isDisposed()) {
             oldSub.dispose();
@@ -129,7 +138,7 @@ public class MarketDataHub {
                                 brokerId, err.getMessage());
                             failedOver.set(false);
                             primaryOnly.set(true);
-                            connectFeed(PRIMARY_BROKER).subscribe();
+                            connectFeed(PRIMARY_BROKER, false).subscribe();
                         } else {
                             log.error("Error on {} feed stream: {}. Triggering failover.", brokerId, err.getMessage());
                             triggerFailover("Feed stream error: " + err.getMessage());
@@ -141,8 +150,20 @@ public class MarketDataHub {
                     );
 
                 feedSubscription.set(newSub);
+
+                // Schedule a delayed validation ONLY for the initial connection.
+                // Retry-triggered connections (scheduleValidation=false) skip this
+                // to prevent cascading parallel validation chains.
+                if (scheduleValidation) {
+                    scheduleFeedRetryValidation(brokerId, 1);
+                }
             })
             .then();
+    }
+
+    /** Convenience overload — connects without scheduling retry validation. */
+    public synchronized Mono<Void> connectFeed(String brokerId) {
+        return connectFeed(brokerId, false);
     }
 
     /**
@@ -158,6 +179,48 @@ public class MarketDataHub {
             .subscribe(tick -> checkSilence());
 
         watchdogSubscription.set(watchdog);
+    }
+
+    /**
+     * Schedules a delayed check after a feed connection attempt. If no ticks arrived
+     * within the delay window (indicating token resolution failure), triggers a retry
+     * with exponential backoff. Only called once from the initial {@link #subscribe()}
+     * path — retry-triggered {@code connectFeed} calls do NOT re-enter this method.
+     *
+     * @param brokerId the broker that was connected
+     * @param attempt  the current attempt number (1-based)
+     */
+    private void scheduleFeedRetryValidation(String brokerId, int attempt) {
+        if (attempt > MAX_FEED_RETRIES) {
+            log.error("Feed retry exhausted for {} after {} attempts — no ticks received", brokerId, attempt - 1);
+            return;
+        }
+        // Outside market hours (before 09:15 or after 15:31 IST, weekends) no ticks
+        // are expected — skip retry validation entirely to avoid noise and wasted reconnects.
+        if (!isMarketHours()) {
+            log.info("Feed validation: skipping retry for {} — outside market hours", brokerId);
+            return;
+        }
+        long delaySeconds = FEED_RETRY_INITIAL_DELAY_SECONDS * attempt;
+        Mono.delay(Duration.ofSeconds(delaySeconds))
+            .subscribeOn(Schedulers.boundedElastic())
+            .subscribe(tick -> {
+                // Check if the primary feed is active and delivering ticks
+                if (!PRIMARY_BROKER.equals(brokerId)) {
+                    return;
+                }
+                Instant last = lastTickTime.get();
+                boolean silent = last == null || Duration.between(last, Instant.now()).compareTo(silenceThreshold) > 0;
+                if (silent && !activeSymbols.isEmpty()) {
+                    log.warn("Feed validation: no ticks received from {} after {}s (attempt {}/{}). Scheduling retry.",
+                        brokerId, delaySeconds, attempt, MAX_FEED_RETRIES);
+                    // Retry without scheduling a new validation chain (prevents cascading connections)
+                    connectFeed(brokerId, false).subscribe();
+                    scheduleFeedRetryValidation(brokerId, attempt + 1);
+                } else if (!silent) {
+                    log.info("Feed validation: ticks OK from {} (attempt {})", brokerId, attempt);
+                }
+            });
     }
 
     /**

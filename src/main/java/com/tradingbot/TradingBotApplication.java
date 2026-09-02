@@ -162,6 +162,18 @@ public class TradingBotApplication {
                 log.error("Historical candle warmup failed (strategies may have reduced look-back): {}", ex.getMessage());
             }
 
+            // 2e. Force reconnect the live market data feed now that the instrument master is
+            //     fully synced. At startup, MarketDataHub.connectFeed() fires before the sync
+            //     completes, so Kite token resolution fails for abstract symbols (NFO:NIFTY_FUT,
+            //     NFO:NIFTY_50). This reconnect re-resolves tokens from the now-populated master
+            //     and restarts the WebSocket with valid tokens. Mirrors the 08:30 IST cron path.
+            try {
+                marketDataHub.reconnectAfterInstrumentSync();
+                log.info("Post-startup: market data feed reconnect triggered after instrument sync");
+            } catch (Exception ex) {
+                log.error("Post-startup feed reconnect failed: {}", ex.getMessage());
+            }
+
             // 2d. Now that 5m history is backfilled, let the VWAP strategy reconstruct any 9:30 /
             //     11:00 bias snapshots it missed because this process started mid-day (those
             //     scheduled events had already fired). Without this its bias stays NEUTRAL and

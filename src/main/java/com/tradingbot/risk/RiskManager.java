@@ -53,6 +53,7 @@ public class RiskManager {
     private final Set<String> frozenBrokers = ConcurrentHashMap.newKeySet();
     private final Set<String> pausedStrategies = ConcurrentHashMap.newKeySet();
 
+    @Autowired
     public RiskManager(
         TradingDbService dbService,
         MarketDataHub marketDataHub,

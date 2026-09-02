@@ -61,61 +61,64 @@ public class KiteOptionChainProvider implements OptionChainProvider {
 
     @Override
     public Mono<OptionChain> getOptionChain(String underlying, String expiry) {
-        return brokerRegistry.getAll()
-            .filter(BrokerAdapter::isEnabled)
-            .take(1)
-            .singleOrEmpty()
-            .flatMap(adapter -> fetchChainFromBroker(underlying, expiry))
-            .switchIfEmpty(Mono.just(OptionChain.empty(underlying, expiry)))
+        return fetchChainFromBroker(underlying, expiry)
+            .switchIfEmpty(Mono.just(OptionChain.empty(normalizeUnderlying(underlying), expiry != null ? expiry : "")))
             .doOnError(e -> log.warn("Failed to fetch option chain from Kite for {}: {}", underlying, e.getMessage()));
     }
 
     private Mono<OptionChain> fetchChainFromBroker(String underlying, String expiry) {
-        return instrumentMaster.findOptionContracts(underlying, expiry, null, "CE")
-            .concatWith(instrumentMaster.findOptionContracts(underlying, expiry, null, "PE"))
-            .collectList()
-            .flatMap(instruments -> {
-                if (instruments.isEmpty()) return Mono.just(OptionChain.empty(underlying, expiry));
+        String normUnderlying = normalizeUnderlying(underlying);
+        Mono<String> expiryMono = (expiry != null && !expiry.isBlank())
+            ? Mono.just(expiry)
+            : instrumentMaster.findUpcomingExpiries(normUnderlying, "CE", 1).next();
 
-                List<String> canonicalSymbols = instruments.stream()
-                    .map(Instrument::canonicalSymbol)
-                    .filter(s -> s != null && !s.isBlank())
-                    .toList();
+        return expiryMono.flatMap(targetExpiry ->
+            instrumentMaster.findOptionContracts(normUnderlying, targetExpiry, null, "CE")
+                .concatWith(instrumentMaster.findOptionContracts(normUnderlying, targetExpiry, null, "PE"))
+                .collectList()
+                .flatMap(instruments -> {
+                    if (instruments.isEmpty()) return Mono.just(OptionChain.empty(normUnderlying, targetExpiry));
 
-                if (canonicalSymbols.isEmpty()) return Mono.just(OptionChain.empty(underlying, expiry));
+                    List<String> canonicalSymbols = instruments.stream()
+                        .map(Instrument::canonicalSymbol)
+                        .filter(s -> s != null && !s.isBlank())
+                        .toList();
 
-                return fetchBatchLtp(canonicalSymbols)
-                    .zipWith(getSpotPrice(underlying))
-                    .map(tuple -> {
-                        Map<String, Double> prices = tuple.getT1();
-                        double spot = tuple.getT2();
-                        Map<Integer, StrikeQuote> calls = new HashMap<>();
-                        Map<Integer, StrikeQuote> puts = new HashMap<>();
-                        for (Instrument inst : instruments) {
-                            if (inst.strike() == null) continue;
-                            OptionType type = "CE".equalsIgnoreCase(inst.instrumentType()) ? OptionType.CE : OptionType.PE;
-                            int strike = inst.strike().intValue();
+                    if (canonicalSymbols.isEmpty()) return Mono.just(OptionChain.empty(normUnderlying, targetExpiry));
 
-                            double ltp = prices.getOrDefault(inst.canonicalSymbol(), 0.0);
-                            double delta = approximateDelta(strike, spot, type);
-                            StrikeQuote quote = new StrikeQuote(
-                                strike, type,
-                                BigDecimal.valueOf(ltp),
-                                BigDecimal.valueOf(ltp),
-                                BigDecimal.valueOf(ltp),
-                                10000, 500,
-                                delta, 0.0, 0.0, 0.0
-                            );
+                    return fetchBatchLtp(canonicalSymbols)
+                        .zipWith(getSpotPrice(normUnderlying))
+                        .map(tuple -> {
+                            Map<String, Double> prices = tuple.getT1();
+                            double spot = tuple.getT2();
+                            Map<Integer, StrikeQuote> calls = new HashMap<>();
+                            Map<Integer, StrikeQuote> puts = new HashMap<>();
+                            for (Instrument inst : instruments) {
+                                if (inst.strike() == null) continue;
+                                OptionType type = "CE".equalsIgnoreCase(inst.instrumentType()) ? OptionType.CE : OptionType.PE;
+                                int strike = inst.strike().intValue();
 
-                            if (type == OptionType.CE) {
-                                calls.put(strike, quote);
-                            } else {
-                                puts.put(strike, quote);
+                                double ltp = prices.getOrDefault(inst.canonicalSymbol(), 0.0);
+                                double delta = approximateDelta(strike, spot, type);
+                                StrikeQuote quote = new StrikeQuote(
+                                    strike, type,
+                                    BigDecimal.valueOf(ltp),
+                                    BigDecimal.valueOf(ltp),
+                                    BigDecimal.valueOf(ltp),
+                                    10000, 500,
+                                    delta, 0.0, 0.0, 0.0
+                                );
+
+                                if (type == OptionType.CE) {
+                                    calls.put(strike, quote);
+                                } else {
+                                    puts.put(strike, quote);
+                                }
                             }
-                        }
-                        return new OptionChain(underlying, expiry, calls, puts);
-                    });
-            });
+                            return new OptionChain(normUnderlying, targetExpiry, calls, puts);
+                        });
+                })
+        ).defaultIfEmpty(OptionChain.empty(normUnderlying, expiry != null ? expiry : ""));
     }
 
     private double approximateDelta(int strike, double spot, OptionType type) {
@@ -136,31 +139,29 @@ public class KiteOptionChainProvider implements OptionChainProvider {
         List<List<String>> partitions = partition(canonicalSymbols, 100);
         return kiteAuthenticator.getAccessToken()
             .flatMap(token -> Flux.fromIterable(partitions)
-                .flatMap(batch -> {
-                    String query = batch.stream()
-                        .map(s -> "i=" + URLEncoder.encode(s, StandardCharsets.UTF_8))
-                        .collect(Collectors.joining("&"));
-                    return webClient.get()
-                        .uri("/quote/ltp?" + query)
-                        .header("Authorization", "token " + kiteConfig.getApiKey() + ":" + token)
-                        .header("X-Kite-Version", "3")
-                        .retrieve()
-                        .bodyToMono(JsonNode.class)
-                        .map(root -> {
-                            Map<String, Double> prices = new HashMap<>();
-                            JsonNode data = root.path("data");
-                            if (data.isObject()) {
-                                data.fields().forEachRemaining(e -> {
-                                    prices.put(e.getKey(), e.getValue().path("last_price").asDouble(0.0));
-                                });
-                            }
-                            return prices;
-                        })
-                        .onErrorResume(e -> {
-                            log.warn("[KiteOptionChain] Batch quote error: {}", e.getMessage());
-                            return Mono.just(Collections.emptyMap());
-                        });
-                })
+                .flatMap(batch -> webClient.get()
+                    .uri(uriBuilder -> uriBuilder.path("/quote/ltp")
+                        .queryParam("i", (Object[]) batch.toArray(String[]::new))
+                        .build())
+                    .header("Authorization", "token " + kiteConfig.getApiKey() + ":" + token)
+                    .header("X-Kite-Version", "3")
+                    .retrieve()
+                    .bodyToMono(JsonNode.class)
+                    .map(root -> {
+                        Map<String, Double> prices = new HashMap<>();
+                        JsonNode data = root.path("data");
+                        if (data.isObject()) {
+                            data.fields().forEachRemaining(e -> {
+                                prices.put(e.getKey(), e.getValue().path("last_price").asDouble(0.0));
+                            });
+                        }
+                        return prices;
+                    })
+                    .onErrorResume(e -> {
+                        log.warn("[KiteOptionChain] Batch quote error: {}", e.getMessage());
+                        return Mono.just(Collections.emptyMap());
+                    })
+                )
                 .reduce((Map<String, Double>) new HashMap<String, Double>(), (acc, map) -> {
                     acc.putAll(map);
                     return acc;
@@ -177,7 +178,7 @@ public class KiteOptionChainProvider implements OptionChainProvider {
         }
         return kiteAuthenticator.getAccessToken()
             .flatMap(token -> webClient.get()
-                .uri("/quote/ltp?i=" + URLEncoder.encode(sym, StandardCharsets.UTF_8))
+                .uri(uriBuilder -> uriBuilder.path("/quote/ltp").queryParam("i", sym).build())
                 .header("Authorization", "token " + kiteConfig.getApiKey() + ":" + token)
                 .header("X-Kite-Version", "3")
                 .retrieve()
@@ -188,13 +189,35 @@ public class KiteOptionChainProvider implements OptionChainProvider {
             .onErrorResume(e -> Mono.just(0.0));
     }
 
+    private String normalizeUnderlying(String underlying) {
+        if (underlying == null) return "NIFTY";
+        String s = underlying.toUpperCase().trim();
+        if (s.startsWith("NSE:") || s.startsWith("NFO:")) {
+            s = s.substring(s.indexOf(':') + 1).trim();
+        }
+        return switch (s) {
+            case "NIFTY 50", "NIFTY50", "NIFTY_50" -> "NIFTY";
+            case "NIFTY BANK", "BANKNIFTY_50", "BANK NIFTY" -> "BANKNIFTY";
+            case "NIFTY FIN SERVICE", "FINNIFTY_50", "FIN NIFTY" -> "FINNIFTY";
+            case "NIFTY MID SELECT", "MIDCPNIFTY_50" -> "MIDCPNIFTY";
+            case "NIFTY NEXT 50", "NIFTYNXT50" -> "NIFTYNXT50";
+            default -> s;
+        };
+    }
+
     private String mapToKiteCanonicalIndex(String underlying) {
         if (underlying == null) return "NSE:NIFTY 50";
-        return switch (underlying.toUpperCase().trim()) {
-            case "NIFTY", "NIFTY 50", "NIFTY50" -> "NSE:NIFTY 50";
-            case "BANKNIFTY", "NIFTY BANK" -> "NSE:NIFTY BANK";
-            case "FINNIFTY", "NIFTY FIN SERVICE" -> "NSE:NIFTY FIN SERVICE";
-            default -> underlying.startsWith("NSE:") ? underlying : "NSE:" + underlying;
+        String s = underlying.toUpperCase().trim();
+        if (s.startsWith("NSE:") || s.startsWith("NFO:")) {
+            s = s.substring(s.indexOf(':') + 1).trim();
+        }
+        return switch (s) {
+            case "NIFTY", "NIFTY 50", "NIFTY50", "NIFTY_50" -> "NSE:NIFTY 50";
+            case "BANKNIFTY", "NIFTY BANK", "BANKNIFTY_50", "BANK NIFTY" -> "NSE:NIFTY BANK";
+            case "FINNIFTY", "NIFTY FIN SERVICE", "FINNIFTY_50", "FIN NIFTY" -> "NSE:NIFTY FIN SERVICE";
+            case "MIDCPNIFTY", "NIFTY MID SELECT", "MIDCPNIFTY_50" -> "NSE:NIFTY MID SELECT";
+            case "NIFTYNXT50", "NIFTY NEXT 50" -> "NSE:NIFTY NEXT 50";
+            default -> "NSE:" + s;
         };
     }
 

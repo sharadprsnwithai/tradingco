@@ -231,7 +231,13 @@ public class InstrumentMasterService {
         if (s.endsWith("_FUT")) {
             String name = s.substring(0, s.length() - 4);
             log.info("[INSTR] '{}' not found as canonical — mapping to nearest {} FUT contract", symbol, name);
-            return findNearestExpiring(name, "FUT");
+            return findNearestExpiring(name, "FUT")
+                .doOnNext(inst -> log.info("[INSTR] '{}' resolved to {} (token={}, expiry={})",
+                    symbol, inst.canonicalSymbol(), inst.kiteToken(), inst.expiry()))
+                .switchIfEmpty(Mono.fromRunnable(() ->
+                    log.warn("[INSTR] '{}' resolution FAILED: findNearestExpiring('{}','FUT') returned empty — "
+                        + "no FUT contracts found with expiry >= today. Check instrument master sync.", symbol, name)
+                ).then(Mono.empty()));
         }
 
         // Index-style abstracts: NIFTY_50, BANKNIFTY_50, FINNIFTY_50, MIDCPNIFTY_50, ...
@@ -239,7 +245,13 @@ public class InstrumentMasterService {
         if (s.matches(".+_\\d+")) {
             String name = s.substring(0, s.lastIndexOf('_'));
             log.info("[INSTR] '{}' not found as canonical — mapping index '{}' to nearest FUT contract", symbol, name);
-            return findNearestExpiring(name, "FUT");
+            return findNearestExpiring(name, "FUT")
+                .doOnNext(inst -> log.info("[INSTR] '{}' resolved to {} (token={}, expiry={})",
+                    symbol, inst.canonicalSymbol(), inst.kiteToken(), inst.expiry()))
+                .switchIfEmpty(Mono.fromRunnable(() ->
+                    log.warn("[INSTR] '{}' resolution FAILED: findNearestExpiring('{}','FUT') returned empty — "
+                        + "no FUT contracts found with expiry >= today. Check instrument master sync.", symbol, name)
+                ).then(Mono.empty()));
         }
 
         // Spot index names on NSE (e.g. "NSE:NIFTY" from a strategy's spot subscription)
@@ -250,9 +262,16 @@ public class InstrumentMasterService {
         String indexTradingsymbol = INDEX_TRADING_SYMBOLS.get(s.toUpperCase());
         if (indexTradingsymbol != null && !symbol.startsWith("NFO:")) {
             log.info("[INSTR] '{}' not found as canonical — mapping to spot index '{}'", symbol, indexTradingsymbol);
-            return findIndexInstrument(indexTradingsymbol);
+            return findIndexInstrument(indexTradingsymbol)
+                .doOnNext(inst -> log.info("[INSTR] '{}' resolved to {} (token={})",
+                    symbol, inst.canonicalSymbol(), inst.kiteToken()))
+                .switchIfEmpty(Mono.fromRunnable(() ->
+                    log.warn("[INSTR] '{}' resolution FAILED: findIndexInstrument('{}') returned empty",
+                        symbol, indexTradingsymbol)
+                ).then(Mono.empty()));
         }
 
+        log.warn("[INSTR] '{}' resolution FAILED: no matching pattern in resolveAbstract()", symbol);
         return Mono.empty();
     }
 
@@ -461,7 +480,9 @@ public class InstrumentMasterService {
     /**
      * Finds the nearest-expiry instrument of a given type for an underlying
      * (e.g. name="NIFTY", instrumentType="FUT" for the current NIFTY futures contract).
-     * Only expiries on or after today (IST) are considered.
+     * Only expiries on or after today (IST) are considered. If no contract is found
+     * (e.g. on weekends/holidays where the nearest expiry just passed), falls back to
+     * expiries within the last 3 days to catch contracts that haven't been cleaned up.
      *
      * @param name           underlying name as in the instruments dump (e.g. "NIFTY")
      * @param instrumentType "FUT", "CE", or "PE"
@@ -480,6 +501,26 @@ public class InstrumentMasterService {
                     if (rs.next()) {
                         Instrument inst = mapRow(rs);
                         cacheActive(inst);
+                        return Optional.of(inst);
+                    }
+                }
+            }
+            // Fallback: on weekends/holidays the nearest expiry may have just passed.
+            // Look for contracts within the last 3 days that haven't been purged yet.
+            String fallbackStr = LocalDate.now(ZoneId.of("Asia/Kolkata")).minusDays(3).toString();
+            String fallbackSql = "SELECT * FROM instruments WHERE " + NAME_MATCH
+                + " = ? AND instrument_type = ? AND expiry >= ? AND expiry < ? ORDER BY expiry DESC LIMIT 1";
+            try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(fallbackSql)) {
+                ps.setString(1, name);
+                ps.setString(2, instrumentType);
+                ps.setString(3, fallbackStr);
+                ps.setString(4, todayStr);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        Instrument inst = mapRow(rs);
+                        cacheActive(inst);
+                        log.info("[INSTR] findNearestExpiring('{}','{}') falling back to recent expiry: {} (token={})",
+                            name, instrumentType, inst.expiry(), inst.kiteToken());
                         return Optional.of(inst);
                     }
                 }
