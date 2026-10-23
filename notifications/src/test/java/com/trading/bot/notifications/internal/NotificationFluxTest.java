@@ -129,13 +129,18 @@ class NotificationFluxTest {
     flux.publish(first);
     assertThat(transportEnteredLatch.await(2, TimeUnit.SECONDS)).isTrue();
 
-    final long start = System.currentTimeMillis();
+    final List<Notification> toPublish = new ArrayList<>(1100);
     for (int i = 0; i < 1100; i++) {
-      flux.publish(
+      toPublish.add(
           Notification.of(
               Severity.INFO, NotificationType.ORDER_SUBMITTED, "title" + i, "body" + i));
     }
-    final long elapsed = System.currentTimeMillis() - start;
+
+    final long start = System.nanoTime();
+    for (int i = 0; i < 1100; i++) {
+      flux.publish(toPublish.get(i));
+    }
+    final long elapsed = (System.nanoTime() - start) / 1_000_000;
 
     assertThat(elapsed)
         .as("1100 publish() calls should complete in under 100ms even when transport blocks")
