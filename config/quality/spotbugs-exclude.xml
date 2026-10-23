@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<FindBugsFilter>
+    <!--
+      Lombok-generated members (@EqualsAndHashCode, @Builder, accessors) are invisible
+      to SpotBugs as generated code; these are their known false-positive patterns.
+      Tune when real Lombok-annotated classes land (Task 2+).
+    -->
+    <Match>
+        <Bug pattern="EQ_DOESNT_IMPLEMENT_EQUALS,EQ_DOESNT_OVERRIDE_EQUALS"/>
+    </Match>
+    <Match>
+        <Bug pattern="RCN_REDUNDANT_NULLCHECK_OF_NONNULL_VALUE,RCN_REDUNDANT_NULLCHECK_WOULD_HAVE_BEEN_A_NPE"/>
+    </Match>
+    <Match>
+        <Bug pattern="UWF_FIELD_NOT_INITIALIZED_IN_CONSTRUCTOR"/>
+    </Match>
+</FindBugsFilter>
