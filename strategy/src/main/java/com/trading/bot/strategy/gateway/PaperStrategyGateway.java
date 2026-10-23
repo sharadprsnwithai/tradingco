@@ -9,10 +9,15 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 /** Simulates fills using real-time quotes without placing real capital at risk. */
-@Component
+@Component("paperStrategyGateway")
+@ConditionalOnProperty(
+    name = "strategy.execution-mode",
+    havingValue = "PAPER",
+    matchIfMissing = true)
 public final class PaperStrategyGateway implements StrategyExecutionGateway {
 
   private final Broker broker;

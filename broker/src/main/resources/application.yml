@@ -27,3 +27,11 @@ kite:
     max-attempts-per-hour: 3
   orders:
     lost-grace: 30s
+
+strategy:
+  execution-mode: ${STRATEGY_EXECUTION_MODE:PAPER}
+  lots: ${STRATEGY_LOTS:2}
+  sl-percentage: ${STRATEGY_SL_PERCENTAGE:30.0}
+  trail-to-breakeven: ${STRATEGY_TRAIL_TO_BREAKEVEN:true}
+  nifty-hedge-distance: 1000
+  sensex-hedge-distance: 2000

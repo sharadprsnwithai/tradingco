@@ -18,6 +18,7 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-actuator")
     implementation("dev.samstevens.totp:totp:1.7.1")
 
+    testImplementation(project(":strategy"))
     testImplementation("org.springframework.boot:spring-boot-starter-test")
 }
 

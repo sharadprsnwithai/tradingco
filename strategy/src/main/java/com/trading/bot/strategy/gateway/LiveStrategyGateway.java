@@ -18,10 +18,12 @@ import java.util.Objects;
 import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 /** Executes real trades on Zerodha Kite Connect via the Broker port. */
-@Component
+@Component("liveStrategyGateway")
+@ConditionalOnProperty(name = "strategy.execution-mode", havingValue = "LIVE")
 public final class LiveStrategyGateway implements StrategyExecutionGateway {
 
   private static final Logger LOG = LoggerFactory.getLogger(LiveStrategyGateway.class);
