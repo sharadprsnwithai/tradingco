@@ -37,6 +37,7 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -62,14 +63,18 @@ public final class KiteBroker implements Broker {
   private final KiteHttpClient httpClient;
   private final ExecutionTracker tracker;
   private final NotificationPublisher publisher;
+  private final KiteTickerClient tickerClient;
   private final Clock clock;
   private final AtomicLong tagCounter = new AtomicLong(0);
   private final SecureRandom random = new SecureRandom();
 
   @Autowired
   public KiteBroker(
-      KiteHttpClient httpClient, ExecutionTracker tracker, NotificationPublisher publisher) {
-    this(httpClient, tracker, publisher, Clock.system(ZoneId.of("Asia/Kolkata")));
+      KiteHttpClient httpClient,
+      ExecutionTracker tracker,
+      NotificationPublisher publisher,
+      @Autowired(required = false) KiteTickerClient tickerClient) {
+    this(httpClient, tracker, publisher, tickerClient, Clock.system(ZoneId.of("Asia/Kolkata")));
   }
 
   public KiteBroker(
@@ -77,9 +82,19 @@ public final class KiteBroker implements Broker {
       ExecutionTracker tracker,
       NotificationPublisher publisher,
       Clock clock) {
+    this(httpClient, tracker, publisher, null, clock);
+  }
+
+  public KiteBroker(
+      KiteHttpClient httpClient,
+      ExecutionTracker tracker,
+      NotificationPublisher publisher,
+      KiteTickerClient tickerClient,
+      Clock clock) {
     this.httpClient = Objects.requireNonNull(httpClient, "httpClient must not be null");
     this.tracker = Objects.requireNonNull(tracker, "tracker must not be null");
     this.publisher = Objects.requireNonNull(publisher, "publisher must not be null");
+    this.tickerClient = tickerClient;
     this.clock = Objects.requireNonNull(clock, "clock must not be null");
   }
 
@@ -246,18 +261,52 @@ public final class KiteBroker implements Broker {
       return Map.of();
     }
 
+    final Map<InstrumentToken, Quote> result = new HashMap<>();
+    final List<QuoteRef> missingRefs = new ArrayList<>();
+
+    if (tickerClient != null) {
+      final List<Long> tokensToSubscribe = new ArrayList<>();
+      for (final QuoteRef ref : refs) {
+        final Optional<BigDecimal> wsLtp = tickerClient.getLtp(ref.token().value());
+        if (wsLtp.isPresent()) {
+          result.put(
+              ref.token(),
+              new Quote(
+                  ref.token(),
+                  ref.tradingsymbol(),
+                  wsLtp.get(),
+                  BigDecimal.ZERO,
+                  BigDecimal.ZERO,
+                  BigDecimal.ZERO,
+                  BigDecimal.ZERO,
+                  0L));
+        } else {
+          missingRefs.add(ref);
+          tokensToSubscribe.add(ref.token().value());
+        }
+      }
+      if (!tokensToSubscribe.isEmpty()) {
+        tickerClient.subscribe(tokensToSubscribe);
+      }
+    } else {
+      missingRefs.addAll(refs);
+    }
+
+    if (missingRefs.isEmpty()) {
+      return result;
+    }
+
     final String query =
-        refs.stream()
+        missingRefs.stream()
             .map(r -> "i=" + r.exchange().name() + ":" + r.tradingsymbol())
             .collect(Collectors.joining("&"));
 
     final QuoteDto dto = httpClient.get("/quote?" + query, QuoteDto.class, Mutability.READ);
     if (dto == null || dto.data() == null) {
-      return Map.of();
+      return result;
     }
 
-    final Map<InstrumentToken, Quote> result = new HashMap<>();
-    for (final QuoteRef ref : refs) {
+    for (final QuoteRef ref : missingRefs) {
       final String key = ref.exchange().name() + ":" + ref.tradingsymbol();
       final QuoteDataDto qData = dto.data().get(key);
       if (qData != null) {
