@@ -70,22 +70,24 @@
 
 ---
 
-### Task 3: Instrument Resolver & Strike Mathematics
+### Task 3: Instrument Resolver, Expiry Mathematics & Symbol Builder
 
 **Files:**
 - Create: `strategy/src/main/java/com/trading/bot/strategy/engine/InstrumentResolver.java`
+- Create: `strategy/src/main/java/com/trading/bot/strategy/engine/ExpiryCalculator.java`
 - Create: `strategy/src/main/java/com/trading/bot/strategy/model/TargetIndex.java`
 - Create: `strategy/src/main/java/com/trading/bot/strategy/model/StrikeSelection.java`
 - Test: `strategy/src/test/java/com/trading/bot/strategy/engine/InstrumentResolverTest.java`
 
 **Interfaces:**
 - Produces:
-  - `enum TargetIndex { NIFTY, SENSEX }` with step size (50 vs 100), hedge distance (1,000 vs 2,000), and schedule days (Mon/Tue vs Wed/Thu).
+  - `enum TargetIndex { NIFTY, SENSEX }` with step size (50 vs 100), hedge distance (1,000 vs 2,000), lot size (65 vs 20), spot token (`256265L` for NIFTY, `265L` for SENSEX), and schedule days (Mon/Tue vs Wed/Thu).
+  - `ExpiryCalculator`: determines current near-week expiry date for NIFTY (Thursday) and SENSEX (Friday), adjusting for holidays.
   - `record StrikeSelection(int atmStrike, int otmCeStrike, int otmPeStrike)`
   - `@Component InstrumentResolver`:
     - `int computeAtmStrike(TargetIndex index, double spotPrice)`: rounds to nearest 50 for Nifty, nearest 100 for Sensex; midpoint tie-breaker rounds up (Review Focus 1).
     - `StrikeSelection selectStrikes(TargetIndex index, double spotPrice)`: returns ATM, +20 OTM CE strike, -20 OTM PE strike.
-    - `String formatContractSymbol(TargetIndex index, LocalDate expiry, int strike, OptionType type)`: formats Kite tradingsymbol.
+    - `String formatContractSymbol(TargetIndex index, LocalDate expiry, int strike, String optionType)`: formats valid Kite derivative tradingsymbol (e.g. `NIFTY26OCT25000CE` or `NIFTY26O2925000CE`).
 
 - [ ] **Step 1: Write failing test** covering:
   - NIFTY strike rounding (24,924 -> 24,900; 24,926 -> 24,950; 24,975.00 -> 25,000 midpoint).
@@ -98,7 +100,7 @@
 
 ---
 
-### Task 4: Strategy State Machine & Daily Persistence
+### Task 4: Strategy State Machine & Atomic Daily Persistence
 
 **Files:**
 - Create: `strategy/src/main/java/com/trading/bot/strategy/model/StrategyState.java`
@@ -110,9 +112,9 @@
 **Interfaces:**
 - Produces:
   - `enum StrategyState { IDLE, HEDGED, STRADDLE_ACTIVE, ONE_LEG_STOPPED, COMPLETED, ABORTED }`
-  - `record TradeLeg(String symbol, InstrumentToken token, int quantity, BigDecimal entryPrice, BigDecimal slPrice, boolean isOpen)`
+  - `record TradeLeg(String symbol, InstrumentToken token, int quantity, BigDecimal entryPrice, BigDecimal exitPrice, BigDecimal slPrice, OrderId slOrderId, boolean isOpen)`
   - `record DailyTradeRecord(LocalDate date, TargetIndex index, StrategyState state, TradeLeg hedgeCe, TradeLeg hedgePe, TradeLeg shortCe, TradeLeg shortPe, BigDecimal realizedPnl)`
-  - `@Component StrategyStateRepository`: saves and loads today's record from `data/strategy_state.json`.
+  - `@Component StrategyStateRepository`: saves atomically via temp file + `ATOMIC_MOVE` to prevent file corruption, loads today's record from `data/strategy_state.json`.
 
 - [ ] **Step 1: Write failing test** asserting serialization, deserialization, state updates, and recovery from disk on simulated restart (Review Focus 4).
 - [ ] **Step 2: Run** `./gradlew :strategy:test` → expected: FAIL.

@@ -94,13 +94,13 @@ strategy/                 # Strategy domain engine
 
 ### 4.1 Index Specifications & Schedule
 
-| Day | Target Index | Exchange | Strike Step | Hedge Distance (20 Strikes) | Expiry Target |
-|---|---|---|---|---|---|
-| **Monday** | NIFTY 50 | NSE / NFO | 50 points | ±1,000 points | Current weekly expiry |
-| **Tuesday** | NIFTY 50 | NSE / NFO | 50 points | ±1,000 points | Current weekly expiry |
-| **Wednesday** | SENSEX | BSE / BFO | 100 points | ±2,000 points | Current weekly expiry |
-| **Thursday** | SENSEX | BSE / BFO | 100 points | ±2,000 points | Current weekly expiry |
-| **Friday** | *None* | — | — | — | Standby / Flat |
+| Day | Target Index | Spot Exchange / Token | Deriv Exchange | Strike Step | Lot Size | Hedge Distance (20 Strikes) | Weekly Expiry Day |
+|---|---|---|---|---|---|---|---|
+| **Monday** | NIFTY 50 | NSE (`256265`) | NFO | 50 points | 65 | ±1,000 points | Current week Thursday |
+| **Tuesday** | NIFTY 50 | NSE (`256265`) | NFO | 50 points | 65 | ±1,000 points | Current week Thursday |
+| **Wednesday** | SENSEX | BSE (`265`) | BFO | 100 points | 20 | ±2,000 points | Current week Friday |
+| **Thursday** | SENSEX | BSE (`265`) | BFO | 100 points | 20 | ±2,000 points | Current week Friday |
+| **Friday** | *None* | — | — | — | — | — | Standby / Flat |
 
 ### 4.2 Timeline & State Machine
 
@@ -196,26 +196,18 @@ All parameters are bound via Spring `@ConfigurationProperties("strategy")` with 
 
 ---
 
-## 6. Persistence & Crash Recovery
+## 6. Persistence, Crash Recovery & Atomic Writes
 
-A daily trade state file (`data/strategy_state.json`) tracks:
-```json
-{
-  "date": "2026-10-26",
-  "index": "NIFTY",
-  "mode": "PAPER",
-  "state": "STRADDLE_ACTIVE",
-  "hedgeCe": { "symbol": "NIFTY26OCT26000CE", "qty": 100, "entryPrice": 3.20 },
-  "hedgePe": { "symbol": "NIFTY26OCT24000PE", "qty": 100, "entryPrice": 4.10 },
-  "shortCe": { "symbol": "NIFTY26OCT25000CE", "qty": 100, "entryPrice": 120.00, "slPrice": 156.00, "status": "OPEN" },
-  "shortPe": { "symbol": "NIFTY26OCT25000PE", "qty": 100, "entryPrice": 110.00, "slPrice": 143.00, "status": "OPEN" },
-  "realizedPnl": 0.0
-}
-```
+A daily trade state file (`data/strategy_state.json`) tracks all active trade details. To eliminate race conditions and corrupted file writes during container power cycles or ungraceful terminations, `StrategyStateRepository` performs **atomic file writes**:
+1. Writes state payload to a temporary file in the same filesystem directory: `data/strategy_state.json.tmp`.
+2. Flushes and syncs to disk.
+3. Performs `Files.move(tempFile, stateFile, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)`.
+
 On application restart:
 1. If file exists for today's date and state is `STRADDLE_ACTIVE` or `ONE_LEG_STOPPED`:
-   - Re-adopts the tracked positions.
-   - Resumes live quote risk monitoring for remaining open legs.
+   - Re-adopts the tracked positions and active exchange SL order IDs (`slOrderId`).
+   - Cross-checks with `broker.orderBook()` to reconcile any fills that occurred while offline.
+   - Resumes live quote risk monitoring and order tracking for remaining open legs.
    - Avoids placing duplicate hedge or straddle orders.
 2. If time > 15:00 IST on restart with active positions, immediately executes catch-up square-off.
 
