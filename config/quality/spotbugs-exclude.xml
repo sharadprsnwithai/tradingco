@@ -14,9 +14,13 @@
     <Match>
         <Bug pattern="UWF_FIELD_NOT_INITIALIZED_IN_CONSTRUCTOR"/>
     </Match>
-    <!-- Notification is an immutable record; SpotBugs treats its Throwable field as mutable (EI/EI2). -->
+    <!-- Notification and Margins are immutable records; SpotBugs flags their non-primitive fields as mutable (EI/EI2). -->
     <Match>
         <Class name="com.trading.bot.notifications.api.Notification"/>
+        <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
+    </Match>
+    <Match>
+        <Class name="com.trading.bot.broker.api.model.Margins"/>
         <Bug pattern="EI_EXPOSE_REP,EI_EXPOSE_REP2"/>
     </Match>
 </FindBugsFilter>
