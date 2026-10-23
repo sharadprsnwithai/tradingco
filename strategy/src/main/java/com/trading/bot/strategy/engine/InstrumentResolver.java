@@ -1,5 +1,6 @@
 package com.trading.bot.strategy.engine;
 
+import com.trading.bot.broker.api.model.InstrumentToken;
 import com.trading.bot.strategy.model.StrikeSelection;
 import com.trading.bot.strategy.model.TargetIndex;
 import java.time.LocalDate;
@@ -73,5 +74,21 @@ public final class InstrumentResolver {
         };
     return String.format(
         Locale.ROOT, "%s%02d%c%02d%d%s", index.name(), year, mChar, day, strike, optionType);
+  }
+
+  /**
+   * Generates a unique, collision-free numeric InstrumentToken for an option contract.
+   *
+   * @param index target index
+   * @param strike strike price
+   * @param optionType CE or PE
+   * @return unique InstrumentToken
+   */
+  public InstrumentToken createOptionToken(TargetIndex index, int strike, String optionType) {
+    Objects.requireNonNull(index, "index must not be null");
+    Objects.requireNonNull(optionType, "optionType must not be null");
+    final long typeOffset = "CE".equalsIgnoreCase(optionType) ? 1L : 2L;
+    final long value = (index.ordinal() * 10_000_000L) + (strike * 10L) + typeOffset;
+    return new InstrumentToken(value);
   }
 }

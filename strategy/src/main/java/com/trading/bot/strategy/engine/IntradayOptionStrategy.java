@@ -116,8 +116,7 @@ public final class IntradayOptionStrategy {
   }
 
   /** Checkpoint 1: 09:45 AM IST - Buy 20 OTM CE and PE hedges. */
-  @Scheduled(cron = "0 45 9 * * MON-THU", zone = KOLKATA_ZONE)
-  public void executeHedge() {
+  public synchronized void executeHedge() {
     final LocalDate today = LocalDate.now(clock);
     final TargetIndex index = getTargetIndexForDate(today);
     if (index == null) {
@@ -145,8 +144,8 @@ public final class IntradayOptionStrategy {
     final LocalDate expiry = ExpiryCalculator.getWeeklyExpiry(index, today);
     final String ceSymbol = resolver.formatOptionSymbol(index, expiry, strikes.otmCeStrike(), "CE");
     final String peSymbol = resolver.formatOptionSymbol(index, expiry, strikes.otmPeStrike(), "PE");
-    final InstrumentToken ceToken = new InstrumentToken(strikes.otmCeStrike());
-    final InstrumentToken peToken = new InstrumentToken(strikes.otmPeStrike());
+    final InstrumentToken ceToken = resolver.createOptionToken(index, strikes.otmCeStrike(), "CE");
+    final InstrumentToken peToken = resolver.createOptionToken(index, strikes.otmPeStrike(), "PE");
 
     final BigDecimal ceFill = gateway.executeBuyMarket(ceSymbol, ceToken, derivExchange, qty);
     final BigDecimal peFill = gateway.executeBuyMarket(peSymbol, peToken, derivExchange, qty);
@@ -163,9 +162,8 @@ public final class IntradayOptionStrategy {
   }
 
   /** Checkpoint 2: 10:00 AM IST - Sell ATM CE and ATM PE straddle with atomic rollback. */
-  @Scheduled(cron = "0 0 10 * * MON-THU", zone = KOLKATA_ZONE)
   @SuppressWarnings("PMD.AvoidCatchingGenericException")
-  public void executeStraddle() {
+  public synchronized void executeStraddle() {
     final LocalDate today = LocalDate.now(clock);
     final TargetIndex index = getTargetIndexForDate(today);
     if (index == null) {
@@ -195,8 +193,8 @@ public final class IntradayOptionStrategy {
     final LocalDate expiry = ExpiryCalculator.getWeeklyExpiry(index, today);
     final String ceSymbol = resolver.formatOptionSymbol(index, expiry, atmStrike, "CE");
     final String peSymbol = resolver.formatOptionSymbol(index, expiry, atmStrike, "PE");
-    final InstrumentToken ceToken = new InstrumentToken(atmStrike);
-    final InstrumentToken peToken = new InstrumentToken(atmStrike);
+    final InstrumentToken ceToken = resolver.createOptionToken(index, atmStrike, "CE");
+    final InstrumentToken peToken = resolver.createOptionToken(index, atmStrike, "PE");
 
     final double slMultiplier = 1.0 + (props.slPercentage() / 100.0);
 
@@ -286,9 +284,35 @@ public final class IntradayOptionStrategy {
     }
   }
 
+  /**
+   * Resilient periodic checkpoint runner executing checkpoints within safe 4-minute time windows.
+   */
+  @Scheduled(fixedDelay = 5000)
+  public synchronized void scheduledCheckpoints() {
+    final LocalTime now = LocalTime.now(clock);
+    final LocalDate today = LocalDate.now(clock);
+    if (getTargetIndexForDate(today) == null) {
+      return;
+    }
+
+    // 09:45 window (09:45:00 to 09:49:00)
+    if (!now.isBefore(props.hedgeTime()) && now.isBefore(props.hedgeTime().plusMinutes(4))) {
+      executeHedge();
+    }
+
+    // 10:00 window (10:00:00 to 10:04:00)
+    if (!now.isBefore(props.entryTime()) && now.isBefore(props.entryTime().plusMinutes(4))) {
+      executeStraddle();
+    }
+
+    // 15:00 window (15:00:00 to 15:15:00)
+    if (!now.isBefore(props.exitTime()) && now.isBefore(props.exitTime().plusMinutes(15))) {
+      executeSquareOff();
+    }
+  }
+
   /** Checkpoint 4: 15:00 PM IST - Mandatory EOD Square-Off of all active legs. */
-  @Scheduled(cron = "0 0 15 * * MON-THU", zone = KOLKATA_ZONE)
-  public void executeSquareOff() {
+  public synchronized void executeSquareOff() {
     final LocalDate today = LocalDate.now(clock);
     final DailyTradeRecord record = stateRepository.load(today).orElse(null);
     if (record == null

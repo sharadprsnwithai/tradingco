@@ -311,6 +311,20 @@ public final class PositionRiskManager {
       newState = StrategyState.STRADDLE_ACTIVE;
     }
 
+    BigDecimal updatedPnl = record.realizedPnl() != null ? record.realizedPnl() : BigDecimal.ZERO;
+    if (shortCe != null
+        && !shortCe.isOpen()
+        && record.shortCe() != null
+        && record.shortCe().isOpen()) {
+      updatedPnl = updatedPnl.add(shortCe.calculatePnl(true));
+    }
+    if (shortPe != null
+        && !shortPe.isOpen()
+        && record.shortPe() != null
+        && record.shortPe().isOpen()) {
+      updatedPnl = updatedPnl.add(shortPe.calculatePnl(true));
+    }
+
     final DailyTradeRecord updated =
         new DailyTradeRecord(
             record.date(),
@@ -320,7 +334,7 @@ public final class PositionRiskManager {
             record.hedgePe(),
             shortCe,
             shortPe,
-            record.realizedPnl());
+            updatedPnl);
 
     stateRepository.save(updated);
     return updated;

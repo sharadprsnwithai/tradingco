@@ -58,13 +58,13 @@ class InstrumentResolverTest {
   }
 
   @Test
-  void weeklyExpiryCalculatorFindsUpcomingThursdayForNiftyAndFridayForSensex() {
+  void weeklyExpiryCalculatorFindsUpcomingTuesdayForNiftyAndThursdayForSensex() {
     final LocalDate monday = LocalDate.of(2026, 10, 26);
     final LocalDate niftyExpiry = ExpiryCalculator.getWeeklyExpiry(TargetIndex.NIFTY, monday);
-    assertThat(niftyExpiry).isEqualTo(LocalDate.of(2026, 10, 29)); // Thursday 29-Oct-2026
+    assertThat(niftyExpiry).isEqualTo(LocalDate.of(2026, 10, 27)); // Tuesday 27-Oct-2026
 
     final LocalDate sensexExpiry = ExpiryCalculator.getWeeklyExpiry(TargetIndex.SENSEX, monday);
-    assertThat(sensexExpiry).isEqualTo(LocalDate.of(2026, 10, 30)); // Friday 30-Oct-2026
+    assertThat(sensexExpiry).isEqualTo(LocalDate.of(2026, 10, 29)); // Thursday 29-Oct-2026
   }
 
   @Test

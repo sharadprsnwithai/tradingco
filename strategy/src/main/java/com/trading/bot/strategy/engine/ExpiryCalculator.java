@@ -22,8 +22,10 @@ public final class ExpiryCalculator {
     Objects.requireNonNull(index, "index must not be null");
     Objects.requireNonNull(currentDate, "currentDate must not be null");
 
+    // Mon/Tue -> NIFTY 1-DTE & 0-DTE (target Tuesday expiry)
+    // Wed/Thu -> SENSEX 1-DTE & 0-DTE (target Thursday expiry)
     final DayOfWeek targetExpiryDay =
-        index == TargetIndex.NIFTY ? DayOfWeek.THURSDAY : DayOfWeek.FRIDAY;
+        index == TargetIndex.NIFTY ? DayOfWeek.TUESDAY : DayOfWeek.THURSDAY;
 
     if (currentDate.getDayOfWeek().getValue() <= targetExpiryDay.getValue()) {
       return currentDate.with(TemporalAdjusters.nextOrSame(targetExpiryDay));
