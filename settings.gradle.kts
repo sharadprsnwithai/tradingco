@@ -6,4 +6,4 @@ dependencyResolutionManagement {
     }
 }
 
-include("notifications", "broker")
+include("notifications", "broker", "strategy")

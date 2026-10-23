@@ -10,6 +10,7 @@ application {
 
 dependencies {
     implementation(project(":notifications"))
+    runtimeOnly(project(":strategy"))
     implementation("org.springframework.boot:spring-boot-starter")
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-json")
