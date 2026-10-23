@@ -132,8 +132,8 @@ def simulate_day(day_df, instrument, mode, daily_iv, lots=2, move_to_breakeven=F
     strike_step = 50.0 if instrument == 'NIFTY' else 100.0
     hedge_distance = 20 * strike_step  # 1,000 pts Nifty, 2,000 pts Sensex
 
-    # Lot sizes (NIFTY = 25, SENSEX = 10; 2 lots = 50 and 20)
-    qty_per_lot = 25 if instrument == 'NIFTY' else 10
+    # Lot sizes (NIFTY = 65, SENSEX = 20; 2 lots = 130 and 40)
+    qty_per_lot = 65 if instrument == 'NIFTY' else 20
     total_qty = lots * qty_per_lot
 
     # Expiry date

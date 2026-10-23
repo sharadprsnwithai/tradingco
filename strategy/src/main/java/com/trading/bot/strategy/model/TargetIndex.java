@@ -4,8 +4,8 @@ import com.trading.bot.broker.api.model.Exchange;
 
 /** Underlying index target specifications for intraday trading. */
 public enum TargetIndex {
-  NIFTY(50, 1000, 25, Exchange.NSE, "NIFTY 50"),
-  SENSEX(100, 2000, 10, Exchange.BSE, "SENSEX");
+  NIFTY(50, 1000, 65, Exchange.NSE, "NIFTY 50"),
+  SENSEX(100, 2000, 20, Exchange.BSE, "SENSEX");
 
   private final int step;
   private final int hedgeDist;
