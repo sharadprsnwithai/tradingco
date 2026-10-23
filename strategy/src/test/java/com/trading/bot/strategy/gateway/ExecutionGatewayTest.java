@@ -42,7 +42,30 @@ class ExecutionGatewayTest {
     final Broker broker = mock(Broker.class);
     final StrategyExecutionGateway gateway = new LiveStrategyGateway(broker);
 
-    when(broker.placeOrder(any())).thenReturn(new OrderId("order-101"));
+    final OrderId orderId = new OrderId("order-101");
+    when(broker.placeOrder(any())).thenReturn(orderId);
+
+    final com.trading.bot.broker.api.model.Order filledOrder =
+        new com.trading.bot.broker.api.model.Order(
+            orderId,
+            java.util.Optional.empty(),
+            Exchange.NFO,
+            "NIFTY26OCT25000CE",
+            TransactionType.BUY,
+            OrderType.MARKET,
+            com.trading.bot.broker.api.model.Product.MIS,
+            com.trading.bot.broker.api.model.Validity.DAY,
+            com.trading.bot.broker.api.model.OrderStatus.FILLED,
+            "COMPLETE",
+            130,
+            130,
+            0,
+            BigDecimal.ZERO,
+            BigDecimal.ZERO,
+            BigDecimal.valueOf(120.50),
+            "",
+            java.time.Instant.now());
+    when(broker.orderBook()).thenReturn(List.of(filledOrder));
 
     final InstrumentToken token = new InstrumentToken(256265L);
     final BigDecimal price =
@@ -57,8 +80,8 @@ class ExecutionGatewayTest {
     assertThat(req.orderType()).isEqualTo(OrderType.MARKET);
     assertThat(req.quantity()).isEqualTo(130);
 
-    // Live gateway returns estimated price or non-negative
-    assertThat(price).isGreaterThanOrEqualTo(BigDecimal.ZERO);
+    // Live gateway extracts execution averagePrice directly from the order book
+    assertThat(price).isEqualByComparingTo(BigDecimal.valueOf(120.50));
   }
 
   @Test

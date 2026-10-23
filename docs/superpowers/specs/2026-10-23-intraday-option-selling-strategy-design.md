@@ -176,6 +176,14 @@ digraph StrategyLifecycle {
 4. Save state as `COMPLETED`.
 5. Publish daily summary notification with final P&L breakdown.
 
+### 4.3 Institutional Production Safeguards
+1. **Instrument Token Resolution:** Contract lookups match real exchange tokens (e.g. `256265` for Nifty, `265` for Sensex, and official Kite derivative tokens) rather than synthetic strike approximations.
+2. **Order Execution Fill Price Extraction:** Entry and exit prices are captured from actual broker order execution reports (`averagePrice`), never unconfirmed ₹0.00 quote estimations.
+3. **Orphan Order Prevention:** Whenever a software/quote stop-loss executes a market buy, the resting exchange `BUY SL` order is immediately cancelled to prevent accidental position flipping.
+4. **Straddle Atomic Rollback:** If selling leg 1 (CE) succeeds but leg 2 (PE) fails or is rejected, leg 1 is immediately unwound via market buy to prevent unhedged single-leg exposure.
+5. **Exchange Trigger Rule Pre-Validation:** Prior to modifying a surviving leg's SL order down to cost, verify $LTP < TriggerPrice$. If $LTP \ge TriggerPrice$ already, cancel the SL order and execute an emergency market exit.
+6. **Resilient Entry Windows:** 09:45 hedge and 10:00 straddle execution runs on a 5-second resilient buffer window (e.g. 09:45:00–09:49:00 and 10:00:00–10:04:00) so a 500ms network lag does not abort the trading day.
+
 ---
 
 ## 5. Configuration & Environment Tunables

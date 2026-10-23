@@ -122,6 +122,11 @@ public final class PositionRiskManager {
           q != null && q.lastPrice() != null && q.lastPrice().compareTo(shortCe.slPrice()) >= 0;
 
       if (ceFilledAtExchange || quoteTriggered) {
+        if (!ceFilledAtExchange && shortCe.slOrderId() != null) {
+          // Cancel resting exchange SL order to prevent position flipping
+          gateway.cancelOrder(shortCe.slOrderId());
+        }
+
         final BigDecimal exitPrice =
             ceFilledAtExchange
                 ? ceExchangePrice
@@ -138,7 +143,7 @@ public final class PositionRiskManager {
                 shortCe.entryPrice(),
                 exitPrice,
                 shortCe.slPrice(),
-                shortCe.slOrderId(),
+                null,
                 false);
 
         if (isBreakevenExit) {
@@ -147,22 +152,49 @@ public final class PositionRiskManager {
           if (Boolean.TRUE.equals(props.trailToBreakeven())
               && shortPe != null
               && shortPe.isOpen()) {
-            if (shortPe.slOrderId() != null) {
-              final BigDecimal peLimit =
-                  roundToTick(shortPe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
-              gateway.modifyStopLoss(
-                  shortPe.slOrderId(), shortPe.quantity(), shortPe.entryPrice(), peLimit);
+            final Quote peQuote = quotes.get(shortPe.token());
+            final BigDecimal peLtp =
+                peQuote != null && peQuote.lastPrice() != null
+                    ? peQuote.lastPrice()
+                    : BigDecimal.ZERO;
+
+            if (peLtp.compareTo(shortPe.entryPrice()) >= 0) {
+              // Exchange rule: LTP >= TriggerPrice -> Emergency exit at market
+              if (shortPe.slOrderId() != null) {
+                gateway.cancelOrder(shortPe.slOrderId());
+              }
+              final BigDecimal peExit =
+                  gateway.executeBuyMarket(
+                      shortPe.symbol(), shortPe.token(), derivExchange, shortPe.quantity());
+              shortPe =
+                  new TradeLeg(
+                      shortPe.symbol(),
+                      shortPe.token(),
+                      shortPe.quantity(),
+                      shortPe.entryPrice(),
+                      peExit,
+                      shortPe.entryPrice(),
+                      null,
+                      false);
+              alertService.notifyBreakevenHit(shortPe, peExit, props.executionMode());
+            } else {
+              if (shortPe.slOrderId() != null) {
+                final BigDecimal peLimit =
+                    roundToTick(shortPe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
+                gateway.modifyStopLoss(
+                    shortPe.slOrderId(), shortPe.quantity(), shortPe.entryPrice(), peLimit);
+              }
+              shortPe =
+                  new TradeLeg(
+                      shortPe.symbol(),
+                      shortPe.token(),
+                      shortPe.quantity(),
+                      shortPe.entryPrice(),
+                      shortPe.exitPrice(),
+                      shortPe.entryPrice(),
+                      shortPe.slOrderId(),
+                      true);
             }
-            shortPe =
-                new TradeLeg(
-                    shortPe.symbol(),
-                    shortPe.token(),
-                    shortPe.quantity(),
-                    shortPe.entryPrice(),
-                    shortPe.exitPrice(),
-                    shortPe.entryPrice(),
-                    shortPe.slOrderId(),
-                    true);
           }
           alertService.notifyStopLossHit(shortCe, exitPrice, shortPe, props.executionMode());
         }
@@ -190,6 +222,11 @@ public final class PositionRiskManager {
           q != null && q.lastPrice() != null && q.lastPrice().compareTo(shortPe.slPrice()) >= 0;
 
       if (peFilledAtExchange || quoteTriggered) {
+        if (!peFilledAtExchange && shortPe.slOrderId() != null) {
+          // Cancel resting exchange SL order to prevent position flipping
+          gateway.cancelOrder(shortPe.slOrderId());
+        }
+
         final BigDecimal exitPrice =
             peFilledAtExchange
                 ? peExchangePrice
@@ -206,7 +243,7 @@ public final class PositionRiskManager {
                 shortPe.entryPrice(),
                 exitPrice,
                 shortPe.slPrice(),
-                shortPe.slOrderId(),
+                null,
                 false);
 
         if (isBreakevenExit) {
@@ -215,22 +252,49 @@ public final class PositionRiskManager {
           if (Boolean.TRUE.equals(props.trailToBreakeven())
               && shortCe != null
               && shortCe.isOpen()) {
-            if (shortCe.slOrderId() != null) {
-              final BigDecimal ceLimit =
-                  roundToTick(shortCe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
-              gateway.modifyStopLoss(
-                  shortCe.slOrderId(), shortCe.quantity(), shortCe.entryPrice(), ceLimit);
+            final Quote ceQuote = quotes.get(shortCe.token());
+            final BigDecimal ceLtp =
+                ceQuote != null && ceQuote.lastPrice() != null
+                    ? ceQuote.lastPrice()
+                    : BigDecimal.ZERO;
+
+            if (ceLtp.compareTo(shortCe.entryPrice()) >= 0) {
+              // Exchange rule: LTP >= TriggerPrice -> Emergency exit at market
+              if (shortCe.slOrderId() != null) {
+                gateway.cancelOrder(shortCe.slOrderId());
+              }
+              final BigDecimal ceExit =
+                  gateway.executeBuyMarket(
+                      shortCe.symbol(), shortCe.token(), derivExchange, shortCe.quantity());
+              shortCe =
+                  new TradeLeg(
+                      shortCe.symbol(),
+                      shortCe.token(),
+                      shortCe.quantity(),
+                      shortCe.entryPrice(),
+                      ceExit,
+                      shortCe.entryPrice(),
+                      null,
+                      false);
+              alertService.notifyBreakevenHit(shortCe, ceExit, props.executionMode());
+            } else {
+              if (shortCe.slOrderId() != null) {
+                final BigDecimal ceLimit =
+                    roundToTick(shortCe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
+                gateway.modifyStopLoss(
+                    shortCe.slOrderId(), shortCe.quantity(), shortCe.entryPrice(), ceLimit);
+              }
+              shortCe =
+                  new TradeLeg(
+                      shortCe.symbol(),
+                      shortCe.token(),
+                      shortCe.quantity(),
+                      shortCe.entryPrice(),
+                      shortCe.exitPrice(),
+                      shortCe.entryPrice(),
+                      shortCe.slOrderId(),
+                      true);
             }
-            shortCe =
-                new TradeLeg(
-                    shortCe.symbol(),
-                    shortCe.token(),
-                    shortCe.quantity(),
-                    shortCe.entryPrice(),
-                    shortCe.exitPrice(),
-                    shortCe.entryPrice(),
-                    shortCe.slOrderId(),
-                    true);
           }
           alertService.notifyStopLossHit(shortPe, exitPrice, shortCe, props.executionMode());
         }

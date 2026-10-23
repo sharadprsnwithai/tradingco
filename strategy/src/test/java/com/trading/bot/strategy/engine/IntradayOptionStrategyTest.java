@@ -37,7 +37,7 @@ import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
-@SuppressWarnings("PMD.UnitTestContainsTooManyAsserts")
+@SuppressWarnings({"PMD.UnitTestContainsTooManyAsserts", "PMD.AvoidDuplicateLiterals"})
 class IntradayOptionStrategyTest {
 
   private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
@@ -324,5 +324,89 @@ class IntradayOptionStrategyTest {
     assertThat(saved.state()).isEqualTo(StrategyState.STRADDLE_ACTIVE);
     assertThat(saved.shortCe().slOrderId()).isEqualTo(new OrderId("sl-101"));
     assertThat(saved.shortPe().slOrderId()).isEqualTo(new OrderId("sl-102"));
+  }
+
+  @Test
+  void straddleAtomicRollbackUnwindsCallIfPutFails() {
+    final Broker broker = mock(Broker.class);
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final InstrumentResolver resolver = new InstrumentResolver();
+    final PositionRiskManager riskManager = mock(PositionRiskManager.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final List<Notification> published = new ArrayList<>();
+    final NotificationPublisher publisher = published::add;
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final Clock clock = Clock.fixed(Instant.parse("2026-10-26T04:30:00Z"), IST);
+
+    final TradeLeg hCe =
+        new TradeLeg(
+            "NIFTY_H_CE",
+            new InstrumentToken(1L),
+            130,
+            BigDecimal.valueOf(3.50),
+            BigDecimal.ZERO,
+            true);
+    final TradeLeg hPe =
+        new TradeLeg(
+            "NIFTY_H_PE",
+            new InstrumentToken(2L),
+            130,
+            BigDecimal.valueOf(4.20),
+            BigDecimal.ZERO,
+            true);
+    final DailyTradeRecord hedgedRecord =
+        new DailyTradeRecord(
+            LocalDate.now(clock),
+            TargetIndex.NIFTY,
+            StrategyState.HEDGED,
+            hCe,
+            hPe,
+            null,
+            null,
+            BigDecimal.ZERO);
+
+    when(stateRepo.load(any())).thenReturn(Optional.of(hedgedRecord));
+
+    final InstrumentToken spotToken = new InstrumentToken(256265L);
+    when(broker.quotes(any()))
+        .thenReturn(
+            Map.of(spotToken, makeQuote(spotToken, "NIFTY 50", BigDecimal.valueOf(25000.0))));
+
+    // CE sell succeeds, PE sell throws exception
+    when(gateway.executeSellMarket(any(), any(), any(), anyInt()))
+        .thenReturn(BigDecimal.valueOf(100.0))
+        .thenThrow(new RuntimeException("Price freeze on PE"));
+    when(gateway.placeStopLossBuy(any(), any(), any(), anyInt(), any(), any()))
+        .thenReturn(new OrderId("sl-ce-101"));
+
+    final IntradayOptionStrategy strategy =
+        new IntradayOptionStrategy(
+            broker,
+            gateway,
+            resolver,
+            riskManager,
+            stateRepo,
+            alertService,
+            publisher,
+            props,
+            clock);
+
+    strategy.executeStraddle();
+
+    // Rollback: CE stop loss order cancelled
+    verify(gateway).cancelOrder(eq(new OrderId("sl-ce-101")));
+
+    // Rollback: CE bought back at market
+    verify(gateway).executeBuyMarket(any(), any(), eq(Exchange.NFO), eq(130));
+
+    // ABORTED state saved
+    final ArgumentCaptor<DailyTradeRecord> captor = ArgumentCaptor.forClass(DailyTradeRecord.class);
+    verify(stateRepo).save(captor.capture());
+    assertThat(captor.getValue().state()).isEqualTo(StrategyState.ABORTED);
+
+    // Critical alert published
+    assertThat(published)
+        .anyMatch(n -> n.title().contains("Rollback") || n.body().contains("Unwound CE"));
   }
 }

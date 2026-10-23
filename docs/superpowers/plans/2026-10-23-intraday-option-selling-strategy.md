@@ -24,10 +24,12 @@
 ## Review Focus
 
 1. **Midpoint Strike Boundary Rounding:** When NIFTY spot is on the exact midpoint boundary (e.g. 24,975.00), round deterministically to the upper strike (25,000) rather than floating-point drift. Tested in Task 3.
-2. **Hedge Failure Safety Interlock:** If 09:45 hedge buying is rejected or fails, the 10:00 short straddle MUST abort to prevent naked exposure. Tested in Task 7.
+2. **Hedge Failure Safety Interlock & Straddle Rollback:** If 09:45 hedge buying is rejected or fails, the 10:00 short straddle MUST abort to prevent naked exposure. If CE sells but PE rejects, CE must immediately rollback/unwind. Tested in Task 7.
 3. **Both Short Legs Stopped Simultaneously:** In volatile sessions where both CE and PE cross 30% SL, both close cleanly without double-exit attempts or race conditions. Tested in Task 6.
 4. **Mid-Day Crash Recovery & De-duplication:** On container restart at 11:30 IST with an active trade, re-adopt state from `data/strategy_state.json` without re-entering hedges or straddles. Tested in Task 4.
 5. **Post-Market Square-Off Catch-Up:** If restarted after 15:00 IST with unfinished state from an earlier crash, immediately execute catch-up square-off. Tested in Task 7.
+6. **Orphan SL Order Prevention & Exchange Trigger Rule:** Software stop-loss exits immediately cancel resting exchange SL orders to prevent position flipping; verify LTP < TriggerPrice before modifying SL to breakeven. Tested in Task 6.
+7. **Execution Fill Price Integrity:** Entry fill prices are verified > 0 from order execution reports to prevent false ₹0-based stop-out triggers. Tested in Task 5.
 
 ---
 

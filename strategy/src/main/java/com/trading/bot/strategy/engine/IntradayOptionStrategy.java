@@ -162,8 +162,9 @@ public final class IntradayOptionStrategy {
     alertService.notifyHedgeExecution(record, spot, props.executionMode());
   }
 
-  /** Checkpoint 2: 10:00 AM IST - Sell ATM CE and ATM PE straddle. */
+  /** Checkpoint 2: 10:00 AM IST - Sell ATM CE and ATM PE straddle with atomic rollback. */
   @Scheduled(cron = "0 0 10 * * MON-THU", zone = KOLKATA_ZONE)
+  @SuppressWarnings("PMD.AvoidCatchingGenericException")
   public void executeStraddle() {
     final LocalDate today = LocalDate.now(clock);
     final TargetIndex index = getTargetIndexForDate(today);
@@ -197,26 +198,66 @@ public final class IntradayOptionStrategy {
     final InstrumentToken ceToken = new InstrumentToken(atmStrike);
     final InstrumentToken peToken = new InstrumentToken(atmStrike);
 
-    final BigDecimal ceFill = gateway.executeSellMarket(ceSymbol, ceToken, derivExchange, qty);
-    final BigDecimal peFill = gateway.executeSellMarket(peSymbol, peToken, derivExchange, qty);
-
     final double slMultiplier = 1.0 + (props.slPercentage() / 100.0);
-    final BigDecimal ceSl = roundToTick(ceFill.multiply(BigDecimal.valueOf(slMultiplier)));
-    final BigDecimal ceSlLimit = roundToTick(ceSl.multiply(BigDecimal.valueOf(1.05)));
 
-    final BigDecimal peSl = roundToTick(peFill.multiply(BigDecimal.valueOf(slMultiplier)));
-    final BigDecimal peSlLimit = roundToTick(peSl.multiply(BigDecimal.valueOf(1.05)));
+    final TradeLeg sCe;
+    try {
+      final BigDecimal ceFill = gateway.executeSellMarket(ceSymbol, ceToken, derivExchange, qty);
+      final BigDecimal ceSl = roundToTick(ceFill.multiply(BigDecimal.valueOf(slMultiplier)));
+      final BigDecimal ceSlLimit = roundToTick(ceSl.multiply(BigDecimal.valueOf(1.05)));
+      final OrderId ceSlOrderId =
+          gateway.placeStopLossBuy(ceSymbol, ceToken, derivExchange, qty, ceSl, ceSlLimit);
+      sCe = new TradeLeg(ceSymbol, ceToken, qty, ceFill, BigDecimal.ZERO, ceSl, ceSlOrderId, true);
+    } catch (RuntimeException e) {
+      if (LOG.isErrorEnabled()) {
+        LOG.error("Failed executing CE leg during straddle entry: {}", e.getMessage(), e);
+      }
+      publisher.publish(
+          Notification.of(
+              Severity.CRITICAL,
+              NotificationType.SYSTEM_ALERT,
+              "Straddle CE Sell Failed",
+              "CE leg sell failed: " + e.getMessage()));
+      return;
+    }
 
-    // Immediately place exchange-level Stop-Loss orders with Kite at ~10:00 AM
-    final OrderId ceSlOrderId =
-        gateway.placeStopLossBuy(ceSymbol, ceToken, derivExchange, qty, ceSl, ceSlLimit);
-    final OrderId peSlOrderId =
-        gateway.placeStopLossBuy(peSymbol, peToken, derivExchange, qty, peSl, peSlLimit);
-
-    final TradeLeg sCe =
-        new TradeLeg(ceSymbol, ceToken, qty, ceFill, BigDecimal.ZERO, ceSl, ceSlOrderId, true);
-    final TradeLeg sPe =
-        new TradeLeg(peSymbol, peToken, qty, peFill, BigDecimal.ZERO, peSl, peSlOrderId, true);
+    final TradeLeg sPe;
+    try {
+      final BigDecimal peFill = gateway.executeSellMarket(peSymbol, peToken, derivExchange, qty);
+      final BigDecimal peSl = roundToTick(peFill.multiply(BigDecimal.valueOf(slMultiplier)));
+      final BigDecimal peSlLimit = roundToTick(peSl.multiply(BigDecimal.valueOf(1.05)));
+      final OrderId peSlOrderId =
+          gateway.placeStopLossBuy(peSymbol, peToken, derivExchange, qty, peSl, peSlLimit);
+      sPe = new TradeLeg(peSymbol, peToken, qty, peFill, BigDecimal.ZERO, peSl, peSlOrderId, true);
+    } catch (RuntimeException e) {
+      if (LOG.isErrorEnabled()) {
+        LOG.error(
+            "PE leg failed after CE executed. Rolling back CE leg immediately: {}",
+            e.getMessage(),
+            e);
+      }
+      if (sCe.slOrderId() != null) {
+        gateway.cancelOrder(sCe.slOrderId());
+      }
+      gateway.executeBuyMarket(sCe.symbol(), sCe.token(), derivExchange, sCe.quantity());
+      publisher.publish(
+          Notification.of(
+              Severity.CRITICAL,
+              NotificationType.SYSTEM_ALERT,
+              "Straddle Atomic Rollback",
+              "PE leg failed. Unwound CE leg to prevent naked exposure: " + e.getMessage()));
+      stateRepository.save(
+          new DailyTradeRecord(
+              today,
+              index,
+              StrategyState.ABORTED,
+              record.hedgeCe(),
+              record.hedgePe(),
+              null,
+              null,
+              record.realizedPnl()));
+      return;
+    }
 
     final DailyTradeRecord updated =
         new DailyTradeRecord(

@@ -4,6 +4,7 @@ import com.trading.bot.broker.api.Broker;
 import com.trading.bot.broker.api.error.BrokerException;
 import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.Order;
 import com.trading.bot.broker.api.model.OrderId;
 import com.trading.bot.broker.api.model.OrderPatch;
 import com.trading.bot.broker.api.model.OrderRequest;
@@ -30,6 +31,7 @@ import org.springframework.stereotype.Component;
 public final class LiveStrategyGateway implements StrategyExecutionGateway {
 
   private static final Logger LOG = LoggerFactory.getLogger(LiveStrategyGateway.class);
+  private static final BigDecimal MIN_TICK_FALLBACK = BigDecimal.valueOf(0.05);
 
   private final Broker broker;
 
@@ -54,8 +56,8 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
             Optional.empty(),
             Optional.empty());
 
-    broker.placeOrder(request);
-    return fetchEstimatedPrice(symbol, token, exchange);
+    final OrderId orderId = broker.placeOrder(request);
+    return fetchExecutionPrice(orderId, symbol, token, exchange);
   }
 
   @Override
@@ -75,8 +77,8 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
             Optional.empty(),
             Optional.empty());
 
-    broker.placeOrder(request);
-    return fetchEstimatedPrice(symbol, token, exchange);
+    final OrderId orderId = broker.placeOrder(request);
+    return fetchExecutionPrice(orderId, symbol, token, exchange);
   }
 
   @Override
@@ -128,6 +130,43 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
         LOG.warn("Notice cancelling stop-loss order {}: {}", orderId.value(), e.getMessage(), e);
       }
     }
+  }
+
+  private BigDecimal fetchExecutionPrice(
+      OrderId orderId, String symbol, InstrumentToken token, Exchange exchange) {
+    if (orderId != null) {
+      for (int i = 0; i < 5; i++) {
+        try {
+          final List<Order> book = broker.orderBook();
+          if (book != null) {
+            for (final Order o : book) {
+              if (orderId.equals(o.orderId())
+                  && o.averagePrice() != null
+                  && o.averagePrice().compareTo(BigDecimal.ZERO) > 0) {
+                return o.averagePrice();
+              }
+            }
+          }
+          Thread.sleep(100);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          break;
+        } catch (BrokerException e) {
+          if (LOG.isWarnEnabled()) {
+            LOG.warn(
+                "Notice fetching order book for fill price {}: {}",
+                orderId.value(),
+                e.getMessage());
+          }
+        }
+      }
+    }
+
+    final BigDecimal estimated = fetchEstimatedPrice(symbol, token, exchange);
+    if (estimated.compareTo(BigDecimal.ZERO) > 0) {
+      return estimated;
+    }
+    return MIN_TICK_FALLBACK;
   }
 
   private BigDecimal fetchEstimatedPrice(String symbol, InstrumentToken token, Exchange exchange) {
