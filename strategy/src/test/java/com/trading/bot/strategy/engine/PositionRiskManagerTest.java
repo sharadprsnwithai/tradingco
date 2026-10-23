@@ -30,8 +30,11 @@ import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 
-@SuppressWarnings({"PMD.UnitTestContainsTooManyAsserts", "PMD.AvoidDuplicateLiterals"})
+@SuppressWarnings("PMD.UnitTestContainsTooManyAsserts")
 class PositionRiskManagerTest {
+
+  private static final String CE_SYMBOL = "NIFTY26OCT25000CE";
+  private static final String PE_SYMBOL = "NIFTY26OCT25000PE";
 
   private final StrategyProperties props =
       new StrategyProperties(
@@ -64,29 +67,20 @@ class PositionRiskManagerTest {
     final Broker broker = mock(Broker.class);
     final List<Notification> published = new ArrayList<>();
     final NotificationPublisher publisher = published::add;
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
 
     final PositionRiskManager riskManager =
-        new PositionRiskManager(gateway, stateRepo, broker, publisher, props);
+        new PositionRiskManager(gateway, stateRepo, broker, alertService, props);
 
     final InstrumentToken ceToken = new InstrumentToken(201L);
     final InstrumentToken peToken = new InstrumentToken(202L);
 
     final TradeLeg shortCe =
         new TradeLeg(
-            "NIFTY26OCT25000CE",
-            ceToken,
-            130,
-            BigDecimal.valueOf(100.0),
-            BigDecimal.valueOf(130.0),
-            true);
+            CE_SYMBOL, ceToken, 130, BigDecimal.valueOf(100.0), BigDecimal.valueOf(130.0), true);
     final TradeLeg shortPe =
         new TradeLeg(
-            "NIFTY26OCT25000PE",
-            peToken,
-            130,
-            BigDecimal.valueOf(100.0),
-            BigDecimal.valueOf(130.0),
-            true);
+            PE_SYMBOL, peToken, 130, BigDecimal.valueOf(100.0), BigDecimal.valueOf(130.0), true);
 
     final DailyTradeRecord record =
         new DailyTradeRecord(
@@ -103,23 +97,28 @@ class PositionRiskManagerTest {
     when(broker.quotes(any()))
         .thenReturn(
             Map.of(
-                ceToken, makeQuote(ceToken, "NIFTY26OCT25000CE", BigDecimal.valueOf(132.0)),
-                peToken, makeQuote(peToken, "NIFTY26OCT25000PE", BigDecimal.valueOf(70.0))));
+                ceToken, makeQuote(ceToken, CE_SYMBOL, BigDecimal.valueOf(132.0)),
+                peToken, makeQuote(peToken, PE_SYMBOL, BigDecimal.valueOf(70.0))));
 
-    when(gateway.executeBuyMarket(eq("NIFTY26OCT25000CE"), eq(ceToken), any(), eq(130)))
+    when(gateway.executeBuyMarket(eq(CE_SYMBOL), eq(ceToken), any(), eq(130)))
         .thenReturn(BigDecimal.valueOf(132.0));
 
     final DailyTradeRecord updated = riskManager.evaluateRisk(record);
 
     // CE exited
     assertThat(updated.shortCe().isOpen()).isFalse();
-    verify(gateway).executeBuyMarket(eq("NIFTY26OCT25000CE"), eq(ceToken), any(), eq(130));
+    assertThat(updated.shortCe().exitPrice()).isEqualByComparingTo(BigDecimal.valueOf(132.0));
+    verify(gateway).executeBuyMarket(eq(CE_SYMBOL), eq(ceToken), any(), eq(130));
 
     // PE remains open, but SL is moved to entry price (100.0)
     assertThat(updated.shortPe().isOpen()).isTrue();
     assertThat(updated.shortPe().slPrice()).isEqualByComparingTo(BigDecimal.valueOf(100.0));
 
     verify(stateRepo).save(updated);
+
+    // Alert verified
+    assertThat(published).isNotEmpty();
+    assertThat(published.get(0).title()).contains("[PAPER]").contains("Stop-Loss Hit");
   }
 
   @Test
@@ -129,9 +128,10 @@ class PositionRiskManagerTest {
     final Broker broker = mock(Broker.class);
     final List<Notification> published = new ArrayList<>();
     final NotificationPublisher publisher = published::add;
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
 
     final PositionRiskManager riskManager =
-        new PositionRiskManager(gateway, stateRepo, broker, publisher, props);
+        new PositionRiskManager(gateway, stateRepo, broker, alertService, props);
 
     final InstrumentToken ceToken = new InstrumentToken(201L);
     final InstrumentToken peToken = new InstrumentToken(202L);
@@ -139,18 +139,20 @@ class PositionRiskManagerTest {
     // CE already closed, PE open with slPrice trailed to entry (100.0)
     final TradeLeg shortCe =
         new TradeLeg(
-            "NIFTY26OCT25000CE",
+            CE_SYMBOL,
             ceToken,
             130,
             BigDecimal.valueOf(100.0),
+            BigDecimal.valueOf(132.0),
             BigDecimal.valueOf(130.0),
             false);
     final TradeLeg shortPe =
         new TradeLeg(
-            "NIFTY26OCT25000PE",
+            PE_SYMBOL,
             peToken,
             130,
             BigDecimal.valueOf(100.0),
+            BigDecimal.ZERO,
             BigDecimal.valueOf(100.0),
             true);
 
@@ -167,13 +169,18 @@ class PositionRiskManagerTest {
 
     // PE rises back to 100.5 (>= 100.0 breakeven SL)
     when(broker.quotes(any()))
-        .thenReturn(
-            Map.of(peToken, makeQuote(peToken, "NIFTY26OCT25000PE", BigDecimal.valueOf(100.5))));
+        .thenReturn(Map.of(peToken, makeQuote(peToken, PE_SYMBOL, BigDecimal.valueOf(100.5))));
+
+    when(gateway.executeBuyMarket(eq(PE_SYMBOL), eq(peToken), any(), eq(130)))
+        .thenReturn(BigDecimal.valueOf(100.5));
 
     final DailyTradeRecord updated = riskManager.evaluateRisk(record);
 
     assertThat(updated.shortPe().isOpen()).isFalse();
-    verify(gateway).executeBuyMarket(eq("NIFTY26OCT25000PE"), eq(peToken), any(), eq(130));
+    verify(gateway).executeBuyMarket(eq(PE_SYMBOL), eq(peToken), any(), eq(130));
+
+    assertThat(published).isNotEmpty();
+    assertThat(published.get(0).title()).contains("[PAPER]").contains("Breakeven Stop Hit");
   }
 
   @Test
@@ -182,29 +189,20 @@ class PositionRiskManagerTest {
     final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
     final Broker broker = mock(Broker.class);
     final NotificationPublisher publisher = n -> {};
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
 
     final PositionRiskManager riskManager =
-        new PositionRiskManager(gateway, stateRepo, broker, publisher, props);
+        new PositionRiskManager(gateway, stateRepo, broker, alertService, props);
 
     final InstrumentToken ceToken = new InstrumentToken(201L);
     final InstrumentToken peToken = new InstrumentToken(202L);
 
     final TradeLeg shortCe =
         new TradeLeg(
-            "NIFTY26OCT25000CE",
-            ceToken,
-            130,
-            BigDecimal.valueOf(100.0),
-            BigDecimal.valueOf(130.0),
-            true);
+            CE_SYMBOL, ceToken, 130, BigDecimal.valueOf(100.0), BigDecimal.valueOf(130.0), true);
     final TradeLeg shortPe =
         new TradeLeg(
-            "NIFTY26OCT25000PE",
-            peToken,
-            130,
-            BigDecimal.valueOf(100.0),
-            BigDecimal.valueOf(130.0),
-            true);
+            PE_SYMBOL, peToken, 130, BigDecimal.valueOf(100.0), BigDecimal.valueOf(130.0), true);
 
     final DailyTradeRecord record =
         new DailyTradeRecord(
@@ -221,8 +219,8 @@ class PositionRiskManagerTest {
     when(broker.quotes(any()))
         .thenReturn(
             Map.of(
-                ceToken, makeQuote(ceToken, "NIFTY26OCT25000CE", BigDecimal.valueOf(115.0)),
-                peToken, makeQuote(peToken, "NIFTY26OCT25000PE", BigDecimal.valueOf(95.0))));
+                ceToken, makeQuote(ceToken, CE_SYMBOL, BigDecimal.valueOf(115.0)),
+                peToken, makeQuote(peToken, PE_SYMBOL, BigDecimal.valueOf(95.0))));
 
     final DailyTradeRecord updated = riskManager.evaluateRisk(record);
 
@@ -237,29 +235,20 @@ class PositionRiskManagerTest {
     final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
     final Broker broker = mock(Broker.class);
     final NotificationPublisher publisher = n -> {};
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
 
     final PositionRiskManager riskManager =
-        new PositionRiskManager(gateway, stateRepo, broker, publisher, props);
+        new PositionRiskManager(gateway, stateRepo, broker, alertService, props);
 
     final InstrumentToken ceToken = new InstrumentToken(201L);
     final InstrumentToken peToken = new InstrumentToken(202L);
 
     final TradeLeg shortCe =
         new TradeLeg(
-            "NIFTY26OCT25000CE",
-            ceToken,
-            130,
-            BigDecimal.valueOf(100.0),
-            BigDecimal.valueOf(130.0),
-            true);
+            CE_SYMBOL, ceToken, 130, BigDecimal.valueOf(100.0), BigDecimal.valueOf(130.0), true);
     final TradeLeg shortPe =
         new TradeLeg(
-            "NIFTY26OCT25000PE",
-            peToken,
-            130,
-            BigDecimal.valueOf(100.0),
-            BigDecimal.valueOf(130.0),
-            true);
+            PE_SYMBOL, peToken, 130, BigDecimal.valueOf(100.0), BigDecimal.valueOf(130.0), true);
 
     final DailyTradeRecord record =
         new DailyTradeRecord(
@@ -276,8 +265,13 @@ class PositionRiskManagerTest {
     when(broker.quotes(any()))
         .thenReturn(
             Map.of(
-                ceToken, makeQuote(ceToken, "NIFTY26OCT25000CE", BigDecimal.valueOf(135.0)),
-                peToken, makeQuote(peToken, "NIFTY26OCT25000PE", BigDecimal.valueOf(135.0))));
+                ceToken, makeQuote(ceToken, CE_SYMBOL, BigDecimal.valueOf(135.0)),
+                peToken, makeQuote(peToken, PE_SYMBOL, BigDecimal.valueOf(135.0))));
+
+    when(gateway.executeBuyMarket(eq(CE_SYMBOL), any(), any(), anyInt()))
+        .thenReturn(BigDecimal.valueOf(135.0));
+    when(gateway.executeBuyMarket(eq(PE_SYMBOL), any(), any(), anyInt()))
+        .thenReturn(BigDecimal.valueOf(135.0));
 
     final DailyTradeRecord updated = riskManager.evaluateRisk(record);
 

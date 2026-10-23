@@ -5,15 +5,12 @@ import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
 import com.trading.bot.broker.api.model.Quote;
 import com.trading.bot.broker.api.model.QuoteRef;
-import com.trading.bot.notifications.api.Notification;
-import com.trading.bot.notifications.api.NotificationPublisher;
-import com.trading.bot.notifications.api.NotificationType;
-import com.trading.bot.notifications.api.Severity;
 import com.trading.bot.strategy.config.StrategyProperties;
 import com.trading.bot.strategy.gateway.StrategyExecutionGateway;
 import com.trading.bot.strategy.model.DailyTradeRecord;
 import com.trading.bot.strategy.model.StrategyState;
 import com.trading.bot.strategy.model.TradeLeg;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -27,20 +24,20 @@ public final class PositionRiskManager {
   private final StrategyExecutionGateway gateway;
   private final StrategyStateRepository stateRepository;
   private final Broker broker;
-  private final NotificationPublisher publisher;
+  private final StrategyAlertService alertService;
   private final StrategyProperties props;
 
   public PositionRiskManager(
       StrategyExecutionGateway gateway,
       StrategyStateRepository stateRepository,
       Broker broker,
-      NotificationPublisher publisher,
+      StrategyAlertService alertService,
       StrategyProperties props) {
     this.gateway = Objects.requireNonNull(gateway, "gateway must not be null");
     this.stateRepository =
         Objects.requireNonNull(stateRepository, "stateRepository must not be null");
     this.broker = Objects.requireNonNull(broker, "broker must not be null");
-    this.publisher = Objects.requireNonNull(publisher, "publisher must not be null");
+    this.alertService = Objects.requireNonNull(alertService, "alertService must not be null");
     this.props = Objects.requireNonNull(props, "props must not be null");
   }
 
@@ -81,40 +78,39 @@ public final class PositionRiskManager {
     if (shortCe != null && shortCe.isOpen()) {
       final Quote q = quotes.get(shortCe.token());
       if (q != null && q.lastPrice() != null && q.lastPrice().compareTo(shortCe.slPrice()) >= 0) {
-        gateway.executeBuyMarket(
-            shortCe.symbol(), shortCe.token(), derivExchange, shortCe.quantity());
+        final BigDecimal exitPrice =
+            gateway.executeBuyMarket(
+                shortCe.symbol(), shortCe.token(), derivExchange, shortCe.quantity());
+
+        final boolean isBreakevenExit = shortCe.slPrice().compareTo(shortCe.entryPrice()) == 0;
+
         shortCe =
             new TradeLeg(
                 shortCe.symbol(),
                 shortCe.token(),
                 shortCe.quantity(),
                 shortCe.entryPrice(),
+                exitPrice,
                 shortCe.slPrice(),
                 false);
 
-        publisher.publish(
-            Notification.of(
-                Severity.WARN,
-                NotificationType.SYSTEM_ALERT,
-                "Stop-Loss Hit: " + shortCe.symbol(),
-                "Call leg hit SL at " + q.lastPrice() + " (entry=" + shortCe.entryPrice() + ")"));
-
-        if (Boolean.TRUE.equals(props.trailToBreakeven()) && shortPe != null && shortPe.isOpen()) {
-          shortPe =
-              new TradeLeg(
-                  shortPe.symbol(),
-                  shortPe.token(),
-                  shortPe.quantity(),
-                  shortPe.entryPrice(),
-                  shortPe.entryPrice(),
-                  true);
-
-          publisher.publish(
-              Notification.of(
-                  Severity.INFO,
-                  NotificationType.SYSTEM_ALERT,
-                  "Breakeven Trailed: " + shortPe.symbol(),
-                  "Put leg SL moved to entry cost " + shortPe.entryPrice()));
+        if (isBreakevenExit) {
+          alertService.notifyBreakevenHit(shortCe, exitPrice, props.executionMode());
+        } else {
+          if (Boolean.TRUE.equals(props.trailToBreakeven())
+              && shortPe != null
+              && shortPe.isOpen()) {
+            shortPe =
+                new TradeLeg(
+                    shortPe.symbol(),
+                    shortPe.token(),
+                    shortPe.quantity(),
+                    shortPe.entryPrice(),
+                    shortPe.exitPrice(),
+                    shortPe.entryPrice(),
+                    true);
+          }
+          alertService.notifyStopLossHit(shortCe, exitPrice, shortPe, props.executionMode());
         }
       }
     }
@@ -123,40 +119,39 @@ public final class PositionRiskManager {
     if (shortPe != null && shortPe.isOpen()) {
       final Quote q = quotes.get(shortPe.token());
       if (q != null && q.lastPrice() != null && q.lastPrice().compareTo(shortPe.slPrice()) >= 0) {
-        gateway.executeBuyMarket(
-            shortPe.symbol(), shortPe.token(), derivExchange, shortPe.quantity());
+        final BigDecimal exitPrice =
+            gateway.executeBuyMarket(
+                shortPe.symbol(), shortPe.token(), derivExchange, shortPe.quantity());
+
+        final boolean isBreakevenExit = shortPe.slPrice().compareTo(shortPe.entryPrice()) == 0;
+
         shortPe =
             new TradeLeg(
                 shortPe.symbol(),
                 shortPe.token(),
                 shortPe.quantity(),
                 shortPe.entryPrice(),
+                exitPrice,
                 shortPe.slPrice(),
                 false);
 
-        publisher.publish(
-            Notification.of(
-                Severity.WARN,
-                NotificationType.SYSTEM_ALERT,
-                "Stop-Loss Hit: " + shortPe.symbol(),
-                "Put leg hit SL at " + q.lastPrice() + " (entry=" + shortPe.entryPrice() + ")"));
-
-        if (Boolean.TRUE.equals(props.trailToBreakeven()) && shortCe != null && shortCe.isOpen()) {
-          shortCe =
-              new TradeLeg(
-                  shortCe.symbol(),
-                  shortCe.token(),
-                  shortCe.quantity(),
-                  shortCe.entryPrice(),
-                  shortCe.entryPrice(),
-                  true);
-
-          publisher.publish(
-              Notification.of(
-                  Severity.INFO,
-                  NotificationType.SYSTEM_ALERT,
-                  "Breakeven Trailed: " + shortCe.symbol(),
-                  "Call leg SL moved to entry cost " + shortCe.entryPrice()));
+        if (isBreakevenExit) {
+          alertService.notifyBreakevenHit(shortPe, exitPrice, props.executionMode());
+        } else {
+          if (Boolean.TRUE.equals(props.trailToBreakeven())
+              && shortCe != null
+              && shortCe.isOpen()) {
+            shortCe =
+                new TradeLeg(
+                    shortCe.symbol(),
+                    shortCe.token(),
+                    shortCe.quantity(),
+                    shortCe.entryPrice(),
+                    shortCe.exitPrice(),
+                    shortCe.entryPrice(),
+                    true);
+          }
+          alertService.notifyStopLossHit(shortPe, exitPrice, shortCe, props.executionMode());
         }
       }
     }

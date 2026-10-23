@@ -1,6 +1,7 @@
 package com.trading.bot.strategy.gateway;
 
 import com.trading.bot.broker.api.Broker;
+import com.trading.bot.broker.api.error.BrokerException;
 import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
 import com.trading.bot.broker.api.model.OrderRequest;
@@ -15,11 +16,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 /** Executes real trades on Zerodha Kite Connect via the Broker port. */
 @Component
 public final class LiveStrategyGateway implements StrategyExecutionGateway {
+
+  private static final Logger LOG = LoggerFactory.getLogger(LiveStrategyGateway.class);
 
   private final Broker broker;
 
@@ -74,8 +79,11 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
       final Map<InstrumentToken, Quote> quotes =
           broker.quotes(List.of(new QuoteRef(exchange, symbol, token)));
       final Quote q = quotes.get(token);
-      return q != null ? q.lastPrice() : BigDecimal.ZERO;
-    } catch (com.trading.bot.broker.api.error.BrokerException ignored) {
+      return q != null && q.lastPrice() != null ? q.lastPrice() : BigDecimal.ZERO;
+    } catch (BrokerException e) {
+      if (LOG.isWarnEnabled()) {
+        LOG.warn("Failed fetching estimated execution price for {}: {}", symbol, e.getMessage(), e);
+      }
       return BigDecimal.ZERO;
     }
   }
