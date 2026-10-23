@@ -11,6 +11,9 @@ dependencyManagement {
 
 dependencies {
     implementation("org.springframework.boot:spring-boot-starter")
+    implementation("org.springframework.boot:spring-boot-starter-json")
+    implementation("org.springframework.boot:spring-boot-starter-validation")
+    implementation("org.springframework:spring-web")
     implementation("io.projectreactor:reactor-core")
     implementation("io.micrometer:micrometer-core")
 
