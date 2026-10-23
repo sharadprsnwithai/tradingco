@@ -119,12 +119,13 @@ def fetch_market_data():
 # -----------------------------------------------------------------------------
 # Daily Simulation Engine
 # -----------------------------------------------------------------------------
-def simulate_day(day_df, instrument, mode, daily_iv, lots=2):
+def simulate_day(day_df, instrument, mode, daily_iv, lots=2, move_to_breakeven=False):
     """
     Simulates one single day of execution:
       - 09:45 IST: Buy 20 OTM CE & PE hedges
       - 10:00 IST: Sell ATM CE & PE straddle
       - 30% independent SL on each short leg
+      - move_to_breakeven: if True, when one leg hits SL, move other leg's SL to entry price
       - 15:00 IST: Square off all active legs
     """
     trade_date = day_df['Date'].iloc[0]
@@ -213,6 +214,9 @@ def simulate_day(day_df, instrument, mode, daily_iv, lots=2):
                     short_ce_sl_hit = True
                     short_ce_exit_price = short_ce_sl
                     short_ce_exit_time = c_time
+                    if move_to_breakeven and short_pe_active:
+                        # Move surviving PE leg to breakeven (entry price)
+                        short_pe_sl = short_pe_entry
 
             # Check PE Stop-Loss (breached if market crashes to low)
             if short_pe_active:
@@ -222,6 +226,9 @@ def simulate_day(day_df, instrument, mode, daily_iv, lots=2):
                     short_pe_sl_hit = True
                     short_pe_exit_price = short_pe_sl
                     short_pe_exit_time = c_time
+                    if move_to_breakeven and short_ce_active:
+                        # Move surviving CE leg to breakeven (entry price)
+                        short_ce_sl = short_ce_entry
 
         # -------------------------------------------------------------
         # 4. 15:00 PM IST - Mandatory Square-off
@@ -291,8 +298,9 @@ def simulate_day(day_df, instrument, mode, daily_iv, lots=2):
 # -----------------------------------------------------------------------------
 # Main Backtest Runner & Analytics
 # -----------------------------------------------------------------------------
-def run_backtest(lots=2):
-    df_nifty, df_sensex, vix_map = fetch_market_data()
+def run_backtest(lots=2, move_to_breakeven=False, df_nifty=None, df_sensex=None, vix_map=None):
+    if df_nifty is None:
+        df_nifty, df_sensex, vix_map = fetch_market_data()
 
     nifty_days = {d: g for d, g in df_nifty.groupby('Date')}
     sensex_days = {d: g for d, g in df_sensex.groupby('Date')}
@@ -302,12 +310,6 @@ def run_backtest(lots=2):
 
     for d in all_dates:
         wd = d.weekday()
-        # Monday (0) -> NIFTY 1-DTE
-        # Tuesday (1) -> NIFTY 0-DTE
-        # Wednesday (2) -> SENSEX 1-DTE
-        # Thursday (3) -> SENSEX 0-DTE
-        # Friday (4) -> No Trade
-
         if wd in (0, 1) and d in nifty_days:
             inst = 'NIFTY'
             mode = '1DTE' if wd == 0 else '0DTE'
@@ -320,14 +322,15 @@ def run_backtest(lots=2):
             continue
 
         daily_iv = vix_map.get(d, 0.13 if inst == 'NIFTY' else 0.125)
-        trade_res = simulate_day(g, inst, mode, daily_iv, lots=lots)
+        trade_res = simulate_day(g, inst, mode, daily_iv, lots=lots, move_to_breakeven=move_to_breakeven)
         if trade_res:
             results.append(trade_res)
 
     res_df = pd.DataFrame(results)
 
+    title_suffix = "WITH BREAKEVEN TRAILING" if move_to_breakeven else "OPTION A: ORIGINAL 30% SL"
     print("\n=================================================================")
-    print(f"       BACKTEST RESULTS: DTE 1 & 0 STRADDLE + 30% SL (2 LOTS)")
+    print(f"  BACKTEST RESULTS ({lots} LOTS) — {title_suffix}")
     print("=================================================================")
 
     if res_df.empty:
@@ -381,7 +384,14 @@ def run_backtest(lots=2):
     cols = ['date', 'weekday', 'instrument', 'mode', 'atm_strike', 'ce_entry', 'ce_exit', 'ce_sl_hit', 'pe_entry', 'pe_exit', 'pe_sl_hit', 'net_pnl_inr']
     print(res_df[cols].tail(15).to_string(index=False))
     print("=================================================================\n")
+    return res_df
 
 if __name__ == '__main__':
     lots = int(sys.argv[1]) if len(sys.argv) > 1 else 2
-    run_backtest(lots=lots)
+    df_nifty, df_sensex, vix_map = fetch_market_data()
+
+    print("\n>>> RUNNING BACKTEST: OPTION A (Keep 30% SL on surviving leg)...")
+    df_opt_a = run_backtest(lots=lots, move_to_breakeven=False, df_nifty=df_nifty, df_sensex=df_sensex, vix_map=vix_map)
+
+    print("\n>>> RUNNING BACKTEST: OPTION B (Trail surviving leg SL to BREAKEVEN)...")
+    df_opt_b = run_backtest(lots=lots, move_to_breakeven=True, df_nifty=df_nifty, df_sensex=df_sensex, vix_map=vix_map)
