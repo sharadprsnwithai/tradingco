@@ -23,6 +23,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -33,6 +35,7 @@ import org.springframework.stereotype.Component;
 @Component
 public final class Reconciler {
 
+  private static final Logger LOG = LoggerFactory.getLogger(Reconciler.class);
   private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
 
   private final Broker broker;
@@ -115,7 +118,15 @@ public final class Reconciler {
   @EventListener(ApplicationReadyEvent.class)
   @SuppressWarnings("PMD.AvoidInstantiatingObjectsInLoops")
   public void rebuildOnStartup() {
-    final List<Order> book = broker.orderBook();
+    final List<Order> book;
+    try {
+      book = broker.orderBook();
+    } catch (com.trading.bot.broker.api.error.BrokerException e) {
+      if (LOG.isErrorEnabled()) {
+        LOG.error("Failed to fetch order book on startup rebuild: {}", e.getMessage(), e);
+      }
+      return;
+    }
     final List<String> recoveredIds = new ArrayList<>();
 
     for (final Order order : book) {
