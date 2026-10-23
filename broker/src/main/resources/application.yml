@@ -6,6 +6,15 @@ spring:
       pool:
         size: 4
 
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+  endpoint:
+    health:
+      show-details: always
+
 kite:
   base-url: https://api.kite.trade
   http:

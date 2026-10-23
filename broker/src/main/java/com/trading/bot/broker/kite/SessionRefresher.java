@@ -25,6 +25,8 @@ import org.springframework.stereotype.Component;
 @Component
 public final class SessionRefresher implements SessionDelegate, ApplicationRunner {
 
+  private static final org.slf4j.Logger LOG =
+      org.slf4j.LoggerFactory.getLogger(SessionRefresher.class);
   private static final Duration ONE_HOUR = Duration.ofHours(1);
 
   private final KiteSession session;
@@ -68,9 +70,28 @@ public final class SessionRefresher implements SessionDelegate, ApplicationRunne
     loginOnStartup();
   }
 
-  /** Fail-fast initial login at application startup per spec §7. */
+  /** Fail-safe initial login at application startup per spec §7, entering DEGRADED on failure. */
   public void loginOnStartup() {
-    session.login();
+    try {
+      session.login();
+    } catch (AuthException e) {
+      if (LOG.isErrorEnabled()) {
+        LOG.error("Initial startup login failed: {}", e.getMessage(), e);
+      }
+      synchronized (lock) {
+        this.degraded = true;
+        session.setDegraded(true);
+        consecutiveFailures = 1;
+        final Duration backoff = computeBackoff(consecutiveFailures);
+        nextAllowedAttemptTime = clock.instant().plus(backoff);
+      }
+      publisher.publish(
+          Notification.of(
+              Severity.CRITICAL,
+              NotificationType.AUTH_DEGRADED,
+              "Auth degraded",
+              "Initial startup login failed: " + e.getMessage()));
+    }
   }
 
   /** Daily scheduled re-authentication at 06:00 IST. */
