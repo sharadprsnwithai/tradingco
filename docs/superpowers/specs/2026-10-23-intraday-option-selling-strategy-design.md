@@ -14,7 +14,7 @@ The goal of this module is to implement an automated, systematic, intraday optio
 The strategy harvests intraday theta decay (time decay) of high-gamma, near-expiry options while enforcing strict structural risk bounds:
 1. **Pre-Hedged Margin Efficiency:** Deep out-of-the-money (OTM) wings are purchased at 09:45 IST, 15 minutes prior to the short straddle entry. This drastically reduces the exchange margin requirement for the subsequent short legs and caps black-swan catastrophe tail risk.
 2. **Short Straddle at Peak Morning Liquidity:** At 10:00 IST, once initial morning opening price discovery has stabilized, an At-The-Money (ATM) short straddle (Sell ATM CE + Sell ATM PE) is deployed.
-3. **Independent 30% Stop-Loss (Option A):** Each short leg is protected by an independent 30% stop-loss based on its execution fill price. If market momentum triggers a stop on one wing, that leg is closed immediately, while the counter-leg remains open to collect remaining decay, balanced by the wing hedges.
+3. **Independent 30% Stop-Loss with Breakeven Trailing:** Each short leg is protected by an independent 30% stop-loss based on its execution fill price ($SL_{price} = Entry_{price} \times 1.30$). Crucially, **when one leg triggers its stop-loss, the surviving counter-leg's stop-loss is immediately moved down to its entry price (breakeven)**. This locks the surviving leg against adverse market whipsaws while allowing it to capture remaining theta decay, significantly reducing drawdown and boosting overall profit factor.
 4. **Mandatory 15:00 IST Intraday Square-Off:** All active short and long positions are closed at 15:00 IST to ensure the book is completely flat before market close, preventing overnight gap risk.
 
 ---
@@ -34,8 +34,9 @@ The strategy harvests intraday theta decay (time decay) of high-gamma, near-expi
 - **Dual Execution Modes:**
   - `PAPER`: Simulates fills using live quotes from the `Broker` port, tracking P&L and stop-loss triggers in memory without placing real capital at risk.
   - `LIVE`: Executes real orders via `Broker.placeOrder()`.
-- **Individual 30% Stop-Loss Management:**
+- **Individual 30% Stop-Loss Management with Breakeven Trailing:**
   - Precise entry premium calculation: $SL_{price} = Entry_{price} \times 1.30$.
+  - When either leg triggers its stop-loss, the other leg's stop-loss automatically trails to its entry price ($SL_{surviving} = Entry_{surviving}$).
   - Dedicated risk monitoring loop polling active leg premiums or placing trigger stop-loss orders.
 - **Guaranteed EOD Square-Off at 15:00 IST:**
   - Cancels pending stop-loss orders.
@@ -111,14 +112,14 @@ digraph StrategyLifecycle {
   IDLE [label="IDLE\nBefore 09:45 IST"];
   HEDGED [label="HEDGED\n09:45 IST: Buy OTM CE & PE"];
   STRADDLE_ACTIVE [label="STRADDLE ACTIVE\n10:00 IST: Sell ATM CE & PE\n(SL 30% active)"];
-  ONE_LEG_STOPPED [label="ONE LEG STOPPED\nCE or PE hit 30% SL\nOther leg & hedges run"];
+  ONE_LEG_STOPPED [label="ONE LEG STOPPED\nCE or PE hit 30% SL\nSurviving leg SL moved to Breakeven\nHedges remain active"];
   SQUARED_OFF [label="SQUARED OFF\n15:00 IST: Close all open legs\nStatus: COMPLETE"];
 
   IDLE -> HEDGED [label="09:45 IST (Mon-Thu)"];
   HEDGED -> STRADDLE_ACTIVE [label="10:00 IST"];
-  STRADDLE_ACTIVE -> ONE_LEG_STOPPED [label="30% SL Hit on 1 Leg"];
+  STRADDLE_ACTIVE -> ONE_LEG_STOPPED [label="30% SL Hit on 1 Leg\n(Move other to Breakeven)"];
   STRADDLE_ACTIVE -> SQUARED_OFF [label="15:00 IST"];
-  ONE_LEG_STOPPED -> SQUARED_OFF [label="15:00 IST or 2nd SL Hit"];
+  ONE_LEG_STOPPED -> SQUARED_OFF [label="15:00 IST or Breakeven SL Hit"];
 }
 ```
 
@@ -151,18 +152,23 @@ digraph StrategyLifecycle {
 7. Place stop-loss trigger orders (or engage continuous risk monitoring thread).
 8. Publish `ORDER_SUBMITTED` notification detailing entry strikes, premiums, and stop-loss levels.
 
-#### Step 3: 10:00 to 15:00 IST — Active Risk Monitoring
+#### Step 3: 10:00 to 15:00 IST — Active Risk Monitoring & Breakeven Trailing
 1. Monitor live quotes for active short legs every 1 second.
 2. **If CE premium reaches or exceeds $SL_{CE}$:**
    - Execute market buy to close CE short leg.
    - Cancel pending CE stop-loss order.
-   - Leave PE short leg and long hedges running unchanged.
-   - Publish `ORDER_REJECTED` / `SYSTEM_ALERT` notification: *"CE Stop-loss triggered at ₹X (loss capped at 30%)"*.
+   - **Immediately update PE stop-loss level to its entry cost ($SL_{PE} = P_{PE\_entry}$)**.
+   - Leave PE short leg and long hedges running with the tightened breakeven stop.
+   - Publish `SYSTEM_ALERT` notification: *"CE Stop-loss triggered at ₹X (loss capped at 30%). PE stop-loss moved to breakeven (₹Y)"*.
 3. **If PE premium reaches or exceeds $SL_{PE}$:**
    - Execute market buy to close PE short leg.
    - Cancel pending PE stop-loss order.
-   - Leave CE short leg and long hedges running unchanged.
-   - Publish alert: *"PE Stop-loss triggered at ₹Y (loss capped at 30%)"*.
+   - **Immediately update CE stop-loss level to its entry cost ($SL_{CE} = P_{CE\_entry}$)**.
+   - Leave CE short leg and long hedges running with the tightened breakeven stop.
+   - Publish `SYSTEM_ALERT` notification: *"PE Stop-loss triggered at ₹Y (loss capped at 30%). CE stop-loss moved to breakeven (₹X)"*.
+4. **If surviving leg subsequently hits its breakeven stop:**
+   - Execute market buy to close surviving leg at cost.
+   - Transition state to `ONE_LEG_STOPPED` (both short legs exited, hedges continue holding until 15:00 IST).
 
 #### Step 4: 15:00 IST — Mandatory Square-Off
 1. Cancel all outstanding stop-loss trigger orders.
@@ -183,6 +189,7 @@ All parameters are bound via Spring `@ConfigurationProperties("strategy")` with 
 | `strategy.execution-mode` | `STRATEGY_EXECUTION_MODE` | `PAPER` | `PAPER` or `LIVE` execution mode |
 | `strategy.lots` | `STRATEGY_LOTS` | `2` | Number of lots per leg |
 | `strategy.sl-percentage` | `STRATEGY_SL_PERCENTAGE` | `30.0` | Stop-loss percentage per short leg |
+| `strategy.trail-to-breakeven` | `STRATEGY_TRAIL_TO_BREAKEVEN` | `true` | Move surviving leg SL to entry price when one leg hits SL |
 | `strategy.hedge-time` | `STRATEGY_HEDGE_TIME` | `09:45` | IST time to buy hedges |
 | `strategy.entry-time` | `STRATEGY_ENTRY_TIME` | `10:00` | IST time to sell straddle |
 | `strategy.exit-time` | `STRATEGY_EXIT_TIME` | `15:00` | IST time to square-off all legs |
@@ -223,6 +230,6 @@ To ensure rigorous quality and production safety:
 2. **Strike Increment Math Test:** Verify exact 50-point rounding for Nifty (e.g. 24,976 -> 25,000; 24,974 -> 24,950) and 100-point rounding for Sensex.
 3. **Hedge Distance Math Test:** Verify Nifty hedge strikes are exactly ±1,000 pts from ATM and Sensex hedges are exactly ±2,000 pts from ATM.
 4. **Stop-Loss Math Test:** Verify exact 30% calculation ($100.0 \to 130.0$, $85.50 \to 111.15$).
-5. **Leg Independence (Option A) Test:** Verify that when CE hits stop-loss, PE remains active and hedges are not prematurely closed.
+5. **Leg Independence & Breakeven Trailing Test:** Verify that when CE hits stop-loss, PE's SL is updated to $PE_{entry}$ and hedges are not prematurely closed; verify PE exits at cost if market reverses.
 6. **Square-Off Completeness Test:** Verify that 15:00 trigger closes all 4 legs (2 shorts + 2 hedges) and leaves net position at 0.
 7. **Paper vs Live Isolation:** Verify `PAPER` mode never calls `Broker.placeOrder()`.

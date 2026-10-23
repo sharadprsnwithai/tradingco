@@ -17,8 +17,8 @@
 - All timestamps and schedules in `ZoneId.of("Asia/Kolkata")`.
 - Weekly schedule: Mon/Tue NIFTY, Wed/Thu SENSEX, Fri idle.
 - Schedule checkpoints: 09:45 IST (buy 20-strike OTM hedges), 10:00 IST (sell ATM CE & PE), 15:00 IST (square-off all open legs).
-- Stop-loss rule (Option A): 30% loss on entry premium per short leg; triggering SL on one leg leaves the opposite leg and hedges active.
-- Configurable environment properties in `.env` with default values: `STRATEGY_EXECUTION_MODE=PAPER`, `STRATEGY_LOTS=2`, `STRATEGY_SL_PERCENTAGE=30.0`.
+- Stop-loss rule: 30% loss on entry premium per short leg. When one leg triggers SL, the surviving leg's SL is automatically trailed to its entry price (breakeven), preventing whipsaw losses.
+- Configurable environment properties in `.env` with default values: `STRATEGY_EXECUTION_MODE=PAPER`, `STRATEGY_LOTS=2`, `STRATEGY_SL_PERCENTAGE=30.0`, `STRATEGY_TRAIL_TO_BREAKEVEN=true`.
 - Quality gates wired into `check`; `./gradlew build` must stay green after every task.
 
 ## Review Focus
@@ -60,9 +60,9 @@
 **Interfaces:**
 - Produces:
   - `enum ExecutionMode { PAPER, LIVE }`
-  - `@ConfigurationProperties("strategy") @Validated StrategyProperties(ExecutionMode executionMode, int lots, double slPercentage, LocalTime hedgeTime, LocalTime entryTime, LocalTime exitTime, int niftyHedgeDistance, int sensexHedgeDistance)` with defaults `PAPER`, `2`, `30.0`, `09:45`, `10:00`, `15:00`, `1000`, `2000`.
+  - `@ConfigurationProperties("strategy") @Validated StrategyProperties(ExecutionMode executionMode, int lots, double slPercentage, boolean trailToBreakeven, LocalTime hedgeTime, LocalTime entryTime, LocalTime exitTime, int niftyHedgeDistance, int sensexHedgeDistance)` with defaults `PAPER`, `2`, `30.0`, `true`, `09:45`, `10:00`, `15:00`, `1000`, `2000`.
 
-- [ ] **Step 1: Write failing test** asserting defaults, custom property overrides, and validation (lots > 0, slPercentage > 0).
+- [ ] **Step 1: Write failing test** asserting defaults, custom property overrides, and validation (lots > 0, slPercentage > 0, trailToBreakeven boolean).
 - [ ] **Step 2: Run** `./gradlew :strategy:test` → expected: FAIL.
 - [ ] **Step 3: Implement** `ExecutionMode.java` and `StrategyProperties.java`.
 - [ ] **Step 4: Run** `./gradlew :strategy:test` → expected: PASS.
@@ -146,22 +146,23 @@
 
 ---
 
-### Task 6: Position Risk Manager & 30% Stop-Loss (Option A)
+### Task 6: Position Risk Manager & 30% Stop-Loss with Breakeven Trailing
 
 **Files:**
 - Create: `strategy/src/main/java/com/trading/bot/strategy/engine/PositionRiskManager.java`
 - Test: `strategy/src/test/java/com/trading/bot/strategy/engine/PositionRiskManagerTest.java`
 
 **Interfaces:**
-- Consumes: `StrategyExecutionGateway`, `StrategyStateRepository`, `Broker.quotes()`, `NotificationPublisher`.
+- Consumes: `StrategyExecutionGateway`, `StrategyStateRepository`, `Broker.quotes()`, `NotificationPublisher`, `StrategyProperties`.
 - Produces:
   - `@Component PositionRiskManager`:
-    - `void evaluateRisk(DailyTradeRecord record)`: polls quotes for active short legs; if current premium >= entry * 1.30, triggers market buy to close leg; updates state to `ONE_LEG_STOPPED` or `COMPLETED`.
-    - Handles independent legs (Option A): if CE stops, PE and hedges stay active.
+    - `void evaluateRisk(DailyTradeRecord record)`: polls quotes for active short legs; if current premium >= entry * 1.30, triggers market buy to close leg; if `props.trailToBreakeven()`, immediately updates surviving leg's SL to its entry cost (`slPrice = entryPrice`).
+    - Handles breakeven exit: if market subsequently whipsaws and surviving leg reaches entry price, closes surviving leg at cost.
     - Handles double leg stop collision gracefully (Review Focus 3).
 
 - [ ] **Step 1: Write failing test** covering:
-  - Entry 100.0, price hits 130.5 -> CE exits, PE remains open.
+  - Entry 100.0, price hits 130.5 -> CE exits, PE stop-loss updated to entry price (100.0).
+  - Subsequent reversal where PE touches 100.0 -> PE exits at breakeven.
   - Entry 100.0, price 125.0 -> no exit.
   - Both legs spiking above 30% SL -> both exit cleanly without collision.
 - [ ] **Step 2: Run** `./gradlew :strategy:test` → expected: FAIL.
