@@ -6,6 +6,7 @@ import java.util.Locale;
 public enum Exchange {
   NSE,
   NFO,
+  BSE,
   BFO,
   MCX,
   CDS;
