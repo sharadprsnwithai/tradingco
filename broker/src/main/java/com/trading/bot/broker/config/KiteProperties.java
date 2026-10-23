@@ -12,6 +12,7 @@ import org.springframework.validation.annotation.Validated;
  * @param userId Kite user ID
  * @param password Kite account password
  * @param totpSecret Kite TOTP seed
+ * @param baseUrl Kite API base URL (default https://api.kite.trade)
  * @param http HTTP timeout tunables
  * @param auth authentication and retry backoff tunables
  * @param orders order reconciliation tunables
@@ -23,10 +24,12 @@ public record KiteProperties(
     @NotBlank(message = "KITE_USER_ID (kite.user-id) must not be blank") String userId,
     @NotBlank(message = "KITE_PASSWORD (kite.password) must not be blank") String password,
     @NotBlank(message = "KITE_TOTP_SECRET (kite.totp-secret) must not be blank") String totpSecret,
+    String baseUrl,
     Http http,
     Auth auth,
     Orders orders) {
 
+  private static final String DEFAULT_BASE_URL = "https://api.kite.trade";
   private static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(5);
   private static final Duration DEFAULT_READ_TIMEOUT = Duration.ofSeconds(10);
   private static final Duration DEFAULT_PLACE_READ_TIMEOUT = Duration.ofSeconds(15);
@@ -39,6 +42,9 @@ public record KiteProperties(
 
   /** Compact constructor applying nested defaults when omitted. */
   public KiteProperties {
+    if (baseUrl == null || baseUrl.isBlank()) {
+      baseUrl = DEFAULT_BASE_URL;
+    }
     if (http == null) {
       http = new Http(null, null, null);
     }
