@@ -1,6 +1,7 @@
 package com.trading.bot.notifications.internal;
 
 import com.trading.bot.notifications.api.Notification;
+import com.trading.bot.notifications.api.Severity;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Clock;
@@ -144,14 +145,10 @@ public final class TelegramSender implements NotificationTransport {
 
   private String formatMessage(Notification n) {
     final StringBuilder sb = new StringBuilder();
-    sb.append('[')
-        .append(n.severity())
-        .append("] ")
-        .append(n.type())
-        .append('\n')
-        .append(n.title())
-        .append('\n')
-        .append(n.body());
+    if (n.severity() != null && n.severity() != Severity.INFO) {
+      sb.append('[').append(n.severity()).append("] ");
+    }
+    sb.append(n.type()).append('\n').append(n.title()).append('\n').append(n.body());
 
     if (n.cause() != null && n.cause().getMessage() != null) {
       sb.append("\nCause: ").append(n.cause().getMessage());

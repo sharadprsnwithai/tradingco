@@ -72,6 +72,7 @@ class TelegramSenderTest {
                 .string(
                     org.hamcrest.Matchers.allOf(
                         org.hamcrest.Matchers.containsString("\"chat_id\":\"" + CHAT_ID + "\""),
+                        org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString("[INFO]")),
                         org.hamcrest.Matchers.containsString("ORDER_FILLED"),
                         org.hamcrest.Matchers.containsString("Order executed"),
                         org.hamcrest.Matchers.containsString("Bought 10 RELIANCE"))))
@@ -105,6 +106,7 @@ class TelegramSenderTest {
             content()
                 .string(
                     org.hamcrest.Matchers.allOf(
+                        org.hamcrest.Matchers.containsString("[WARN]"),
                         org.hamcrest.Matchers.containsString("…[truncated]"),
                         org.hamcrest.Matchers.not(org.hamcrest.Matchers.containsString(hugeBody)))))
         .andRespond(withSuccess(SUCCESS_JSON, MediaType.APPLICATION_JSON));
