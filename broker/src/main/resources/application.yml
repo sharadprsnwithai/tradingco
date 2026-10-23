@@ -1,0 +1,20 @@
+spring:
+  application:
+    name: trading-bot
+  task:
+    scheduling:
+      pool:
+        size: 4
+
+kite:
+  base-url: https://api.kite.trade
+  http:
+    connect-timeout: 5s
+    read-timeout: 10s
+    place-read-timeout: 15s
+  auth:
+    initial-retry: 1m
+    max-retry: 20m
+    max-attempts-per-hour: 3
+  orders:
+    lost-grace: 30s
