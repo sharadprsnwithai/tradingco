@@ -12,6 +12,8 @@ import org.springframework.validation.annotation.Validated;
  * @param userId Kite user ID
  * @param password Kite account password
  * @param totpSecret Kite TOTP seed
+ * @param apiSecret optional Kite API secret for automated OAuth handshake
+ * @param redirectUri optional OAuth redirect URI
  * @param baseUrl Kite API base URL (default https://api.kite.trade)
  * @param http HTTP timeout tunables
  * @param auth authentication and retry backoff tunables
@@ -24,12 +26,15 @@ public record KiteProperties(
     @NotBlank(message = "KITE_USER_ID (kite.user-id) must not be blank") String userId,
     @NotBlank(message = "KITE_PASSWORD (kite.password) must not be blank") String password,
     @NotBlank(message = "KITE_TOTP_SECRET (kite.totp-secret) must not be blank") String totpSecret,
+    String apiSecret,
+    String redirectUri,
     String baseUrl,
     Http http,
     Auth auth,
     Orders orders) {
 
   private static final String DEFAULT_BASE_URL = "https://api.kite.trade";
+  private static final String DEFAULT_REDIRECT_URI = "http://127.0.0.1/";
   private static final Duration DEFAULT_CONNECT_TIMEOUT = Duration.ofSeconds(5);
   private static final Duration DEFAULT_READ_TIMEOUT = Duration.ofSeconds(10);
   private static final Duration DEFAULT_PLACE_READ_TIMEOUT = Duration.ofSeconds(15);
@@ -40,8 +45,24 @@ public record KiteProperties(
 
   private static final Duration DEFAULT_LOST_GRACE = Duration.ofSeconds(30);
 
+  public KiteProperties(
+      String apiKey,
+      String userId,
+      String password,
+      String totpSecret,
+      String baseUrl,
+      Http http,
+      Auth auth,
+      Orders orders) {
+    this(apiKey, userId, password, totpSecret, null, null, baseUrl, http, auth, orders);
+  }
+
   /** Compact constructor applying nested defaults when omitted. */
+  @org.springframework.boot.context.properties.bind.ConstructorBinding
   public KiteProperties {
+    if (redirectUri == null || redirectUri.isBlank()) {
+      redirectUri = DEFAULT_REDIRECT_URI;
+    }
     if (baseUrl == null || baseUrl.isBlank()) {
       baseUrl = DEFAULT_BASE_URL;
     }
