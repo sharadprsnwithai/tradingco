@@ -43,6 +43,14 @@
         <module name="NeedBraces"/>
         <module name="ModifierOrder"/>
         <module name="UpperEll"/>
-        <module name="WhitespaceAround"/>
+        <module name="WhitespaceAround">
+            <!-- google-java-format emits empty blocks as `{`; allowEmpty* keeps them legal. -->
+            <property name="allowEmptyConstructors" value="true"/>
+            <property name="allowEmptyMethods" value="true"/>
+            <property name="allowEmptyTypes" value="true"/>
+            <property name="allowEmptyLoops" value="true"/>
+            <property name="allowEmptyLambdas" value="true"/>
+            <property name="allowEmptyCatches" value="true"/>
+        </module>
     </module>
 </module>
