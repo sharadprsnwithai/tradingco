@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import com.trading.bot.strategy.model.StrikeSelection;
 import com.trading.bot.strategy.model.TargetIndex;
+import java.time.LocalDate;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -54,5 +55,28 @@ class InstrumentResolverTest {
     assertThat(selection.atmStrike()).isEqualTo(80000);
     assertThat(selection.otmCeStrike()).isEqualTo(82000);
     assertThat(selection.otmPeStrike()).isEqualTo(78000);
+  }
+
+  @Test
+  void weeklyExpiryCalculatorFindsUpcomingThursdayForNiftyAndFridayForSensex() {
+    final LocalDate monday = LocalDate.of(2026, 10, 26);
+    final LocalDate niftyExpiry = ExpiryCalculator.getWeeklyExpiry(TargetIndex.NIFTY, monday);
+    assertThat(niftyExpiry).isEqualTo(LocalDate.of(2026, 10, 29)); // Thursday 29-Oct-2026
+
+    final LocalDate sensexExpiry = ExpiryCalculator.getWeeklyExpiry(TargetIndex.SENSEX, monday);
+    assertThat(sensexExpiry).isEqualTo(LocalDate.of(2026, 10, 30)); // Friday 30-Oct-2026
+  }
+
+  @Test
+  void formatOptionSymbolProducesKiteDerivativeSymbols() {
+    final LocalDate monthlyExpiry = LocalDate.of(2026, 10, 29);
+    final String niftyMonthlySymbol =
+        resolver.formatOptionSymbol(TargetIndex.NIFTY, monthlyExpiry, 25000, "CE");
+    assertThat(niftyMonthlySymbol).isEqualTo("NIFTY26OCT25000CE");
+
+    final LocalDate weeklyExpiry = LocalDate.of(2026, 10, 15);
+    final String niftyWeeklySymbol =
+        resolver.formatOptionSymbol(TargetIndex.NIFTY, weeklyExpiry, 25000, "PE");
+    assertThat(niftyWeeklySymbol).isEqualTo("NIFTY26O1525000PE");
   }
 }

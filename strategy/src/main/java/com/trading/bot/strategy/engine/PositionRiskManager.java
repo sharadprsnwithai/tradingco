@@ -1,8 +1,11 @@
 package com.trading.bot.strategy.engine;
 
 import com.trading.bot.broker.api.Broker;
+import com.trading.bot.broker.api.error.BrokerException;
 import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.Order;
+import com.trading.bot.broker.api.model.OrderStatus;
 import com.trading.bot.broker.api.model.Quote;
 import com.trading.bot.broker.api.model.QuoteRef;
 import com.trading.bot.strategy.config.StrategyProperties;
@@ -15,11 +18,19 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-/** Monitors live short leg premiums and executes stop-losses with breakeven trailing. */
+/**
+ * Monitors live short leg premiums and reconciles exchange stop-loss execution with breakeven
+ * trailing.
+ */
 @Component
 public final class PositionRiskManager {
+
+  private static final Logger LOG = LoggerFactory.getLogger(PositionRiskManager.class);
 
   private final StrategyExecutionGateway gateway;
   private final StrategyStateRepository stateRepository;
@@ -42,7 +53,7 @@ public final class PositionRiskManager {
   }
 
   /**
-   * Evaluates active short legs against stop-loss and breakeven rules.
+   * Evaluates active short legs against exchange SL order execution and live quote limits.
    *
    * @param record current daily trade record
    * @return updated daily trade record
@@ -72,15 +83,50 @@ public final class PositionRiskManager {
       return record;
     }
 
+    // 1. Fetch live order book to detect exchange-level SL order fills
+    Map<String, Order> orderBookMap = Map.of();
+    try {
+      final List<Order> book = broker.orderBook();
+      if (book != null && !book.isEmpty()) {
+        orderBookMap =
+            book.stream()
+                .filter(o -> o.orderId() != null)
+                .collect(Collectors.toMap(o -> o.orderId().value(), o -> o, (a, b) -> a));
+      }
+    } catch (BrokerException e) {
+      if (LOG.isWarnEnabled()) {
+        LOG.warn("Notice querying order book for SL reconciliation: {}", e.getMessage(), e);
+      }
+    }
+
     final Map<InstrumentToken, Quote> quotes = broker.quotes(refs);
 
-    // 1. Evaluate Call Leg SL
+    // 2. Evaluate Call Leg SL (Exchange fill detection OR quote threshold breach)
     if (shortCe != null && shortCe.isOpen()) {
+      boolean ceFilledAtExchange = false;
+      BigDecimal ceExchangePrice = BigDecimal.ZERO;
+
+      if (shortCe.slOrderId() != null && orderBookMap.containsKey(shortCe.slOrderId().value())) {
+        final Order slOrder = orderBookMap.get(shortCe.slOrderId().value());
+        if (slOrder.status() == OrderStatus.FILLED) {
+          ceFilledAtExchange = true;
+          ceExchangePrice =
+              slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0
+                  ? slOrder.averagePrice()
+                  : shortCe.slPrice();
+        }
+      }
+
       final Quote q = quotes.get(shortCe.token());
-      if (q != null && q.lastPrice() != null && q.lastPrice().compareTo(shortCe.slPrice()) >= 0) {
+      final boolean quoteTriggered =
+          q != null && q.lastPrice() != null && q.lastPrice().compareTo(shortCe.slPrice()) >= 0;
+
+      if (ceFilledAtExchange || quoteTriggered) {
         final BigDecimal exitPrice =
-            gateway.executeBuyMarket(
-                shortCe.symbol(), shortCe.token(), derivExchange, shortCe.quantity());
+            ceFilledAtExchange
+                ? ceExchangePrice
+                : gateway.executeBuyMarket(
+                    shortCe.symbol(), shortCe.token(), derivExchange, shortCe.quantity());
 
         final boolean isBreakevenExit = shortCe.slPrice().compareTo(shortCe.entryPrice()) == 0;
 
@@ -123,13 +169,32 @@ public final class PositionRiskManager {
       }
     }
 
-    // 2. Evaluate Put Leg SL
+    // 3. Evaluate Put Leg SL (Exchange fill detection OR quote threshold breach)
     if (shortPe != null && shortPe.isOpen()) {
+      boolean peFilledAtExchange = false;
+      BigDecimal peExchangePrice = BigDecimal.ZERO;
+
+      if (shortPe.slOrderId() != null && orderBookMap.containsKey(shortPe.slOrderId().value())) {
+        final Order slOrder = orderBookMap.get(shortPe.slOrderId().value());
+        if (slOrder.status() == OrderStatus.FILLED) {
+          peFilledAtExchange = true;
+          peExchangePrice =
+              slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0
+                  ? slOrder.averagePrice()
+                  : shortPe.slPrice();
+        }
+      }
+
       final Quote q = quotes.get(shortPe.token());
-      if (q != null && q.lastPrice() != null && q.lastPrice().compareTo(shortPe.slPrice()) >= 0) {
+      final boolean quoteTriggered =
+          q != null && q.lastPrice() != null && q.lastPrice().compareTo(shortPe.slPrice()) >= 0;
+
+      if (peFilledAtExchange || quoteTriggered) {
         final BigDecimal exitPrice =
-            gateway.executeBuyMarket(
-                shortPe.symbol(), shortPe.token(), derivExchange, shortPe.quantity());
+            peFilledAtExchange
+                ? peExchangePrice
+                : gateway.executeBuyMarket(
+                    shortPe.symbol(), shortPe.token(), derivExchange, shortPe.quantity());
 
         final boolean isBreakevenExit = shortPe.slPrice().compareTo(shortPe.entryPrice()) == 0;
 

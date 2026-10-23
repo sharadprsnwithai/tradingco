@@ -142,8 +142,9 @@ public final class IntradayOptionStrategy {
     final Exchange derivExchange =
         index.spotExchange() == Exchange.NSE ? Exchange.NFO : Exchange.BFO;
 
-    final String ceSymbol = index.name() + "_H_CE_" + strikes.otmCeStrike();
-    final String peSymbol = index.name() + "_H_PE_" + strikes.otmPeStrike();
+    final LocalDate expiry = ExpiryCalculator.getWeeklyExpiry(index, today);
+    final String ceSymbol = resolver.formatOptionSymbol(index, expiry, strikes.otmCeStrike(), "CE");
+    final String peSymbol = resolver.formatOptionSymbol(index, expiry, strikes.otmPeStrike(), "PE");
     final InstrumentToken ceToken = new InstrumentToken(strikes.otmCeStrike());
     final InstrumentToken peToken = new InstrumentToken(strikes.otmPeStrike());
 
@@ -190,8 +191,9 @@ public final class IntradayOptionStrategy {
     final Exchange derivExchange =
         index.spotExchange() == Exchange.NSE ? Exchange.NFO : Exchange.BFO;
 
-    final String ceSymbol = index.name() + "_ATM_CE_" + atmStrike;
-    final String peSymbol = index.name() + "_ATM_PE_" + atmStrike;
+    final LocalDate expiry = ExpiryCalculator.getWeeklyExpiry(index, today);
+    final String ceSymbol = resolver.formatOptionSymbol(index, expiry, atmStrike, "CE");
+    final String peSymbol = resolver.formatOptionSymbol(index, expiry, atmStrike, "PE");
     final InstrumentToken ceToken = new InstrumentToken(atmStrike);
     final InstrumentToken peToken = new InstrumentToken(atmStrike);
 
@@ -386,7 +388,8 @@ public final class IntradayOptionStrategy {
   private double fetchSpotPrice(TargetIndex index) {
     try {
       final QuoteRef ref =
-          new QuoteRef(index.spotExchange(), index.spotSymbol(), new InstrumentToken(256265L));
+          new QuoteRef(
+              index.spotExchange(), index.spotSymbol(), new InstrumentToken(index.spotToken()));
       final Map<InstrumentToken, Quote> quotes = broker.quotes(List.of(ref));
       final Quote q = quotes.get(ref.token());
       if (q != null && q.lastPrice() != null) {

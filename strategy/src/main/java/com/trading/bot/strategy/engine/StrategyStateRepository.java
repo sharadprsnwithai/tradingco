@@ -45,8 +45,16 @@ public final class StrategyStateRepository {
       if (parent != null) {
         Files.createDirectories(parent);
       }
+      final Path fileName = stateFilePath.getFileName();
+      final String name = fileName != null ? fileName.toString() : "strategy_state.json";
+      final Path tempFile = stateFilePath.resolveSibling(name + ".tmp");
       final String json = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(record);
-      Files.writeString(stateFilePath, json);
+      Files.writeString(tempFile, json);
+      Files.move(
+          tempFile,
+          stateFilePath,
+          java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+          java.nio.file.StandardCopyOption.REPLACE_EXISTING);
     } catch (IOException e) {
       if (LOG.isErrorEnabled()) {
         LOG.error("Failed persisting strategy state to {}: {}", stateFilePath, e.getMessage(), e);

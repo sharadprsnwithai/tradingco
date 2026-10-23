@@ -11,8 +11,16 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.trading.bot.broker.api.Broker;
+import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.Order;
+import com.trading.bot.broker.api.model.OrderId;
+import com.trading.bot.broker.api.model.OrderStatus;
+import com.trading.bot.broker.api.model.OrderType;
+import com.trading.bot.broker.api.model.Product;
 import com.trading.bot.broker.api.model.Quote;
+import com.trading.bot.broker.api.model.TransactionType;
+import com.trading.bot.broker.api.model.Validity;
 import com.trading.bot.notifications.api.Notification;
 import com.trading.bot.notifications.api.NotificationPublisher;
 import com.trading.bot.strategy.config.ExecutionMode;
@@ -23,11 +31,13 @@ import com.trading.bot.strategy.model.StrategyState;
 import com.trading.bot.strategy.model.TargetIndex;
 import com.trading.bot.strategy.model.TradeLeg;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
 @SuppressWarnings("PMD.UnitTestContainsTooManyAsserts")
@@ -278,5 +288,98 @@ class PositionRiskManagerTest {
     assertThat(updated.shortCe().isOpen()).isFalse();
     assertThat(updated.shortPe().isOpen()).isFalse();
     verify(gateway, times(2)).executeBuyMarket(any(), any(), any(), anyInt());
+  }
+
+  @Test
+  void reconcilesExchangeSlOrderExecutionWithoutDuplicateMarketBuy() {
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final Broker broker = mock(Broker.class);
+    final List<Notification> published = new ArrayList<>();
+    final NotificationPublisher publisher = published::add;
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final PositionRiskManager riskManager =
+        new PositionRiskManager(gateway, stateRepo, broker, alertService, props);
+
+    final InstrumentToken ceToken = new InstrumentToken(201L);
+    final InstrumentToken peToken = new InstrumentToken(202L);
+
+    final OrderId ceSlOrderId = new OrderId("sl-order-ce-99");
+    final OrderId peSlOrderId = new OrderId("sl-order-pe-99");
+
+    final TradeLeg shortCe =
+        new TradeLeg(
+            CE_SYMBOL,
+            ceToken,
+            130,
+            BigDecimal.valueOf(100.0),
+            BigDecimal.ZERO,
+            BigDecimal.valueOf(130.0),
+            ceSlOrderId,
+            true);
+    final TradeLeg shortPe =
+        new TradeLeg(
+            PE_SYMBOL,
+            peToken,
+            130,
+            BigDecimal.valueOf(100.0),
+            BigDecimal.ZERO,
+            BigDecimal.valueOf(130.0),
+            peSlOrderId,
+            true);
+
+    final DailyTradeRecord record =
+        new DailyTradeRecord(
+            LocalDate.now(),
+            TargetIndex.NIFTY,
+            StrategyState.STRADDLE_ACTIVE,
+            null,
+            null,
+            shortCe,
+            shortPe,
+            BigDecimal.ZERO);
+
+    // OrderBook shows CE SL order was FILLED directly by exchange at 130.50
+    final Order filledCeSlOrder =
+        new Order(
+            ceSlOrderId,
+            Optional.of("sl-ce"),
+            Exchange.NFO,
+            CE_SYMBOL,
+            TransactionType.BUY,
+            OrderType.SL,
+            Product.MIS,
+            Validity.DAY,
+            OrderStatus.FILLED,
+            "COMPLETE",
+            130,
+            130,
+            0,
+            BigDecimal.valueOf(136.50),
+            BigDecimal.valueOf(130.0),
+            BigDecimal.valueOf(130.50),
+            "",
+            Instant.now());
+
+    when(broker.orderBook()).thenReturn(List.of(filledCeSlOrder));
+    when(broker.quotes(any()))
+        .thenReturn(
+            Map.of(
+                ceToken, makeQuote(ceToken, CE_SYMBOL, BigDecimal.valueOf(131.0)),
+                peToken, makeQuote(peToken, PE_SYMBOL, BigDecimal.valueOf(70.0))));
+
+    final DailyTradeRecord updated = riskManager.evaluateRisk(record);
+
+    // CE marked closed with fill price from exchange
+    assertThat(updated.shortCe().isOpen()).isFalse();
+    assertThat(updated.shortCe().exitPrice()).isEqualByComparingTo(BigDecimal.valueOf(130.50));
+
+    // Zero duplicate buy market orders executed!
+    verify(gateway, never()).executeBuyMarket(any(), any(), any(), anyInt());
+
+    // Surviving PE leg's exchange SL order was modified to entry cost (100.0)
+    verify(gateway).modifyStopLoss(eq(peSlOrderId), eq(130), eq(BigDecimal.valueOf(100.0)), any());
+    assertThat(updated.shortPe().slPrice()).isEqualByComparingTo(BigDecimal.valueOf(100.0));
   }
 }

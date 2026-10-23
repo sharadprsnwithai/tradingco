@@ -2,6 +2,8 @@ package com.trading.bot.strategy.engine;
 
 import com.trading.bot.strategy.model.StrikeSelection;
 import com.trading.bot.strategy.model.TargetIndex;
+import java.time.LocalDate;
+import java.util.Locale;
 import java.util.Objects;
 import org.springframework.stereotype.Component;
 
@@ -32,5 +34,44 @@ public final class InstrumentResolver {
   public StrikeSelection selectStrikes(TargetIndex index, double spotPrice) {
     final int atm = computeAtmStrike(index, spotPrice);
     return new StrikeSelection(atm, atm + index.hedgeDistance(), atm - index.hedgeDistance());
+  }
+
+  /**
+   * Formats standard Kite option tradingsymbol for the specified expiry, strike, and option type.
+   *
+   * @param index target index
+   * @param expiry expiry date
+   * @param strike option strike price
+   * @param optionType CE or PE
+   * @return formatted tradingsymbol string (e.g. NIFTY26OCT25000CE or NIFTY26O2925000CE)
+   */
+  public String formatOptionSymbol(
+      TargetIndex index, LocalDate expiry, int strike, String optionType) {
+    Objects.requireNonNull(index, "index must not be null");
+    Objects.requireNonNull(expiry, "expiry must not be null");
+    Objects.requireNonNull(optionType, "optionType must not be null");
+
+    final int year = expiry.getYear() % 100;
+    final int month = expiry.getMonthValue();
+    final int day = expiry.getDayOfMonth();
+
+    // If next week falls into next month, this expiry is the monthly contract
+    final boolean isMonthly = expiry.plusDays(7).getMonthValue() != month;
+
+    if (isMonthly) {
+      final String monthCode = expiry.getMonth().name().substring(0, 3).toUpperCase(Locale.ROOT);
+      return String.format(
+          Locale.ROOT, "%s%02d%s%d%s", index.name(), year, monthCode, strike, optionType);
+    }
+
+    final char mChar =
+        switch (month) {
+          case 10 -> 'O';
+          case 11 -> 'N';
+          case 12 -> 'D';
+          default -> Character.forDigit(month, 10);
+        };
+    return String.format(
+        Locale.ROOT, "%s%02d%c%02d%d%s", index.name(), year, mChar, day, strike, optionType);
   }
 }
