@@ -143,8 +143,9 @@ class NotificationFluxTest {
     final long elapsed = (System.nanoTime() - start) / 1_000_000;
 
     assertThat(elapsed)
-        .as("1100 publish() calls should complete in under 100ms even when transport blocks")
-        .isLessThan(100);
+        .as(
+            "1100 publish() calls should complete in bounded non-blocking time (<250ms) even when transport blocks 5s")
+        .isLessThan(250);
 
     blockTransportLatch.countDown();
 

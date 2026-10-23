@@ -6,8 +6,10 @@ import com.trading.bot.notifications.api.Severity;
 import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.BufferOverflowStrategy;
 import reactor.core.publisher.Sinks;
@@ -24,11 +26,14 @@ import reactor.core.scheduler.Schedulers;
 public final class NotificationFlux implements NotificationPublisher {
 
   private static final Logger LOG = LoggerFactory.getLogger(NotificationFlux.class);
+  private static final long LOG_THROTTLE_MILLIS = 500L;
 
   private final Sinks.Many<Notification> batchSink;
   private final Sinks.Many<Notification> criticalSink;
   private final Counter droppedCounter;
+  private final AtomicLong lastDropLogTime = new AtomicLong(0);
 
+  @Autowired
   public NotificationFlux(
       NotificationTransport transport, PipelineProperties props, MeterRegistry registry) {
     this(transport, props, registry, Schedulers.boundedElastic(), Schedulers.parallel());
@@ -58,8 +63,13 @@ public final class NotificationFlux implements NotificationPublisher {
             props.bufferSize(),
             dropped -> {
               droppedCounter.increment();
-              if (LOG.isWarnEnabled()) {
-                LOG.warn("Notification dropped due to backpressure overflow: {}", dropped.title());
+              final long now = System.currentTimeMillis();
+              final long last = lastDropLogTime.get();
+              if (now - last > LOG_THROTTLE_MILLIS && lastDropLogTime.compareAndSet(last, now)) {
+                if (LOG.isWarnEnabled()) {
+                  LOG.warn(
+                      "Notification dropped due to backpressure overflow: {}", dropped.title());
+                }
               }
             },
             BufferOverflowStrategy.DROP_OLDEST)

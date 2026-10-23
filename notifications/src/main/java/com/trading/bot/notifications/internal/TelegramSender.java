@@ -10,6 +10,7 @@ import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
@@ -43,6 +44,7 @@ public final class TelegramSender implements NotificationTransport {
     void sleep(Duration duration);
   }
 
+  @Autowired
   public TelegramSender(
       TelegramProperties props,
       RestClient.Builder restClientBuilder,

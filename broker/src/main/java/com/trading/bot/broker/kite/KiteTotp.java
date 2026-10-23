@@ -5,6 +5,7 @@ import dev.samstevens.totp.code.DefaultCodeGenerator;
 import dev.samstevens.totp.code.HashingAlgorithm;
 import dev.samstevens.totp.exceptions.CodeGenerationException;
 import java.util.Objects;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /** RFC 6238 TOTP code generator using 30-second steps and SHA-1. */
@@ -16,6 +17,7 @@ public final class KiteTotp {
 
   private final CodeGenerator generator;
 
+  @Autowired
   public KiteTotp() {
     this(new DefaultCodeGenerator(HashingAlgorithm.SHA1, DIGIT_COUNT));
   }
