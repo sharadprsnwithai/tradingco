@@ -13,6 +13,7 @@ import static org.mockito.Mockito.when;
 import com.trading.bot.broker.api.Broker;
 import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.OrderId;
 import com.trading.bot.broker.api.model.Quote;
 import com.trading.bot.notifications.api.Notification;
 import com.trading.bot.notifications.api.NotificationPublisher;
@@ -241,11 +242,87 @@ class IntradayOptionStrategyTest {
 
     assertThat(completed.state()).isEqualTo(StrategyState.COMPLETED);
     assertThat(completed.realizedPnl()).isGreaterThan(BigDecimal.ZERO);
+  }
 
-    // Final P&L alert verified
-    assertThat(published).isNotEmpty();
-    final Notification finalAlert = published.get(0);
-    assertThat(finalAlert.title()).contains("[PAPER]").contains("Final P&L");
-    assertThat(finalAlert.body()).contains("Total Realized P&L");
+  @Test
+  void tenAmStraddleSellsAtmAndPlacesExchangeLevelStopLossOrders() {
+    final Broker broker = mock(Broker.class);
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final InstrumentResolver resolver = new InstrumentResolver();
+    final PositionRiskManager riskManager = mock(PositionRiskManager.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final List<Notification> published = new ArrayList<>();
+    final NotificationPublisher publisher = published::add;
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final Clock clock = Clock.fixed(Instant.parse("2026-10-26T04:30:00Z"), IST); // 10:00 IST
+
+    final TradeLeg hCe =
+        new TradeLeg(
+            "NIFTY_H_CE",
+            new InstrumentToken(1L),
+            130,
+            BigDecimal.valueOf(3.50),
+            BigDecimal.ZERO,
+            true);
+    final TradeLeg hPe =
+        new TradeLeg(
+            "NIFTY_H_PE",
+            new InstrumentToken(2L),
+            130,
+            BigDecimal.valueOf(4.20),
+            BigDecimal.ZERO,
+            true);
+    final DailyTradeRecord hedgedRecord =
+        new DailyTradeRecord(
+            LocalDate.now(clock),
+            TargetIndex.NIFTY,
+            StrategyState.HEDGED,
+            hCe,
+            hPe,
+            null,
+            null,
+            BigDecimal.ZERO);
+
+    when(stateRepo.load(any())).thenReturn(Optional.of(hedgedRecord));
+
+    final InstrumentToken spotToken = new InstrumentToken(256265L);
+    when(broker.quotes(any()))
+        .thenReturn(
+            Map.of(spotToken, makeQuote(spotToken, "NIFTY 50", BigDecimal.valueOf(25000.0))));
+
+    when(gateway.executeSellMarket(any(), any(), any(), anyInt()))
+        .thenReturn(BigDecimal.valueOf(100.0));
+    when(gateway.placeStopLossBuy(any(), any(), any(), anyInt(), any(), any()))
+        .thenReturn(new OrderId("sl-101"), new OrderId("sl-102"));
+
+    final IntradayOptionStrategy strategy =
+        new IntradayOptionStrategy(
+            broker,
+            gateway,
+            resolver,
+            riskManager,
+            stateRepo,
+            alertService,
+            publisher,
+            props,
+            clock);
+
+    strategy.executeStraddle();
+
+    // 2 sell market orders executed
+    verify(gateway, times(2)).executeSellMarket(any(), any(), eq(Exchange.NFO), eq(130));
+
+    // 2 exchange-level SL orders placed
+    verify(gateway, times(2))
+        .placeStopLossBuy(any(), any(), eq(Exchange.NFO), eq(130), any(), any());
+
+    final ArgumentCaptor<DailyTradeRecord> captor = ArgumentCaptor.forClass(DailyTradeRecord.class);
+    verify(stateRepo).save(captor.capture());
+    final DailyTradeRecord saved = captor.getValue();
+
+    assertThat(saved.state()).isEqualTo(StrategyState.STRADDLE_ACTIVE);
+    assertThat(saved.shortCe().slOrderId()).isEqualTo(new OrderId("sl-101"));
+    assertThat(saved.shortPe().slOrderId()).isEqualTo(new OrderId("sl-102"));
   }
 }

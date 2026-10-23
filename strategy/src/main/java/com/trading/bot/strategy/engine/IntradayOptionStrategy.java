@@ -4,6 +4,7 @@ import com.trading.bot.broker.api.Broker;
 import com.trading.bot.broker.api.error.BrokerException;
 import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.OrderId;
 import com.trading.bot.broker.api.model.Quote;
 import com.trading.bot.broker.api.model.QuoteRef;
 import com.trading.bot.notifications.api.Notification;
@@ -198,11 +199,22 @@ public final class IntradayOptionStrategy {
     final BigDecimal peFill = gateway.executeSellMarket(peSymbol, peToken, derivExchange, qty);
 
     final double slMultiplier = 1.0 + (props.slPercentage() / 100.0);
-    final BigDecimal ceSl = ceFill.multiply(BigDecimal.valueOf(slMultiplier));
-    final BigDecimal peSl = peFill.multiply(BigDecimal.valueOf(slMultiplier));
+    final BigDecimal ceSl = roundToTick(ceFill.multiply(BigDecimal.valueOf(slMultiplier)));
+    final BigDecimal ceSlLimit = roundToTick(ceSl.multiply(BigDecimal.valueOf(1.05)));
 
-    final TradeLeg sCe = new TradeLeg(ceSymbol, ceToken, qty, ceFill, ceSl, true);
-    final TradeLeg sPe = new TradeLeg(peSymbol, peToken, qty, peFill, peSl, true);
+    final BigDecimal peSl = roundToTick(peFill.multiply(BigDecimal.valueOf(slMultiplier)));
+    final BigDecimal peSlLimit = roundToTick(peSl.multiply(BigDecimal.valueOf(1.05)));
+
+    // Immediately place exchange-level Stop-Loss orders with Kite at ~10:00 AM
+    final OrderId ceSlOrderId =
+        gateway.placeStopLossBuy(ceSymbol, ceToken, derivExchange, qty, ceSl, ceSlLimit);
+    final OrderId peSlOrderId =
+        gateway.placeStopLossBuy(peSymbol, peToken, derivExchange, qty, peSl, peSlLimit);
+
+    final TradeLeg sCe =
+        new TradeLeg(ceSymbol, ceToken, qty, ceFill, BigDecimal.ZERO, ceSl, ceSlOrderId, true);
+    final TradeLeg sPe =
+        new TradeLeg(peSymbol, peToken, qty, peFill, BigDecimal.ZERO, peSl, peSlOrderId, true);
 
     final DailyTradeRecord updated =
         new DailyTradeRecord(
@@ -249,6 +261,14 @@ public final class IntradayOptionStrategy {
     TradeLeg shortPe = record.shortPe();
     TradeLeg hedgeCe = record.hedgeCe();
     TradeLeg hedgePe = record.hedgePe();
+
+    // 0. Cancel open exchange stop-loss orders
+    if (shortCe != null && shortCe.slOrderId() != null) {
+      gateway.cancelOrder(shortCe.slOrderId());
+    }
+    if (shortPe != null && shortPe.slOrderId() != null) {
+      gateway.cancelOrder(shortPe.slOrderId());
+    }
 
     // 1. Close remaining open short legs
     if (shortCe != null && shortCe.isOpen()) {
@@ -351,6 +371,16 @@ public final class IntradayOptionStrategy {
         executeSquareOff();
       }
     }
+  }
+
+  private static BigDecimal roundToTick(BigDecimal price) {
+    if (price == null) {
+      return BigDecimal.ZERO;
+    }
+    return price
+        .multiply(BigDecimal.valueOf(20))
+        .setScale(0, java.math.RoundingMode.HALF_UP)
+        .divide(BigDecimal.valueOf(20), 2, java.math.RoundingMode.HALF_UP);
   }
 
   private double fetchSpotPrice(TargetIndex index) {

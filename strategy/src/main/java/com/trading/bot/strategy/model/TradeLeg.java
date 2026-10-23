@@ -1,6 +1,7 @@
 package com.trading.bot.strategy.model;
 
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.OrderId;
 import java.math.BigDecimal;
 
 /**
@@ -12,6 +13,7 @@ import java.math.BigDecimal;
  * @param entryPrice fill premium price
  * @param exitPrice execution exit price (or zero if still open)
  * @param slPrice stop loss threshold price
+ * @param slOrderId exchange stop-loss order ID
  * @param isOpen true if leg is actively open
  */
 public record TradeLeg(
@@ -21,6 +23,7 @@ public record TradeLeg(
     BigDecimal entryPrice,
     BigDecimal exitPrice,
     BigDecimal slPrice,
+    OrderId slOrderId,
     boolean isOpen) {
 
   public TradeLeg(
@@ -30,7 +33,18 @@ public record TradeLeg(
       BigDecimal entryPrice,
       BigDecimal slPrice,
       boolean isOpen) {
-    this(symbol, token, quantity, entryPrice, BigDecimal.ZERO, slPrice, isOpen);
+    this(symbol, token, quantity, entryPrice, BigDecimal.ZERO, slPrice, null, isOpen);
+  }
+
+  public TradeLeg(
+      String symbol,
+      InstrumentToken token,
+      int quantity,
+      BigDecimal entryPrice,
+      BigDecimal exitPrice,
+      BigDecimal slPrice,
+      boolean isOpen) {
+    this(symbol, token, quantity, entryPrice, exitPrice, slPrice, null, isOpen);
   }
 
   /**

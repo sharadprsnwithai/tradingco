@@ -3,6 +3,7 @@ package com.trading.bot.strategy.gateway;
 import com.trading.bot.broker.api.Broker;
 import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.OrderId;
 import com.trading.bot.broker.api.model.Quote;
 import com.trading.bot.broker.api.model.QuoteRef;
 import java.math.BigDecimal;
@@ -36,6 +37,28 @@ public final class PaperStrategyGateway implements StrategyExecutionGateway {
   public BigDecimal executeSellMarket(
       String symbol, InstrumentToken token, Exchange exchange, int quantity) {
     return sampleMarketPrice(symbol, token, exchange);
+  }
+
+  @Override
+  public OrderId placeStopLossBuy(
+      String symbol,
+      InstrumentToken token,
+      Exchange exchange,
+      int quantity,
+      BigDecimal triggerPrice,
+      BigDecimal limitPrice) {
+    return new OrderId("paper-sl-" + symbol + "-" + triggerPrice.toPlainString());
+  }
+
+  @Override
+  public void modifyStopLoss(
+      OrderId orderId, int quantity, BigDecimal newTriggerPrice, BigDecimal newLimitPrice) {
+    // In paper mode, simulated in memory
+  }
+
+  @Override
+  public void cancelOrder(OrderId orderId) {
+    // In paper mode, simulated in memory
   }
 
   private BigDecimal sampleMarketPrice(String symbol, InstrumentToken token, Exchange exchange) {

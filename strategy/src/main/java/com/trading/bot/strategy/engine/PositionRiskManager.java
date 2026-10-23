@@ -92,6 +92,7 @@ public final class PositionRiskManager {
                 shortCe.entryPrice(),
                 exitPrice,
                 shortCe.slPrice(),
+                shortCe.slOrderId(),
                 false);
 
         if (isBreakevenExit) {
@@ -100,6 +101,12 @@ public final class PositionRiskManager {
           if (Boolean.TRUE.equals(props.trailToBreakeven())
               && shortPe != null
               && shortPe.isOpen()) {
+            if (shortPe.slOrderId() != null) {
+              final BigDecimal peLimit =
+                  roundToTick(shortPe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
+              gateway.modifyStopLoss(
+                  shortPe.slOrderId(), shortPe.quantity(), shortPe.entryPrice(), peLimit);
+            }
             shortPe =
                 new TradeLeg(
                     shortPe.symbol(),
@@ -108,6 +115,7 @@ public final class PositionRiskManager {
                     shortPe.entryPrice(),
                     shortPe.exitPrice(),
                     shortPe.entryPrice(),
+                    shortPe.slOrderId(),
                     true);
           }
           alertService.notifyStopLossHit(shortCe, exitPrice, shortPe, props.executionMode());
@@ -133,6 +141,7 @@ public final class PositionRiskManager {
                 shortPe.entryPrice(),
                 exitPrice,
                 shortPe.slPrice(),
+                shortPe.slOrderId(),
                 false);
 
         if (isBreakevenExit) {
@@ -141,6 +150,12 @@ public final class PositionRiskManager {
           if (Boolean.TRUE.equals(props.trailToBreakeven())
               && shortCe != null
               && shortCe.isOpen()) {
+            if (shortCe.slOrderId() != null) {
+              final BigDecimal ceLimit =
+                  roundToTick(shortCe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
+              gateway.modifyStopLoss(
+                  shortCe.slOrderId(), shortCe.quantity(), shortCe.entryPrice(), ceLimit);
+            }
             shortCe =
                 new TradeLeg(
                     shortCe.symbol(),
@@ -149,6 +164,7 @@ public final class PositionRiskManager {
                     shortCe.entryPrice(),
                     shortCe.exitPrice(),
                     shortCe.entryPrice(),
+                    shortCe.slOrderId(),
                     true);
           }
           alertService.notifyStopLossHit(shortPe, exitPrice, shortCe, props.executionMode());
@@ -179,5 +195,15 @@ public final class PositionRiskManager {
 
     stateRepository.save(updated);
     return updated;
+  }
+
+  private static BigDecimal roundToTick(BigDecimal price) {
+    if (price == null) {
+      return BigDecimal.ZERO;
+    }
+    return price
+        .multiply(BigDecimal.valueOf(20))
+        .setScale(0, java.math.RoundingMode.HALF_UP)
+        .divide(BigDecimal.valueOf(20), 2, java.math.RoundingMode.HALF_UP);
   }
 }

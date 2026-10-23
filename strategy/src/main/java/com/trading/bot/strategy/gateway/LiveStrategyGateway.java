@@ -4,6 +4,8 @@ import com.trading.bot.broker.api.Broker;
 import com.trading.bot.broker.api.error.BrokerException;
 import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.OrderId;
+import com.trading.bot.broker.api.model.OrderPatch;
 import com.trading.bot.broker.api.model.OrderRequest;
 import com.trading.bot.broker.api.model.OrderType;
 import com.trading.bot.broker.api.model.Product;
@@ -16,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -74,6 +77,57 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
 
     broker.placeOrder(request);
     return fetchEstimatedPrice(symbol, token, exchange);
+  }
+
+  @Override
+  public OrderId placeStopLossBuy(
+      String symbol,
+      InstrumentToken token,
+      Exchange exchange,
+      int quantity,
+      BigDecimal triggerPrice,
+      BigDecimal limitPrice) {
+    final OrderRequest request =
+        new OrderRequest(
+            token,
+            symbol,
+            exchange,
+            TransactionType.BUY,
+            OrderType.SL,
+            Product.MIS,
+            Validity.DAY,
+            quantity,
+            Optional.of(limitPrice),
+            Optional.of(triggerPrice),
+            Optional.of("sl-" + (System.currentTimeMillis() % 1_000_000L)));
+
+    return broker.placeOrder(request);
+  }
+
+  @Override
+  public void modifyStopLoss(
+      OrderId orderId, int quantity, BigDecimal newTriggerPrice, BigDecimal newLimitPrice) {
+    if (orderId == null) {
+      return;
+    }
+    final OrderPatch patch =
+        new OrderPatch(
+            OptionalInt.of(quantity), Optional.of(newLimitPrice), Optional.of(newTriggerPrice));
+    broker.modifyOrder(orderId, patch);
+  }
+
+  @Override
+  public void cancelOrder(OrderId orderId) {
+    if (orderId == null) {
+      return;
+    }
+    try {
+      broker.cancelOrder(orderId);
+    } catch (BrokerException e) {
+      if (LOG.isWarnEnabled()) {
+        LOG.warn("Notice cancelling stop-loss order {}: {}", orderId.value(), e.getMessage(), e);
+      }
+    }
   }
 
   private BigDecimal fetchEstimatedPrice(String symbol, InstrumentToken token, Exchange exchange) {
