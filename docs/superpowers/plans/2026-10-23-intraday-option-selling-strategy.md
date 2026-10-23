@@ -17,7 +17,7 @@
 - All timestamps and schedules in `ZoneId.of("Asia/Kolkata")`.
 - Weekly schedule: Mon/Tue NIFTY, Wed/Thu SENSEX, Fri idle.
 - Schedule checkpoints: 09:45 IST (buy 20-strike OTM hedges), 10:00 IST (sell ATM CE & PE), 15:00 IST (square-off all open legs).
-- Stop-loss rule: 30% loss on entry premium per short leg. When one leg triggers SL, the surviving leg's SL is automatically trailed to its entry price (breakeven), preventing whipsaw losses.
+- Stop-loss rule: 30% loss on entry premium per short leg. In LIVE mode, protective exchange SL orders are placed at 10:00 AM immediately after straddle entry; when one leg executes, the engine modifies the surviving leg's exchange SL order to its entry price (breakeven). In PAPER mode, this lifecycle is simulated in memory.
 - Configurable environment properties in `.env` with default values: `STRATEGY_EXECUTION_MODE=PAPER`, `STRATEGY_LOTS=2`, `STRATEGY_SL_PERCENTAGE=30.0`, `STRATEGY_TRAIL_TO_BREAKEVEN=true`.
 - Quality gates wired into `check`; `./gradlew build` must stay green after every task.
 

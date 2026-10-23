@@ -137,7 +137,7 @@ digraph StrategyLifecycle {
    - Order: `BUY`, `MARKET`, Product `MIS`, Quantity: `Lots * LotSize`.
 7. Verify fills. If hedge buying fails or is rejected, abort strategy for the day and publish alert.
 
-#### Step 2: 10:00 IST — Short Straddle Execution
+#### Step 2: 10:00 IST — Short Straddle Execution & Exchange-Level SL Placement
 1. Re-query spot price at 10:00:00 IST.
 2. Compute execution ATM strike:
    - $ATM_{exec} = \text{round}(Spot / \text{Step}) \times \text{Step}$
@@ -149,34 +149,32 @@ digraph StrategyLifecycle {
 6. Calculate stop-loss trigger levels:
    - $SL_{CE} = P_{CE\_entry} \times 1.30$
    - $SL_{PE} = P_{PE\_entry} \times 1.30$
-7. Place stop-loss trigger orders (or engage continuous risk monitoring thread).
-8. Publish `ORDER_SUBMITTED` notification detailing entry strikes, premiums, and stop-loss levels.
+7. **Immediate Exchange Stop-Loss Placement:**
+   - Immediately at ~10:00 AM, place two protective exchange `BUY SL` orders with Kite:
+     - **CE Stop-Loss Order:** `BUY`, `OrderType.SL`, `triggerPrice = SL_CE`, `price = SL_CE * 1.05` (5% limit buffer).
+     - **PE Stop-Loss Order:** `BUY`, `OrderType.SL`, `triggerPrice = SL_PE`, `price = SL_PE * 1.05` (5% limit buffer).
+   - This ensures the positions are protected at the exchange level against flash crashes or internet outages.
+8. Publish `ORDER_SUBMITTED` notification detailing entry strikes, premiums, and exchange SL order IDs.
 
-#### Step 3: 10:00 to 15:00 IST — Active Risk Monitoring & Breakeven Trailing
-1. Monitor live quotes for active short legs every 1 second.
-2. **If CE premium reaches or exceeds $SL_{CE}$:**
-   - Execute market buy to close CE short leg.
-   - Cancel pending CE stop-loss order.
-   - **Immediately update PE stop-loss level to its entry cost ($SL_{PE} = P_{PE\_entry}$)**.
-   - Leave PE short leg and long hedges running with the tightened breakeven stop.
-   - Publish `SYSTEM_ALERT` notification: *"CE Stop-loss triggered at ₹X (loss capped at 30%). PE stop-loss moved to breakeven (₹Y)"*.
-3. **If PE premium reaches or exceeds $SL_{PE}$:**
-   - Execute market buy to close PE short leg.
-   - Cancel pending PE stop-loss order.
-   - **Immediately update CE stop-loss level to its entry cost ($SL_{CE} = P_{CE\_entry}$)**.
-   - Leave CE short leg and long hedges running with the tightened breakeven stop.
-   - Publish `SYSTEM_ALERT` notification: *"PE Stop-loss triggered at ₹Y (loss capped at 30%). CE stop-loss moved to breakeven (₹X)"*.
-4. **If surviving leg subsequently hits its breakeven stop:**
-   - Execute market buy to close surviving leg at cost.
-   - Transition state to `ONE_LEG_STOPPED` (both short legs exited, hedges continue holding until 15:00 IST).
+#### Step 3: 10:00 to 15:00 IST — Position & Order Status Monitoring with Breakeven Trailing
+1. The engine monitors order status changes and position fills (via WebSocket streaming and periodic verification).
+2. **When one leg's SL is executed at the exchange (e.g. CE SL fills):**
+   - Engine detects CE short position closed at 30% loss.
+   - **Immediately modifies the surviving PE stop-loss order at the exchange:**
+     - Calls `broker.modifyOrder(peSlOrderId, new OrderPatch(qty, P_PE_entry, P_PE_entry * 1.05))`.
+     - Tightens PE stop-loss directly on the exchange book down to its **entry cost price (breakeven)**.
+   - Dispatches Telegram alert: *"CE Stop-loss filled at exchange (-30%). PE stop-loss order modified to Breakeven @ ₹Y"*.
+3. **If market whipsaws back down:**
+   - The exchange executes the modified PE stop-loss order at cost (breakeven), guaranteeing zero loss on the second leg.
+4. **If market continues trending or decays:**
+   - The surviving leg continues collecting theta decay until 15:00 IST.
 
 #### Step 4: 15:00 IST — Mandatory Square-Off
-1. Cancel all outstanding stop-loss trigger orders.
-2. Identify all open positions associated with the strategy (short legs and hedge wings).
-3. Execute market orders to close all positions.
-4. Compute total realized P&L across all 4 legs.
-5. Save state as `COMPLETED`.
-6. Publish `STARTUP` / `SYSTEM_ALERT` notification with final P&L breakdown.
+1. Cancel all open exchange stop-loss orders (`broker.cancelOrder()`).
+2. Execute market orders to close any remaining open short legs and both long hedge wings.
+3. Compute total realized P&L across all 4 legs.
+4. Save state as `COMPLETED`.
+5. Publish daily summary notification with final P&L breakdown.
 
 ---
 
