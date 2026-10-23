@@ -10,6 +10,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.web.client.RestClient;
 
 /** Main Spring Boot application entry point for the Kite trading bot. */
 @SpringBootApplication(scanBasePackages = {"com.trading.bot"})
@@ -24,6 +25,11 @@ public class TradingBotApplication {
   @Bean
   public Clock clock() {
     return Clock.system(ZoneId.of("Asia/Kolkata"));
+  }
+
+  @Bean
+  public RestClient.Builder restClientBuilder() {
+    return RestClient.builder();
   }
 
   public static void main(String[] args) {
