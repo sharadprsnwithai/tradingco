@@ -1,20 +1,70 @@
+---
 services:
   trading-bot:
     build:
       context: .
       dockerfile: Dockerfile
+    image: trading-bot:latest
     container_name: trading-bot
     restart: unless-stopped
-    env_file:
-      - path: .env
-        required: true
     ports:
-      - "127.0.0.1:8080:8080"
+      - "${SERVER_PORT:-8080}:8080"
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - SERVER_PORT=8080
+      - LOGGING_FILE_NAME=/app/logs/trading-bot.log
+      - >-
+        JAVA_OPTS=-Dserver.port=8080 -XX:+UseSerialGC -Xms256m -Xmx384m
+        -XX:+ExitOnOutOfMemoryError -Duser.timezone=Asia/Kolkata
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 600M
+        reservations:
+          cpus: "0.25"
+          memory: 300M
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/actuator/health"]
-      interval: 30s
+      test:
+        - "CMD"
+        - "curl"
+        - "-f"
+        - "http://localhost:8080/actuator/health"
+      interval: 15s
       timeout: 5s
       retries: 3
       start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - trading-net
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+
+  init-permissions:
+    image: alpine:latest
+    container_name: trading-bot-init-permissions
+    user: root
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command:
+      - "sh"
+      - "-c"
+      - >-
+        mkdir -p /app/data /app/logs &&
+        chown -R 10001:10001 /app/data /app/logs &&
+        chmod -R 777 /app/data /app/logs
+
+networks:
+  trading-net:
+    driver: bridge
