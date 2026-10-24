@@ -42,6 +42,10 @@ STRATEGY_TRAIL_TO_BREAKEVEN=true
 
 ## 🐳 Docker & Docker Compose Commands
 
+docker build
+
+ docker build -t sharadprsn/trading-bot:latest .
+
 ### 1. Build and Start Container (Detached Mode)
 ```bash
 docker compose up --build -d
@@ -90,5 +94,5 @@ docker compose restart trading-bot
 
 ## 🔍 Health & Monitoring Endpoints
 
-- **Actuator Health Check:** [`http://localhost:8080/actuator/health`](http://localhost:8080/actuator/health)
-- **Actuator Metrics:** [`http://localhost:8080/actuator/metrics`](http://localhost:8080/actuator/metrics)
+- **Actuator Health Check:** [`http://localhost:8123/actuator/health`](http://localhost:8123/actuator/health)
+- **Actuator Metrics:** [`http://localhost:8123/actuator/metrics`](http://localhost:8123/actuator/metrics)

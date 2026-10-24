@@ -4,11 +4,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: trading-bot:latest
+    image: sharadprsn/trading-bot:latest
     container_name: trading-bot
     restart: unless-stopped
     ports:
-      - "${SERVER_PORT:-8080}:8080"
+      - "${SERVER_PORT:-8123}:8080"
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
@@ -16,10 +16,10 @@ services:
       - path: .env
         required: false
     environment:
-      - SERVER_PORT=8080
+      - SERVER_PORT=8123
       - LOGGING_FILE_NAME=/app/logs/trading-bot.log
       - >-
-        JAVA_OPTS=-Dserver.port=8080 -XX:+UseSerialGC -Xms256m -Xmx384m
+        JAVA_OPTS=-Dserver.port=8123 -XX:+UseSerialGC -Xms256m -Xmx384m
         -XX:+ExitOnOutOfMemoryError -Duser.timezone=Asia/Kolkata
     deploy:
       resources:
@@ -34,7 +34,7 @@ services:
         - "CMD"
         - "curl"
         - "-f"
-        - "http://localhost:8080/actuator/health"
+        - "http://localhost:8123/actuator/health"
       interval: 15s
       timeout: 5s
       retries: 3

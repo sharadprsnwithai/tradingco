@@ -3,3 +3,8 @@ build/
 *.iml
 .env
 __pycache__/
+logs/
+data/
+config/
+scripts/
+.env
