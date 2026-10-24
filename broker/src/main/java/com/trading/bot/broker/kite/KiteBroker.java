@@ -3,6 +3,7 @@ package com.trading.bot.broker.kite;
 import com.trading.bot.broker.api.Broker;
 import com.trading.bot.broker.api.error.AmbiguousOrderStateException;
 import com.trading.bot.broker.api.model.Exchange;
+import com.trading.bot.broker.api.model.HistoricalCandle;
 import com.trading.bot.broker.api.model.Holding;
 import com.trading.bot.broker.api.model.InstrumentToken;
 import com.trading.bot.broker.api.model.Margins;
@@ -18,6 +19,7 @@ import com.trading.bot.broker.api.model.Quote;
 import com.trading.bot.broker.api.model.QuoteRef;
 import com.trading.bot.broker.api.model.TransactionType;
 import com.trading.bot.broker.api.model.Validity;
+import com.trading.bot.broker.kite.dto.HistoricalDto;
 import com.trading.bot.broker.kite.dto.HoldingDto;
 import com.trading.bot.broker.kite.dto.MarginsDto;
 import com.trading.bot.broker.kite.dto.OrderBookDto;
@@ -58,6 +60,7 @@ import org.springframework.stereotype.Component;
 public final class KiteBroker implements Broker {
 
   private static final int MAX_TAG_LENGTH = 20;
+  private static final int MIN_CANDLE_ROW_SIZE = 6;
   private static final DateTimeFormatter KITE_TS_FORMAT =
       DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
@@ -330,6 +333,50 @@ public final class KiteBroker implements Broker {
     }
 
     return result;
+  }
+
+  @Override
+  @SuppressWarnings("PMD.AvoidInstantiatingObjectsInLoops")
+  public List<HistoricalCandle> historicalCandles(
+      InstrumentToken token, String interval, String fromDate, String toDate) {
+    Objects.requireNonNull(token, "token must not be null");
+    Objects.requireNonNull(interval, "interval must not be null");
+    Objects.requireNonNull(fromDate, "fromDate must not be null");
+    Objects.requireNonNull(toDate, "toDate must not be null");
+
+    final String path =
+        String.format(
+            Locale.ROOT,
+            "/instruments/historical/%d/%s?from=%s&to=%s",
+            token.value(),
+            interval,
+            fromDate,
+            toDate);
+
+    final HistoricalDto dto = httpClient.get(path, HistoricalDto.class, Mutability.READ);
+    if (dto == null || dto.data() == null || dto.data().candles() == null) {
+      return List.of();
+    }
+
+    final List<HistoricalCandle> candles = new ArrayList<>();
+    for (final List<Object> row : dto.data().candles()) {
+      if (row.size() >= MIN_CANDLE_ROW_SIZE) {
+        try {
+          final String isoTime = String.valueOf(row.get(0));
+          final Instant ts = Instant.parse(isoTime);
+          final BigDecimal open = new BigDecimal(String.valueOf(row.get(1)));
+          final BigDecimal high = new BigDecimal(String.valueOf(row.get(2)));
+          final BigDecimal low = new BigDecimal(String.valueOf(row.get(3)));
+          final BigDecimal close = new BigDecimal(String.valueOf(row.get(4)));
+          final long volume = Long.parseLong(String.valueOf(row.get(5)));
+
+          candles.add(new HistoricalCandle(ts, open, high, low, close, volume));
+        } catch (java.time.format.DateTimeParseException | NumberFormatException ignored) {
+          // skip malformed candle row
+        }
+      }
+    }
+    return candles;
   }
 
   private Order mapOrderDto(OrderDto dto) {

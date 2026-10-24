@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     env_file:
       - path: .env
-        required: false
+        required: true
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

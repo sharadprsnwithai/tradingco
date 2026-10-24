@@ -1,13 +1,11 @@
 package com.trading.bot.broker.startup;
 
 import com.trading.bot.broker.api.Broker;
-import com.trading.bot.broker.api.model.Position;
 import com.trading.bot.notifications.api.Notification;
 import com.trading.bot.notifications.api.NotificationPublisher;
 import com.trading.bot.notifications.api.NotificationType;
 import com.trading.bot.notifications.api.Severity;
 import jakarta.annotation.PreDestroy;
-import java.util.List;
 import java.util.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,44 +36,8 @@ public final class StartupReporter {
   @EventListener(ApplicationReadyEvent.class)
   @Order(100)
   public void reportStartup(ApplicationReadyEvent event) {
-    try {
-      final List<Position> positions = broker.positions();
-      final String body;
-      if (positions.isEmpty()) {
-        body = "no open positions";
-      } else {
-        final StringBuilder sb = new StringBuilder();
-        for (final Position p : positions) {
-          final String side = p.quantity() >= 0 ? "BUY" : "SELL";
-          final String pnlFormatted =
-              String.format(java.util.Locale.ROOT, "%.2f", p.pnl().doubleValue());
-          sb.append(p.tradingsymbol())
-              .append(' ')
-              .append(side)
-              .append(' ')
-              .append(p.quantity())
-              .append('@')
-              .append(p.averagePrice())
-              .append(" pnl=")
-              .append(pnlFormatted)
-              .append('\n');
-        }
-        body = sb.toString().trim();
-      }
-
-      publisher.publish(
-          Notification.of(Severity.INFO, NotificationType.STARTUP, "Trading Bot Started", body));
-    } catch (com.trading.bot.broker.api.error.BrokerException e) {
-      if (LOG.isErrorEnabled()) {
-        LOG.error("Failed to retrieve positions on startup: {}", e.getMessage(), e);
-      }
-      publisher.publish(
-          Notification.of(
-              Severity.INFO,
-              NotificationType.STARTUP,
-              "Trading Bot Started",
-              "positions unavailable: " + e.getMessage()));
-    }
+    // Startup positions handshake suppressed per user preference (only entry/exit signals sent to
+    // Telegram).
   }
 
   /** Emits SHUTDOWN notification on bean teardown. */

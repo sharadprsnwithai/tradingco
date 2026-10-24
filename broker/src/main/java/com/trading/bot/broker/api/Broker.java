@@ -5,6 +5,7 @@ import com.trading.bot.broker.api.error.ApiException;
 import com.trading.bot.broker.api.error.AuthException;
 import com.trading.bot.broker.api.error.NetworkException;
 import com.trading.bot.broker.api.error.RateLimitException;
+import com.trading.bot.broker.api.model.HistoricalCandle;
 import com.trading.bot.broker.api.model.Holding;
 import com.trading.bot.broker.api.model.InstrumentToken;
 import com.trading.bot.broker.api.model.Margins;
@@ -115,4 +116,20 @@ public interface Broker {
    * @throws ApiException on API error responses
    */
   Map<InstrumentToken, Quote> quotes(Collection<QuoteRef> refs);
+
+  /**
+   * Retrieves historical OHLC candles for the specified instrument token and interval.
+   *
+   * @param token instrument token
+   * @param interval interval (e.g. "minute", "5minute", "day")
+   * @param fromDate start date string (YYYY-MM-DD)
+   * @param toDate end date string (YYYY-MM-DD)
+   * @return list of historical candles
+   * @throws AuthException if unauthenticated or session expired
+   * @throws RateLimitException if rate limit exceeded (HTTP 429)
+   * @throws NetworkException on network communication failure
+   * @throws ApiException on API error responses
+   */
+  List<HistoricalCandle> historicalCandles(
+      InstrumentToken token, String interval, String fromDate, String toDate);
 }
