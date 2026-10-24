@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withException;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
@@ -15,6 +16,7 @@ import com.trading.bot.broker.api.error.RateLimitException;
 import com.trading.bot.broker.config.KiteProperties;
 import com.trading.bot.broker.kite.dto.OrderBookDto;
 import com.trading.bot.broker.kite.dto.PlaceOrderResponseDto;
+import java.io.IOException;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -160,6 +162,91 @@ class KiteHttpClientTest {
         .isInstanceOf(AuthException.class)
         .hasMessageContaining("Bad token");
     server2.verify();
+  }
+
+  @Test
+  void mutationTokenExceptionReplaysOnceAfterReloginThenSucceeds() {
+    final RestClient.Builder builder = RestClient.builder();
+    final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+    final AtomicInteger relogins = new AtomicInteger(0);
+    final SessionDelegate delegate =
+        new SessionDelegate() {
+          @Override
+          public String accessToken() {
+            return TOKEN;
+          }
+
+          @Override
+          public void forceRelogin() {
+            relogins.incrementAndGet();
+          }
+        };
+
+    // TokenException means the mutation was REJECTED before execution -> one replay is safe
+    server
+        .expect(ExpectedCount.once(), requestTo(BASE_URL + "/orders/regular"))
+        .andRespond(
+            withStatus(HttpStatus.FORBIDDEN)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(
+                    "{\"status\":\"error\",\"error_type\":\"TokenException\",\"message\":\"Expired"
+                        + " token\"}"));
+    server
+        .expect(ExpectedCount.once(), requestTo(BASE_URL + "/orders/regular"))
+        .andRespond(
+            withSuccess(
+                "{\"status\":\"success\",\"data\":{\"order_id\":\"42\"}}",
+                MediaType.APPLICATION_JSON));
+
+    final KiteHttpClient client = new KiteHttpClient(props, delegate, builder);
+    final PlaceOrderResponseDto dto =
+        client.post(
+            "/orders/regular",
+            Map.of("tag", "replay-tag-1"),
+            PlaceOrderResponseDto.class,
+            Mutability.MUTATION);
+
+    server.verify();
+    assertThat(dto.data().orderId()).isEqualTo("42");
+    assertThat(relogins.get()).isEqualTo(1);
+  }
+
+  @Test
+  void mutationTimeoutThrowsAmbiguousWithoutReplay() {
+    final RestClient.Builder builder = RestClient.builder();
+    final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+    final AtomicInteger relogins = new AtomicInteger(0);
+    final SessionDelegate delegate =
+        new SessionDelegate() {
+          @Override
+          public String accessToken() {
+            return TOKEN;
+          }
+
+          @Override
+          public void forceRelogin() {
+            relogins.incrementAndGet();
+          }
+        };
+
+    // Timeout on a mutation leaves state unknown -> NO replay (spec D3)
+    server
+        .expect(ExpectedCount.once(), requestTo(BASE_URL + "/orders/regular"))
+        .andRespond(withException(new IOException("connect timed out")));
+
+    final KiteHttpClient client = new KiteHttpClient(props, delegate, builder);
+
+    assertThatThrownBy(
+            () ->
+                client.post(
+                    "/orders/regular",
+                    Map.of("tag", "timeout-tag-1"),
+                    PlaceOrderResponseDto.class,
+                    Mutability.MUTATION))
+        .isInstanceOf(AmbiguousOrderStateException.class);
+
+    server.verify();
+    assertThat(relogins.get()).isZero();
   }
 
   @Test

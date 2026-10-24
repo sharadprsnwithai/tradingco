@@ -223,7 +223,10 @@ public final class KiteHttpClient {
       }
 
       final boolean isTokenError = isTokenException(status, body);
-      if (isTokenError && !isRetry && mutability == Mutability.READ) {
+      // A TokenException means the request was REJECTED before execution, so exactly one
+      // replay after force-relogin is safe for mutations too. Timeout/ambiguity paths never
+      // reach here (spec D3 forbids replaying mutations with unknown state).
+      if (isTokenError && !isRetry) {
         delegate.forceRelogin();
         return executeWithAuth(requestFunction, responseType, mutability, path, form, true);
       }
