@@ -102,8 +102,7 @@ public final class KiteTickerClient implements WebSocket.Listener {
     if (webSocket != null && connected) {
       final String subMsg = buildSubscriptionMessage(tokens);
       final String modeMsg = buildModeMessage("ltp", tokens);
-      webSocket.sendText(subMsg, true);
-      webSocket.sendText(modeMsg, true);
+      webSocket.sendText(subMsg, true).thenCompose(ws -> ws.sendText(modeMsg, true));
     }
   }
 

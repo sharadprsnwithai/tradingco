@@ -101,7 +101,7 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
             quantity,
             Optional.of(limitPrice),
             Optional.of(triggerPrice),
-            Optional.of("sl-" + (System.currentTimeMillis() % 1_000_000L)));
+            Optional.of("sl" + (System.currentTimeMillis() % 1_000_000L)));
 
     return broker.placeOrder(request);
   }

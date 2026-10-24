@@ -347,13 +347,13 @@ class KiteBrokerTest {
     assertThat(margins).isNotNull();
 
     // Quotes mapping
-    final QuoteRef ref = new QuoteRef(Exchange.NSE, "RELIANCE", new InstrumentToken(256265L));
-    when(client.get("/quote?i=NSE:RELIANCE", QuoteDto.class, Mutability.READ))
+    final QuoteRef ref = new QuoteRef(Exchange.NSE, "NIFTY 50", new InstrumentToken(256265L));
+    when(client.get(eq("/quote?i=NSE%3ANIFTY+50"), any(), eq(Mutability.READ)))
         .thenReturn(
             new QuoteDto(
                 "success",
                 Map.of(
-                    "NSE:RELIANCE",
+                    "NSE:NIFTY 50",
                     new QuoteDataDto(
                         256265L,
                         BigDecimal.valueOf(2550),
@@ -368,6 +368,6 @@ class KiteBrokerTest {
     assertThat(quotes).containsKey(new InstrumentToken(256265L));
     final Quote q = quotes.get(new InstrumentToken(256265L));
     assertThat(q.lastPrice()).isEqualByComparingTo(BigDecimal.valueOf(2550));
-    assertThat(q.tradingsymbol()).isEqualTo("RELIANCE");
+    assertThat(q.tradingsymbol()).isEqualTo("NIFTY 50");
   }
 }

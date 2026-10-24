@@ -31,6 +31,8 @@ import com.trading.bot.notifications.api.NotificationPublisher;
 import com.trading.bot.notifications.api.NotificationType;
 import com.trading.bot.notifications.api.Severity;
 import java.math.BigDecimal;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Instant;
@@ -298,7 +300,11 @@ public final class KiteBroker implements Broker {
 
     final String query =
         missingRefs.stream()
-            .map(r -> "i=" + r.exchange().name() + ":" + r.tradingsymbol())
+            .map(
+                r ->
+                    "i="
+                        + URLEncoder.encode(
+                            r.exchange().name() + ":" + r.tradingsymbol(), StandardCharsets.UTF_8))
             .collect(Collectors.joining("&"));
 
     final QuoteDto dto = httpClient.get("/quote?" + query, QuoteDto.class, Mutability.READ);

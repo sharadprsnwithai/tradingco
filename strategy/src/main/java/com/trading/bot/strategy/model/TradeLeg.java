@@ -54,7 +54,7 @@ public record TradeLeg(
    * @return realized P&L in currency
    */
   public BigDecimal calculatePnl(boolean isShort) {
-    if (exitPrice == null || exitPrice.compareTo(BigDecimal.ZERO) == 0) {
+    if (isOpen || exitPrice == null) {
       return BigDecimal.ZERO;
     }
     final BigDecimal diff =

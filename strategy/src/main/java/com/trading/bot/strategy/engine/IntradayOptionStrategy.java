@@ -115,7 +115,8 @@ public final class IntradayOptionStrategy {
     return null;
   }
 
-  /** Checkpoint 1: 09:45 AM IST - Buy 20 OTM CE and PE hedges. */
+  /** Checkpoint 1: 09:45 AM IST - Buy 20 OTM CE and PE hedges with atomic rollback. */
+  @SuppressWarnings("PMD.AvoidCatchingGenericException")
   public synchronized void executeHedge() {
     final LocalDate today = LocalDate.now(clock);
     final TargetIndex index = getTargetIndexForDate(today);
@@ -147,11 +148,36 @@ public final class IntradayOptionStrategy {
     final InstrumentToken ceToken = resolver.createOptionToken(index, strikes.otmCeStrike(), "CE");
     final InstrumentToken peToken = resolver.createOptionToken(index, strikes.otmPeStrike(), "PE");
 
-    final BigDecimal ceFill = gateway.executeBuyMarket(ceSymbol, ceToken, derivExchange, qty);
-    final BigDecimal peFill = gateway.executeBuyMarket(peSymbol, peToken, derivExchange, qty);
+    final TradeLeg hCe;
+    try {
+      final BigDecimal ceFill = gateway.executeBuyMarket(ceSymbol, ceToken, derivExchange, qty);
+      hCe = new TradeLeg(ceSymbol, ceToken, qty, ceFill, BigDecimal.ZERO, true);
+    } catch (RuntimeException e) {
+      if (LOG.isErrorEnabled()) {
+        LOG.error("Failed executing CE hedge wing: {}", e.getMessage(), e);
+      }
+      return;
+    }
 
-    final TradeLeg hCe = new TradeLeg(ceSymbol, ceToken, qty, ceFill, BigDecimal.ZERO, true);
-    final TradeLeg hPe = new TradeLeg(peSymbol, peToken, qty, peFill, BigDecimal.ZERO, true);
+    final TradeLeg hPe;
+    try {
+      final BigDecimal peFill = gateway.executeBuyMarket(peSymbol, peToken, derivExchange, qty);
+      hPe = new TradeLeg(peSymbol, peToken, qty, peFill, BigDecimal.ZERO, true);
+    } catch (RuntimeException e) {
+      if (LOG.isErrorEnabled()) {
+        LOG.error(
+            "PE hedge failed after CE executed. Rolling back CE hedge wing: {}", e.getMessage(), e);
+      }
+      gateway.executeSellMarket(hCe.symbol(), hCe.token(), derivExchange, hCe.quantity());
+      publisher.publish(
+          Notification.of(
+              Severity.CRITICAL,
+              NotificationType.SYSTEM_ALERT,
+              "Hedge Atomic Rollback",
+              "PE hedge failed. Unwound CE hedge wing to prevent partial exposure: "
+                  + e.getMessage()));
+      return;
+    }
 
     final DailyTradeRecord record =
         new DailyTradeRecord(
