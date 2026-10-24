@@ -37,6 +37,7 @@ import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.springframework.scheduling.annotation.Scheduled;
 
 @SuppressWarnings({"PMD.UnitTestContainsTooManyAsserts", "PMD.AvoidDuplicateLiterals"})
 class IntradayOptionStrategyTest {
@@ -458,5 +459,136 @@ class IntradayOptionStrategyTest {
     // Critical alert published
     assertThat(published)
         .anyMatch(n -> n.title().contains("Rollback") || n.body().contains("Unwound CE"));
+  }
+
+  @Test
+  void checkRiskHasScheduledAnnotationWithOneThousandFixedDelay() throws Exception {
+    final java.lang.reflect.Method method = IntradayOptionStrategy.class.getMethod("checkRisk");
+    assertThat(method.isAnnotationPresent(Scheduled.class)).isTrue();
+    final Scheduled scheduled = method.getAnnotation(Scheduled.class);
+    assertThat(scheduled.fixedDelay()).isEqualTo(1000);
+  }
+
+  @Test
+  void checkRiskEvaluatesWhenStraddleIsActive() {
+    final Broker broker = mock(Broker.class);
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final InstrumentResolver resolver = new InstrumentResolver();
+    final PositionRiskManager riskManager = mock(PositionRiskManager.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final NotificationPublisher publisher = mock(NotificationPublisher.class);
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final Clock clock = Clock.fixed(Instant.parse("2026-10-26T05:00:00Z"), IST); // 10:30 IST
+
+    final DailyTradeRecord active =
+        new DailyTradeRecord(
+            LocalDate.now(clock),
+            TargetIndex.NIFTY,
+            StrategyState.STRADDLE_ACTIVE,
+            null,
+            null,
+            null,
+            null,
+            BigDecimal.ZERO);
+    when(stateRepo.load(any())).thenReturn(Optional.of(active));
+
+    final IntradayOptionStrategy strategy =
+        new IntradayOptionStrategy(
+            broker,
+            gateway,
+            resolver,
+            riskManager,
+            stateRepo,
+            alertService,
+            publisher,
+            props,
+            clock);
+
+    strategy.checkRisk();
+
+    verify(riskManager).evaluateRisk(eq(active));
+  }
+
+  @Test
+  void checkRiskEvaluatesWhenOneLegStopped() {
+    final Broker broker = mock(Broker.class);
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final InstrumentResolver resolver = new InstrumentResolver();
+    final PositionRiskManager riskManager = mock(PositionRiskManager.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final NotificationPublisher publisher = mock(NotificationPublisher.class);
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final Clock clock = Clock.fixed(Instant.parse("2026-10-26T06:00:00Z"), IST); // 11:30 IST
+
+    final DailyTradeRecord oneLegStopped =
+        new DailyTradeRecord(
+            LocalDate.now(clock),
+            TargetIndex.NIFTY,
+            StrategyState.ONE_LEG_STOPPED,
+            null,
+            null,
+            null,
+            null,
+            BigDecimal.ZERO);
+    when(stateRepo.load(any())).thenReturn(Optional.of(oneLegStopped));
+
+    final IntradayOptionStrategy strategy =
+        new IntradayOptionStrategy(
+            broker,
+            gateway,
+            resolver,
+            riskManager,
+            stateRepo,
+            alertService,
+            publisher,
+            props,
+            clock);
+
+    strategy.checkRisk();
+
+    verify(riskManager).evaluateRisk(eq(oneLegStopped));
+  }
+
+  @Test
+  void checkRiskSkipsWhenIdleOrCompleted() {
+    final Broker broker = mock(Broker.class);
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final InstrumentResolver resolver = new InstrumentResolver();
+    final PositionRiskManager riskManager = mock(PositionRiskManager.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final NotificationPublisher publisher = mock(NotificationPublisher.class);
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final Clock clock = Clock.fixed(Instant.parse("2026-10-26T09:40:00Z"), IST);
+
+    final DailyTradeRecord completed =
+        new DailyTradeRecord(
+            LocalDate.now(clock),
+            TargetIndex.NIFTY,
+            StrategyState.COMPLETED,
+            null,
+            null,
+            null,
+            null,
+            BigDecimal.ZERO);
+    when(stateRepo.load(any())).thenReturn(Optional.of(completed));
+
+    final IntradayOptionStrategy strategy =
+        new IntradayOptionStrategy(
+            broker,
+            gateway,
+            resolver,
+            riskManager,
+            stateRepo,
+            alertService,
+            publisher,
+            props,
+            clock);
+
+    strategy.checkRisk();
+
+    verify(riskManager, never()).evaluateRisk(any());
   }
 }

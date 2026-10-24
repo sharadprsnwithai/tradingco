@@ -315,8 +315,9 @@ public final class IntradayOptionStrategy {
   }
 
   /** Checkpoint 3: Continuous 1-second Risk & Stop-Loss Monitoring Loop. */
-  @SuppressWarnings("PMD.AvoidCatchingGenericException")
-  public void checkRisk() {
+  @Scheduled(fixedDelay = 1000)
+  @SuppressWarnings(AVOID_GENERIC_EXC)
+  public synchronized void checkRisk() {
     final LocalDate today = LocalDate.now(clock);
     try {
       final DailyTradeRecord record = stateRepository.load(today).orElse(null);
