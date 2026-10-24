@@ -310,9 +310,11 @@ def run_backtest(lots=2, move_to_breakeven=False, df_nifty=None, df_sensex=None,
 
     for d in all_dates:
         wd = d.weekday()
-        if wd in (0, 1) and d in nifty_days:
+        # Monday(0), Tuesday(1), Friday(4) -> NIFTY
+        # Wednesday(2), Thursday(3) -> SENSEX
+        if wd in (0, 1, 4) and d in nifty_days:
             inst = 'NIFTY'
-            mode = '1DTE' if wd == 0 else '0DTE'
+            mode = '1DTE' if wd in (0, 4) else '0DTE'
             g = nifty_days[d]
         elif wd in (2, 3) and d in sensex_days:
             inst = 'SENSEX'
