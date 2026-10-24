@@ -109,11 +109,13 @@ public final class PositionRiskManager {
       if (shortCe.slOrderId() != null && orderBookMap.containsKey(shortCe.slOrderId().value())) {
         final Order slOrder = orderBookMap.get(shortCe.slOrderId().value());
         if (slOrder.status() == OrderStatus.FILLED) {
-          ceFilledAtExchange = true;
-          ceExchangePrice =
-              slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0
-                  ? slOrder.averagePrice()
-                  : shortCe.slPrice();
+          if (slOrder.averagePrice() != null && slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0) {
+            ceFilledAtExchange = true;
+            ceExchangePrice = slOrder.averagePrice();
+          } else {
+            ceFilledAtExchange = true;
+            ceExchangePrice = shortCe.slPrice();
+          }
         }
       }
 
