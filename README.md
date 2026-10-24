@@ -114,3 +114,15 @@ docker compose up forecast_api -d
 ```
 
 Output: `data/forecast/latest.json` + Telegram alert via `NotificationPublisher`. Keeps 48 months history (`data/forecast/history/`).
+
+**Build / deploy (Option A — Docker):**
+```bash
+docker build -t sharadprsn/forecast-api forecast_api/
+docker push sharadprsn/forecast-api
+docker compose up forecast-api -d
+```
+
+**Data download (run once per month):**
+```bash
+python scripts/forecast/download_nse.py
+```

@@ -1,5 +1,19 @@
 ---
 services:
+  forecast-api:
+    build:
+      context: ./forecast_api
+      dockerfile: Dockerfile
+    image: sharadprsn/forecast-api:latest
+    container_name: forecast-api
+    restart: unless-stopped
+    ports:
+      - "5599:5599"
+    volumes:
+      - ./data/forecast:/app/data/forecast
+    environment:
+      - FLASK_APP=forecast_service.py
+
   trading-bot:
     build:
       context: .
