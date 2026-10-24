@@ -15,12 +15,15 @@ import com.trading.bot.broker.api.model.QuoteRef;
 import com.trading.bot.broker.api.model.TransactionType;
 import com.trading.bot.broker.api.model.Validity;
 import com.trading.bot.strategy.config.StrategyProperties;
+import com.trading.bot.strategy.engine.TickUtils;
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -40,6 +43,7 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
 
   private final Broker broker;
   private final StrategyProperties props;
+  private final AtomicLong tagCounter = new AtomicLong(0);
 
   @Autowired
   public LiveStrategyGateway(Broker broker, StrategyProperties props) {
@@ -76,10 +80,12 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
         final Quote q = quotes.get(token);
         if (q != null && q.lastPrice() != null) {
           final BigDecimal ltp = q.lastPrice();
-          final BigDecimal limitPrice =
+          final double spreadFactor = (props != null ? props.maxSpreadPercentage() : 1.5) / 100.0;
+          final BigDecimal rawLimitPrice =
               side == TransactionType.BUY
-                  ? ltp.multiply(BigDecimal.valueOf(1.015))
-                  : ltp.multiply(BigDecimal.valueOf(0.985));
+                  ? ltp.multiply(BigDecimal.valueOf(1.0 + spreadFactor))
+                  : ltp.multiply(BigDecimal.valueOf(1.0 - spreadFactor));
+          final BigDecimal limitPrice = TickUtils.roundToTick(rawLimitPrice);
 
           final OrderRequest request =
               new OrderRequest(
@@ -93,7 +99,7 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
                   quantity,
                   Optional.of(limitPrice),
                   Optional.empty(),
-                  Optional.of("strat" + (System.currentTimeMillis() % 1_000_000L)));
+                  Optional.of(generateOrderTag("strat")));
 
           final OrderId orderId = broker.placeOrder(request);
           return fetchExecutionPrice(orderId, symbol, token, exchange);
@@ -124,7 +130,7 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
             quantity,
             Optional.empty(),
             Optional.empty(),
-            Optional.of("strat" + (System.currentTimeMillis() % 1_000_000L)));
+            Optional.of(generateOrderTag("strat")));
 
     final OrderId orderId = broker.placeOrder(request);
     return fetchExecutionPrice(orderId, symbol, token, exchange);
@@ -150,9 +156,16 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
             quantity,
             Optional.of(limitPrice),
             Optional.of(triggerPrice),
-            Optional.of("sl" + (System.currentTimeMillis() % 1_000_000L)));
+            Optional.of(generateOrderTag("sl")));
 
     return broker.placeOrder(request);
+  }
+
+  private String generateOrderTag(String prefix) {
+    final long count = tagCounter.incrementAndGet() % 10_000L;
+    final long timePart = System.currentTimeMillis() % 1_000_000_000L;
+    final String tag = String.format(Locale.ROOT, "%s%09d%04d", prefix, timePart, count);
+    return tag.length() > 20 ? tag.substring(0, 20) : tag;
   }
 
   @Override
