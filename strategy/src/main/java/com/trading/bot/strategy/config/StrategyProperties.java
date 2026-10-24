@@ -13,6 +13,9 @@ import org.springframework.validation.annotation.Validated;
  * @param lots number of lots per trade leg
  * @param slPercentage stop-loss percentage on entry premium
  * @param trailToBreakeven whether to trail the surviving leg's SL to entry price
+ * @param maxVixThreshold maximum India VIX threshold to permit trading (default 24.0)
+ * @param maxSpreadPercentage maximum allowable bid-ask spread percentage on entry (default 1.5)
+ * @param profitTargetPercentage percentage decay target to book early profit (default 85.0)
  * @param hedgeTime time to execute long hedge purchases (default 09:45)
  * @param entryTime time to execute short straddle sell (default 10:00)
  * @param exitTime time to square-off all active legs (default 15:00)
@@ -26,6 +29,9 @@ public record StrategyProperties(
     @Positive(message = "strategy.lots must be positive") int lots,
     @Positive(message = "strategy.sl-percentage must be positive") double slPercentage,
     Boolean trailToBreakeven,
+    double maxVixThreshold,
+    double maxSpreadPercentage,
+    double profitTargetPercentage,
     LocalTime hedgeTime,
     LocalTime entryTime,
     LocalTime exitTime,
@@ -37,6 +43,9 @@ public record StrategyProperties(
   private static final int DEFAULT_LOTS = 2;
   private static final double DEFAULT_SL_PERCENTAGE = 30.0;
   private static final boolean DEFAULT_TRAIL_BREAKEVEN = true;
+  private static final double DEFAULT_MAX_VIX = 24.0;
+  private static final double DEFAULT_MAX_SPREAD = 1.5;
+  private static final double DEFAULT_PROFIT_TARGET = 85.0;
   private static final LocalTime DEFAULT_HEDGE_TIME = LocalTime.of(9, 45);
   private static final LocalTime DEFAULT_ENTRY_TIME = LocalTime.of(10, 0);
   private static final LocalTime DEFAULT_EXIT_TIME = LocalTime.of(15, 0);
@@ -57,6 +66,15 @@ public record StrategyProperties(
     if (trailToBreakeven == null) {
       trailToBreakeven = DEFAULT_TRAIL_BREAKEVEN;
     }
+    if (maxVixThreshold <= 0) {
+      maxVixThreshold = DEFAULT_MAX_VIX;
+    }
+    if (maxSpreadPercentage <= 0) {
+      maxSpreadPercentage = DEFAULT_MAX_SPREAD;
+    }
+    if (profitTargetPercentage <= 0) {
+      profitTargetPercentage = DEFAULT_PROFIT_TARGET;
+    }
     if (hedgeTime == null) {
       hedgeTime = DEFAULT_HEDGE_TIME;
     }
@@ -74,16 +92,28 @@ public record StrategyProperties(
     }
   }
 
-  public StrategyProperties() {
+  public StrategyProperties(
+      ExecutionMode executionMode,
+      int lots,
+      double slPercentage,
+      boolean trailToBreakeven,
+      LocalTime hedgeTime,
+      LocalTime entryTime,
+      LocalTime exitTime,
+      int niftyHedgeDistance,
+      int sensexHedgeDistance) {
     this(
-        DEFAULT_EXECUTION_MODE,
-        DEFAULT_LOTS,
-        DEFAULT_SL_PERCENTAGE,
-        DEFAULT_TRAIL_BREAKEVEN,
-        DEFAULT_HEDGE_TIME,
-        DEFAULT_ENTRY_TIME,
-        DEFAULT_EXIT_TIME,
-        DEFAULT_NIFTY_HEDGE_DISTANCE,
-        DEFAULT_SENSEX_HEDGE_DISTANCE);
+        executionMode,
+        lots,
+        slPercentage,
+        trailToBreakeven,
+        DEFAULT_MAX_VIX,
+        DEFAULT_MAX_SPREAD,
+        DEFAULT_PROFIT_TARGET,
+        hedgeTime,
+        entryTime,
+        exitTime,
+        niftyHedgeDistance,
+        sensexHedgeDistance);
   }
 }

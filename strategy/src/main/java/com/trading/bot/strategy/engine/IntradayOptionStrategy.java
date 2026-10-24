@@ -115,8 +115,10 @@ public final class IntradayOptionStrategy {
     return null;
   }
 
+  private static final String AVOID_GENERIC_EXC = "PMD.AvoidCatchingGenericException";
+
   /** Checkpoint 1: 09:45 AM IST - Buy 20 OTM CE and PE hedges with atomic rollback. */
-  @SuppressWarnings("PMD.AvoidCatchingGenericException")
+  @SuppressWarnings(AVOID_GENERIC_EXC)
   public synchronized void executeHedge() {
     final LocalDate today = LocalDate.now(clock);
     final TargetIndex index = getTargetIndexForDate(today);
@@ -188,7 +190,7 @@ public final class IntradayOptionStrategy {
   }
 
   /** Checkpoint 2: 10:00 AM IST - Sell ATM CE and ATM PE straddle with atomic rollback. */
-  @SuppressWarnings("PMD.AvoidCatchingGenericException")
+  @SuppressWarnings(AVOID_GENERIC_EXC)
   public synchronized void executeStraddle() {
     final LocalDate today = LocalDate.now(clock);
     final TargetIndex index = getTargetIndexForDate(today);
@@ -299,7 +301,6 @@ public final class IntradayOptionStrategy {
   }
 
   /** Checkpoint 3: Continuous 1-second Risk & Stop-Loss Monitoring Loop. */
-  @Scheduled(fixedDelay = 1000)
   @SuppressWarnings("PMD.AvoidCatchingGenericException")
   public void checkRisk() {
     final LocalDate today = LocalDate.now(clock);
@@ -321,26 +322,33 @@ public final class IntradayOptionStrategy {
    * Resilient periodic checkpoint runner executing checkpoints within safe 4-minute time windows.
    */
   @Scheduled(fixedDelay = 5000)
+  @SuppressWarnings(AVOID_GENERIC_EXC)
   public synchronized void scheduledCheckpoints() {
-    final LocalTime now = LocalTime.now(clock);
-    final LocalDate today = LocalDate.now(clock);
-    if (getTargetIndexForDate(today) == null) {
-      return;
-    }
+    try {
+      final LocalTime now = LocalTime.now(clock);
+      final LocalDate today = LocalDate.now(clock);
+      if (getTargetIndexForDate(today) == null) {
+        return;
+      }
 
-    // 09:45 window (09:45:00 to 09:49:00)
-    if (!now.isBefore(props.hedgeTime()) && now.isBefore(props.hedgeTime().plusMinutes(4))) {
-      executeHedge();
-    }
+      // 09:45 window (09:45:00 to 09:49:00)
+      if (!now.isBefore(props.hedgeTime()) && now.isBefore(props.hedgeTime().plusMinutes(4))) {
+        executeHedge();
+      }
 
-    // 10:00 window (10:00:00 to 10:04:00)
-    if (!now.isBefore(props.entryTime()) && now.isBefore(props.entryTime().plusMinutes(4))) {
-      executeStraddle();
-    }
+      // 10:00 window (10:00:00 to 10:04:00)
+      if (!now.isBefore(props.entryTime()) && now.isBefore(props.entryTime().plusMinutes(4))) {
+        executeStraddle();
+      }
 
-    // 15:00 window (15:00:00 to 15:15:00)
-    if (!now.isBefore(props.exitTime()) && now.isBefore(props.exitTime().plusMinutes(15))) {
-      executeSquareOff();
+      // 15:00 window (15:00:00 to 15:15:00)
+      if (!now.isBefore(props.exitTime()) && now.isBefore(props.exitTime().plusMinutes(15))) {
+        executeSquareOff();
+      }
+    } catch (Exception e) {
+      if (LOG.isErrorEnabled()) {
+        LOG.error("Error during scheduled checkpoints loop: {}", e.getMessage(), e);
+      }
     }
   }
 

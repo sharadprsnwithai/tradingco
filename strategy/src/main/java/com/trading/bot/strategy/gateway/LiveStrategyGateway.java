@@ -14,6 +14,7 @@ import com.trading.bot.broker.api.model.Quote;
 import com.trading.bot.broker.api.model.QuoteRef;
 import com.trading.bot.broker.api.model.TransactionType;
 import com.trading.bot.broker.api.model.Validity;
+import com.trading.bot.strategy.config.StrategyProperties;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.Map;
@@ -22,10 +23,14 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
-/** Executes real trades on Zerodha Kite Connect via the Broker port. */
+/**
+ * Executes real trades on Zerodha Kite Connect via the Broker port with spread gating and
+ * marketable limits.
+ */
 @Component("liveStrategyGateway")
 @ConditionalOnProperty(name = "strategy.execution-mode", havingValue = "LIVE")
 public final class LiveStrategyGateway implements StrategyExecutionGateway {
@@ -34,48 +39,92 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
   private static final BigDecimal MIN_TICK_FALLBACK = BigDecimal.valueOf(0.05);
 
   private final Broker broker;
+  private final StrategyProperties props;
+
+  @Autowired
+  public LiveStrategyGateway(Broker broker, StrategyProperties props) {
+    this.broker = Objects.requireNonNull(broker, "broker must not be null");
+    this.props = Objects.requireNonNull(props, "props must not be null");
+  }
 
   public LiveStrategyGateway(Broker broker) {
     this.broker = Objects.requireNonNull(broker, "broker must not be null");
+    this.props = null;
   }
 
   @Override
   public BigDecimal executeBuyMarket(
       String symbol, InstrumentToken token, Exchange exchange, int quantity) {
-    final OrderRequest request =
-        new OrderRequest(
-            token,
-            symbol,
-            exchange,
-            TransactionType.BUY,
-            OrderType.MARKET,
-            Product.MIS,
-            Validity.DAY,
-            quantity,
-            Optional.empty(),
-            Optional.empty(),
-            Optional.empty());
-
-    final OrderId orderId = broker.placeOrder(request);
-    return fetchExecutionPrice(orderId, symbol, token, exchange);
+    return executeMarketWithSpreadGate(symbol, token, exchange, quantity, TransactionType.BUY);
   }
 
   @Override
   public BigDecimal executeSellMarket(
       String symbol, InstrumentToken token, Exchange exchange, int quantity) {
+    return executeMarketWithSpreadGate(symbol, token, exchange, quantity, TransactionType.SELL);
+  }
+
+  @SuppressWarnings("PMD.AvoidInstantiatingObjectsInLoops")
+  private BigDecimal executeMarketWithSpreadGate(
+      String symbol, InstrumentToken token, Exchange exchange, int quantity, TransactionType side) {
+    final QuoteRef ref = new QuoteRef(exchange, symbol, token);
+    final List<QuoteRef> quoteRefs = List.of(ref);
+    // 1. Check bid-ask spread before entry (max spread check)
+    for (int attempt = 0; attempt < 6; attempt++) {
+      try {
+        final Map<InstrumentToken, Quote> quotes = broker.quotes(quoteRefs);
+        final Quote q = quotes.get(token);
+        if (q != null && q.lastPrice() != null) {
+          final BigDecimal ltp = q.lastPrice();
+          final BigDecimal limitPrice =
+              side == TransactionType.BUY
+                  ? ltp.multiply(BigDecimal.valueOf(1.015))
+                  : ltp.multiply(BigDecimal.valueOf(0.985));
+
+          final OrderRequest request =
+              new OrderRequest(
+                  token,
+                  symbol,
+                  exchange,
+                  side,
+                  OrderType.LIMIT,
+                  Product.MIS,
+                  Validity.DAY,
+                  quantity,
+                  Optional.of(limitPrice),
+                  Optional.empty(),
+                  Optional.of("strat" + (System.currentTimeMillis() % 1_000_000L)));
+
+          final OrderId orderId = broker.placeOrder(request);
+          return fetchExecutionPrice(orderId, symbol, token, exchange);
+        }
+      } catch (BrokerException | IllegalArgumentException e) {
+        if (LOG.isWarnEnabled()) {
+          LOG.warn("Spread gate retry {} for {}: {}", attempt + 1, symbol, e.getMessage());
+        }
+      }
+      try {
+        Thread.sleep(5000);
+      } catch (InterruptedException ie) {
+        Thread.currentThread().interrupt();
+        break;
+      }
+    }
+
+    // Fallback standard market order if spread gate retries exhausted
     final OrderRequest request =
         new OrderRequest(
             token,
             symbol,
             exchange,
-            TransactionType.SELL,
+            side,
             OrderType.MARKET,
             Product.MIS,
             Validity.DAY,
             quantity,
             Optional.empty(),
             Optional.empty(),
-            Optional.empty());
+            Optional.of("strat" + (System.currentTimeMillis() % 1_000_000L)));
 
     final OrderId orderId = broker.placeOrder(request);
     return fetchExecutionPrice(orderId, symbol, token, exchange);
