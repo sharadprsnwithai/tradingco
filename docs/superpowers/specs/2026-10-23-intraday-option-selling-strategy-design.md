@@ -96,11 +96,11 @@ strategy/                 # Strategy domain engine
 
 | Day | Target Index | Spot Exchange / Token | Deriv Exchange | Strike Step | Lot Size | Hedge Distance (20 Strikes) | Weekly Expiry Day |
 |---|---|---|---|---|---|---|---|
-| **Monday** | NIFTY 50 | NSE (`256265`) | NFO | 50 points | 65 | ±1,000 points | Current week Thursday |
-| **Tuesday** | NIFTY 50 | NSE (`256265`) | NFO | 50 points | 65 | ±1,000 points | Current week Thursday |
-| **Wednesday** | SENSEX | BSE (`265`) | BFO | 100 points | 20 | ±2,000 points | Current week Friday |
-| **Thursday** | SENSEX | BSE (`265`) | BFO | 100 points | 20 | ±2,000 points | Current week Friday |
-| **Friday** | *None* | — | — | — | — | — | Standby / Flat |
+| **Monday** | NIFTY 50 | NSE (`256265`) | NFO | 50 points | 65 | ±1,000 points | Current week Tuesday |
+| **Tuesday** | NIFTY 50 | NSE (`256265`) | NFO | 50 points | 65 | ±1,000 points | Current week Tuesday |
+| **Wednesday** | SENSEX | BSE (`265`) | BFO | 100 points | 20 | ±2,000 points | Current week Thursday |
+| **Thursday** | SENSEX | BSE (`265`) | BFO | 100 points | 20 | ±2,000 points | Current week Thursday |
+| **Friday** | NIFTY 50 | NSE (`256265`) | NFO | 50 points | 65 | ±1,000 points | Following week Tuesday |
 
 ### 4.2 Timeline & State Machine
 

@@ -106,7 +106,7 @@ public final class IntradayOptionStrategy {
    */
   public TargetIndex getTargetIndexForDate(LocalDate date) {
     final DayOfWeek dow = date.getDayOfWeek();
-    if (dow == DayOfWeek.MONDAY || dow == DayOfWeek.TUESDAY) {
+    if (dow == DayOfWeek.MONDAY || dow == DayOfWeek.TUESDAY || dow == DayOfWeek.FRIDAY) {
       return TargetIndex.NIFTY;
     }
     if (dow == DayOfWeek.WEDNESDAY || dow == DayOfWeek.THURSDAY) {

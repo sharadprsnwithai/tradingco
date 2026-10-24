@@ -15,7 +15,7 @@
 - Java 25 toolchain; Gradle 9 Kotlin DSL; multi-module build with root `build.gradle.kts`.
 - Strictly decouple `:strategy` from internal Kite HTTP adapter classes; consume only `com.trading.bot.broker.api.Broker` and `com.trading.bot.notifications.api.NotificationPublisher`.
 - All timestamps and schedules in `ZoneId.of("Asia/Kolkata")`.
-- Weekly schedule: Mon/Tue NIFTY, Wed/Thu SENSEX, Fri idle.
+- Weekly schedule: Mon/Tue NIFTY (Tue expiry), Wed/Thu SENSEX (Thu expiry), Fri NIFTY (next Tue expiry).
 - Schedule checkpoints: 09:45 IST (buy 20-strike OTM hedges), 10:00 IST (sell ATM CE & PE), 15:00 IST (square-off all open legs).
 - Stop-loss rule: 30% loss on entry premium per short leg. In LIVE mode, protective exchange SL orders are placed at 10:00 AM immediately after straddle entry; when one leg executes, the engine modifies the surviving leg's exchange SL order to its entry price (breakeven). In PAPER mode, this lifecycle is simulated in memory.
 - Configurable environment properties in `.env` with default values: `STRATEGY_EXECUTION_MODE=PAPER`, `STRATEGY_LOTS=2`, `STRATEGY_SL_PERCENTAGE=30.0`, `STRATEGY_TRAIL_TO_BREAKEVEN=true`.
