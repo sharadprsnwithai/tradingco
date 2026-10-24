@@ -180,7 +180,7 @@ public final class PositionRiskManager {
             } else {
               if (shortPe.slOrderId() != null) {
                 final BigDecimal peLimit =
-                    roundToTick(shortPe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
+                    TickUtils.roundToTick(shortPe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
                 gateway.modifyStopLoss(
                     shortPe.slOrderId(), shortPe.quantity(), shortPe.entryPrice(), peLimit);
               }
@@ -280,7 +280,7 @@ public final class PositionRiskManager {
             } else {
               if (shortCe.slOrderId() != null) {
                 final BigDecimal ceLimit =
-                    roundToTick(shortCe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
+                    TickUtils.roundToTick(shortCe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
                 gateway.modifyStopLoss(
                     shortCe.slOrderId(), shortCe.quantity(), shortCe.entryPrice(), ceLimit);
               }
@@ -338,15 +338,5 @@ public final class PositionRiskManager {
 
     stateRepository.save(updated);
     return updated;
-  }
-
-  private static BigDecimal roundToTick(BigDecimal price) {
-    if (price == null) {
-      return BigDecimal.ZERO;
-    }
-    return price
-        .multiply(BigDecimal.valueOf(20))
-        .setScale(0, java.math.RoundingMode.HALF_UP)
-        .divide(BigDecimal.valueOf(20), 2, java.math.RoundingMode.HALF_UP);
   }
 }

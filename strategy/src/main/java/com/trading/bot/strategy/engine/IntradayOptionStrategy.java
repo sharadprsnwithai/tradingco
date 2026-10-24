@@ -229,8 +229,9 @@ public final class IntradayOptionStrategy {
     final TradeLeg sCe;
     try {
       final BigDecimal ceFill = gateway.executeSellMarket(ceSymbol, ceToken, derivExchange, qty);
-      final BigDecimal ceSl = roundToTick(ceFill.multiply(BigDecimal.valueOf(slMultiplier)));
-      final BigDecimal ceSlLimit = roundToTick(ceSl.multiply(BigDecimal.valueOf(1.05)));
+      final BigDecimal ceSl =
+          TickUtils.roundToTick(ceFill.multiply(BigDecimal.valueOf(slMultiplier)));
+      final BigDecimal ceSlLimit = TickUtils.roundToTick(ceSl.multiply(BigDecimal.valueOf(1.05)));
       final OrderId ceSlOrderId =
           gateway.placeStopLossBuy(ceSymbol, ceToken, derivExchange, qty, ceSl, ceSlLimit);
       sCe = new TradeLeg(ceSymbol, ceToken, qty, ceFill, BigDecimal.ZERO, ceSl, ceSlOrderId, true);
@@ -250,8 +251,9 @@ public final class IntradayOptionStrategy {
     final TradeLeg sPe;
     try {
       final BigDecimal peFill = gateway.executeSellMarket(peSymbol, peToken, derivExchange, qty);
-      final BigDecimal peSl = roundToTick(peFill.multiply(BigDecimal.valueOf(slMultiplier)));
-      final BigDecimal peSlLimit = roundToTick(peSl.multiply(BigDecimal.valueOf(1.05)));
+      final BigDecimal peSl =
+          TickUtils.roundToTick(peFill.multiply(BigDecimal.valueOf(slMultiplier)));
+      final BigDecimal peSlLimit = TickUtils.roundToTick(peSl.multiply(BigDecimal.valueOf(1.05)));
       final OrderId peSlOrderId =
           gateway.placeStopLossBuy(peSymbol, peToken, derivExchange, qty, peSl, peSlLimit);
       sPe = new TradeLeg(peSymbol, peToken, qty, peFill, BigDecimal.ZERO, peSl, peSlOrderId, true);
@@ -479,16 +481,6 @@ public final class IntradayOptionStrategy {
         executeSquareOff();
       }
     }
-  }
-
-  private static BigDecimal roundToTick(BigDecimal price) {
-    if (price == null) {
-      return BigDecimal.ZERO;
-    }
-    return price
-        .multiply(BigDecimal.valueOf(20))
-        .setScale(0, java.math.RoundingMode.HALF_UP)
-        .divide(BigDecimal.valueOf(20), 2, java.math.RoundingMode.HALF_UP);
   }
 
   private static TradeLeg closeLeg(TradeLeg leg) {
