@@ -171,6 +171,39 @@ public final class StrategyAlertService {
   }
 
   /**
+   * Notifies Telegram when a short leg exits after reaching its profit target decay threshold.
+   *
+   * @param leg leg that achieved profit target
+   * @param exitPrice exit fill price
+   * @param mode execution mode
+   */
+  public void notifyProfitTargetHit(TradeLeg leg, BigDecimal exitPrice, ExecutionMode mode) {
+    final String modeBadge = "[" + mode.name() + "]";
+    final String title =
+        String.format(Locale.ROOT, "%s Profit Target Hit: %s", modeBadge, leg.symbol());
+
+    final BigDecimal safeExit = exitPrice != null ? exitPrice : leg.exitPrice();
+    final BigDecimal profit =
+        leg.entryPrice().subtract(safeExit).multiply(BigDecimal.valueOf(leg.quantity()));
+
+    final String body =
+        String.format(
+            Locale.ROOT,
+            "• Leg Exited: %s%n"
+                + "• Entry Price: ₹%s%n"
+                + "• Exit Price: ₹%s (Profit Target Decay)%n"
+                + "• Leg Profit: ₹%s%n"
+                + "• Wing Hedges: Active until 15:00 IST",
+            leg.symbol(),
+            leg.entryPrice().toPlainString(),
+            safeExit.toPlainString(),
+            profit.toPlainString());
+
+    publisher.publish(
+        Notification.of(Severity.INFO, NotificationType.ORDER_SUBMITTED, title, body));
+  }
+
+  /**
    * Notifies Telegram at 15:00 IST with the complete daily square-off and final realized P&L.
    *
    * @param record completed daily trade record

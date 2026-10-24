@@ -382,4 +382,85 @@ class PositionRiskManagerTest {
     verify(gateway).modifyStopLoss(eq(peSlOrderId), eq(130), eq(BigDecimal.valueOf(100.0)), any());
     assertThat(updated.shortPe().slPrice()).isEqualByComparingTo(BigDecimal.valueOf(100.0));
   }
+
+  @Test
+  void shortLegDecayingPastProfitTargetClosesLegAndBooksProfit() {
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final Broker broker = mock(Broker.class);
+    final List<Notification> published = new ArrayList<>();
+    final NotificationPublisher publisher = published::add;
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final PositionRiskManager riskManager =
+        new PositionRiskManager(gateway, stateRepo, broker, alertService, props);
+
+    final InstrumentToken ceToken = new InstrumentToken(201L);
+    final InstrumentToken peToken = new InstrumentToken(202L);
+
+    final OrderId ceSlOrderId = new OrderId("sl-ce-decay");
+    final OrderId peSlOrderId = new OrderId("sl-pe-decay");
+
+    final TradeLeg shortCe =
+        new TradeLeg(
+            CE_SYMBOL,
+            ceToken,
+            130,
+            BigDecimal.valueOf(100.0),
+            BigDecimal.ZERO,
+            BigDecimal.valueOf(130.0),
+            ceSlOrderId,
+            true);
+    final TradeLeg shortPe =
+        new TradeLeg(
+            PE_SYMBOL,
+            peToken,
+            130,
+            BigDecimal.valueOf(100.0),
+            BigDecimal.ZERO,
+            BigDecimal.valueOf(130.0),
+            peSlOrderId,
+            true);
+
+    final DailyTradeRecord record =
+        new DailyTradeRecord(
+            LocalDate.now(),
+            TargetIndex.NIFTY,
+            StrategyState.STRADDLE_ACTIVE,
+            null,
+            null,
+            shortCe,
+            shortPe,
+            BigDecimal.ZERO);
+
+    // CE LTP decayed to 12.0 (decayed 88% > 85% target), PE still at 80.0
+    when(broker.orderBook()).thenReturn(List.of());
+    when(broker.quotes(any()))
+        .thenReturn(
+            Map.of(
+                ceToken, makeQuote(ceToken, CE_SYMBOL, BigDecimal.valueOf(12.0)),
+                peToken, makeQuote(peToken, PE_SYMBOL, BigDecimal.valueOf(80.0))));
+
+    when(gateway.executeBuyMarket(eq(CE_SYMBOL), eq(ceToken), eq(Exchange.NFO), eq(130)))
+        .thenReturn(BigDecimal.valueOf(12.05));
+
+    final DailyTradeRecord updated = riskManager.evaluateRisk(record);
+
+    // Resting SL order cancelled for CE
+    verify(gateway).cancelOrder(eq(ceSlOrderId));
+
+    // Buy market executed to close CE
+    verify(gateway).executeBuyMarket(eq(CE_SYMBOL), eq(ceToken), eq(Exchange.NFO), eq(130));
+
+    // CE closed, PE remains open
+    assertThat(updated.shortCe().isOpen()).isFalse();
+    assertThat(updated.shortCe().exitPrice()).isEqualByComparingTo(BigDecimal.valueOf(12.05));
+    assertThat(updated.shortPe().isOpen()).isTrue();
+    assertThat(updated.state()).isEqualTo(StrategyState.ONE_LEG_STOPPED);
+
+    // Realized PnL credited: (100.0 - 12.05) * 130 = 87.95 * 130 = 11433.50
+    assertThat(updated.realizedPnl()).isGreaterThan(BigDecimal.ZERO);
+
+    assertThat(published).anyMatch(n -> n.title().contains("Profit Target Hit"));
+  }
 }

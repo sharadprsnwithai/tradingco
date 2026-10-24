@@ -198,6 +198,30 @@ public final class PositionRiskManager {
           }
           alertService.notifyStopLossHit(shortCe, exitPrice, shortPe, props.executionMode());
         }
+      } else if (q != null && q.lastPrice() != null && props.profitTargetPercentage() > 0) {
+        final BigDecimal ceLtp = q.lastPrice();
+        final double decayFactor = 1.0 - (props.profitTargetPercentage() / 100.0);
+        final BigDecimal profitTargetPrice =
+            TickUtils.roundToTick(shortCe.entryPrice().multiply(BigDecimal.valueOf(decayFactor)));
+        if (ceLtp.compareTo(BigDecimal.ZERO) > 0 && ceLtp.compareTo(profitTargetPrice) <= 0) {
+          if (shortCe.slOrderId() != null) {
+            gateway.cancelOrder(shortCe.slOrderId());
+          }
+          final BigDecimal exitPrice =
+              gateway.executeBuyMarket(
+                  shortCe.symbol(), shortCe.token(), derivExchange, shortCe.quantity());
+          shortCe =
+              new TradeLeg(
+                  shortCe.symbol(),
+                  shortCe.token(),
+                  shortCe.quantity(),
+                  shortCe.entryPrice(),
+                  exitPrice,
+                  shortCe.slPrice(),
+                  null,
+                  false);
+          alertService.notifyProfitTargetHit(shortCe, exitPrice, props.executionMode());
+        }
       }
     }
 
@@ -297,6 +321,30 @@ public final class PositionRiskManager {
             }
           }
           alertService.notifyStopLossHit(shortPe, exitPrice, shortCe, props.executionMode());
+        }
+      } else if (q != null && q.lastPrice() != null && props.profitTargetPercentage() > 0) {
+        final BigDecimal peLtp = q.lastPrice();
+        final double decayFactor = 1.0 - (props.profitTargetPercentage() / 100.0);
+        final BigDecimal profitTargetPrice =
+            TickUtils.roundToTick(shortPe.entryPrice().multiply(BigDecimal.valueOf(decayFactor)));
+        if (peLtp.compareTo(BigDecimal.ZERO) > 0 && peLtp.compareTo(profitTargetPrice) <= 0) {
+          if (shortPe.slOrderId() != null) {
+            gateway.cancelOrder(shortPe.slOrderId());
+          }
+          final BigDecimal exitPrice =
+              gateway.executeBuyMarket(
+                  shortPe.symbol(), shortPe.token(), derivExchange, shortPe.quantity());
+          shortPe =
+              new TradeLeg(
+                  shortPe.symbol(),
+                  shortPe.token(),
+                  shortPe.quantity(),
+                  shortPe.entryPrice(),
+                  exitPrice,
+                  shortPe.slPrice(),
+                  null,
+                  false);
+          alertService.notifyProfitTargetHit(shortPe, exitPrice, props.executionMode());
         }
       }
     }
