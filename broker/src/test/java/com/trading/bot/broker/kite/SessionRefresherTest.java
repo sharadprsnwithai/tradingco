@@ -198,6 +198,29 @@ class SessionRefresherTest {
   }
 
   @Test
+  void startupLoginFailurePublishesDegradedAndRethrows() {
+    final KiteSession session = mock(KiteSession.class);
+    final List<Notification> published = new ArrayList<>();
+    final NotificationPublisher publisher = published::add;
+    final SimpleMeterRegistry registry = new SimpleMeterRegistry();
+    final Clock clock = Clock.fixed(Instant.parse("2026-10-23T11:30:00Z"), ZoneId.of(KOLKATA_ZONE));
+
+    final SessionRefresher refresher =
+        new SessionRefresher(session, authProps, publisher, registry, clock);
+
+    doThrow(new AuthException("Bad credentials")).when(session).login();
+
+    // Spec §7 / ruling R3: fail-fast — no trading loop without a session
+    assertThatThrownBy(refresher::loginOnStartup).isInstanceOf(AuthException.class);
+
+    final List<Notification> degradedAlerts =
+        published.stream().filter(n -> n.type() == NotificationType.AUTH_DEGRADED).toList();
+    assertThat(degradedAlerts).hasSize(1);
+    assertThat(degradedAlerts.get(0).severity()).isEqualTo(Severity.CRITICAL);
+    assertThat(refresher.isDegraded()).isTrue();
+  }
+
+  @Test
   void authDegradedNotificationCarriesAttemptNumberAndTimestamp() {
     final KiteSession session = mock(KiteSession.class);
     final List<Notification> published = new ArrayList<>();

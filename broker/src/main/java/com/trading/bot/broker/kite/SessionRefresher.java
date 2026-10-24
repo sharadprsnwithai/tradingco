@@ -70,7 +70,10 @@ public final class SessionRefresher implements SessionDelegate, ApplicationRunne
     loginOnStartup();
   }
 
-  /** Fail-safe initial login at application startup per spec §7, entering DEGRADED on failure. */
+  /**
+   * Fail-fast initial login at application startup per spec §7 and ruling R3: publishes
+   * AUTH_DEGRADED, then rethrows so the context aborts — no trading loop without a session.
+   */
   public void loginOnStartup() {
     try {
       session.login();
@@ -91,6 +94,7 @@ public final class SessionRefresher implements SessionDelegate, ApplicationRunne
               NotificationType.AUTH_DEGRADED,
               "Auth degraded",
               "Initial startup login failed: " + e.getMessage()));
+      throw e;
     }
   }
 
