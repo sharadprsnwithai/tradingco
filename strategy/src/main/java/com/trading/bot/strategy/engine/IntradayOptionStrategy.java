@@ -275,8 +275,8 @@ public final class IntradayOptionStrategy {
               today,
               index,
               StrategyState.ABORTED,
-              record.hedgeCe(),
-              record.hedgePe(),
+              closeLeg(record.hedgeCe()),
+              closeLeg(record.hedgePe()),
               null,
               null,
               record.realizedPnl()));
@@ -474,6 +474,21 @@ public final class IntradayOptionStrategy {
         .multiply(BigDecimal.valueOf(20))
         .setScale(0, java.math.RoundingMode.HALF_UP)
         .divide(BigDecimal.valueOf(20), 2, java.math.RoundingMode.HALF_UP);
+  }
+
+  private static TradeLeg closeLeg(TradeLeg leg) {
+    if (leg == null) {
+      return null;
+    }
+    return new TradeLeg(
+        leg.symbol(),
+        leg.token(),
+        leg.quantity(),
+        leg.entryPrice(),
+        leg.entryPrice(),
+        leg.slPrice(),
+        leg.slOrderId(),
+        false);
   }
 
   private double fetchSpotPrice(TargetIndex index) {
