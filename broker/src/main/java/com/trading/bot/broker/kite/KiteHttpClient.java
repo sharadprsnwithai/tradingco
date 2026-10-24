@@ -40,6 +40,7 @@ public final class KiteHttpClient {
   private static final int HTTP_FORBIDDEN = 403;
   private static final int HTTP_TOO_MANY_REQUESTS = 429;
   private static final int HTTP_INTERNAL_SERVER_ERROR = 500;
+  private static final String AUTH_HEADER_PREFIX = "token ";
 
   private final KiteProperties props;
   private final SessionDelegate delegate;
@@ -89,7 +90,8 @@ public final class KiteHttpClient {
             getClient(mutability)
                 .get()
                 .uri(path)
-                .header(HttpHeaders.AUTHORIZATION, "token " + props.apiKey() + ":" + token)
+                .header(
+                    HttpHeaders.AUTHORIZATION, AUTH_HEADER_PREFIX + props.apiKey() + ":" + token)
                 .retrieve()
                 .toEntity(String.class),
         responseType,
@@ -121,7 +123,8 @@ public final class KiteHttpClient {
             getClient(mutability)
                 .post()
                 .uri(path)
-                .header(HttpHeaders.AUTHORIZATION, "token " + props.apiKey() + ":" + token)
+                .header(
+                    HttpHeaders.AUTHORIZATION, AUTH_HEADER_PREFIX + props.apiKey() + ":" + token)
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .body(multiMap)
                 .retrieve()
@@ -155,7 +158,8 @@ public final class KiteHttpClient {
             getClient(mutability)
                 .put()
                 .uri(path)
-                .header(HttpHeaders.AUTHORIZATION, "token " + props.apiKey() + ":" + token)
+                .header(
+                    HttpHeaders.AUTHORIZATION, AUTH_HEADER_PREFIX + props.apiKey() + ":" + token)
                 .contentType(MediaType.APPLICATION_FORM_URLENCODED)
                 .body(multiMap)
                 .retrieve()
@@ -182,7 +186,8 @@ public final class KiteHttpClient {
             getClient(mutability)
                 .delete()
                 .uri(path)
-                .header(HttpHeaders.AUTHORIZATION, "token " + props.apiKey() + ":" + token)
+                .header(
+                    HttpHeaders.AUTHORIZATION, AUTH_HEADER_PREFIX + props.apiKey() + ":" + token)
                 .retrieve()
                 .toEntity(String.class),
         responseType,

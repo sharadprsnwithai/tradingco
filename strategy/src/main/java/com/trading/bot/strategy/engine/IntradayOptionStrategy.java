@@ -300,13 +300,20 @@ public final class IntradayOptionStrategy {
 
   /** Checkpoint 3: Continuous 1-second Risk & Stop-Loss Monitoring Loop. */
   @Scheduled(fixedDelay = 1000)
+  @SuppressWarnings("PMD.AvoidCatchingGenericException")
   public void checkRisk() {
     final LocalDate today = LocalDate.now(clock);
-    final DailyTradeRecord record = stateRepository.load(today).orElse(null);
-    if (record != null
-        && (record.state() == StrategyState.STRADDLE_ACTIVE
-            || record.state() == StrategyState.ONE_LEG_STOPPED)) {
-      riskManager.evaluateRisk(record);
+    try {
+      final DailyTradeRecord record = stateRepository.load(today).orElse(null);
+      if (record != null
+          && (record.state() == StrategyState.STRADDLE_ACTIVE
+              || record.state() == StrategyState.ONE_LEG_STOPPED)) {
+        riskManager.evaluateRisk(record);
+      }
+    } catch (Exception e) {
+      if (LOG.isErrorEnabled()) {
+        LOG.error("Error during risk evaluation loop: {}", e.getMessage(), e);
+      }
     }
   }
 

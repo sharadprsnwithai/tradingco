@@ -1,0 +1,11 @@
+# Build context hygiene — nothing here is COPY'd; keeps secrets and state out of the daemon
+.git
+.gradle
+.superpowers
+.env
+data
+docs
+build
+notifications/build
+strategy/build
+**/*.iml

@@ -54,6 +54,7 @@ subprojects {
         apply(plugin = "pmd")
         apply(plugin = "checkstyle")
         apply(plugin = "com.github.spotbugs")
+        apply(plugin = "jacoco")
 
         configure<JavaPluginExtension> {
             toolchain {
