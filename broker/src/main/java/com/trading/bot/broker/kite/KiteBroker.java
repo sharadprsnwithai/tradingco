@@ -41,7 +41,6 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -191,14 +190,13 @@ public final class KiteBroker implements Broker {
     patch.price().ifPresent(p -> form.put("price", p.toPlainString()));
     patch.triggerPrice().ifPresent(tp -> form.put("trigger_price", tp.toPlainString()));
 
-    httpClient.post("/orders/regular/" + id.value(), form, Object.class, Mutability.MUTATION);
+    httpClient.put("/orders/regular/" + id.value(), form, Object.class, Mutability.MUTATION);
   }
 
   @Override
   public void cancelOrder(OrderId id) {
     Objects.requireNonNull(id, "id must not be null");
-    httpClient.post(
-        "/orders/regular/" + id.value(), Collections.emptyMap(), Object.class, Mutability.MUTATION);
+    httpClient.delete("/orders/regular/" + id.value(), Object.class, Mutability.MUTATION);
   }
 
   @Override

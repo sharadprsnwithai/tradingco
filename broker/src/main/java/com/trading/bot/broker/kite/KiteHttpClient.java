@@ -133,6 +133,65 @@ public final class KiteHttpClient {
         false);
   }
 
+  /**
+   * Executes a PUT request with form-encoded data against Kite.
+   *
+   * @param path API endpoint path
+   * @param form form parameters
+   * @param responseType target DTO class
+   * @param mutability read or mutation
+   * @param <T> DTO type
+   * @return parsed DTO
+   */
+  public <T> T put(
+      String path, Map<String, String> form, Class<T> responseType, Mutability mutability) {
+    final MultiValueMap<String, String> multiMap = new LinkedMultiValueMap<>();
+    if (form != null) {
+      form.forEach(multiMap::add);
+    }
+
+    return executeWithAuth(
+        token ->
+            getClient(mutability)
+                .put()
+                .uri(path)
+                .header(HttpHeaders.AUTHORIZATION, "token " + props.apiKey() + ":" + token)
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .body(multiMap)
+                .retrieve()
+                .toEntity(String.class),
+        responseType,
+        mutability,
+        path,
+        form,
+        false);
+  }
+
+  /**
+   * Executes a DELETE request against Kite.
+   *
+   * @param path API endpoint path
+   * @param responseType target DTO class
+   * @param mutability read or mutation
+   * @param <T> DTO type
+   * @return parsed DTO
+   */
+  public <T> T delete(String path, Class<T> responseType, Mutability mutability) {
+    return executeWithAuth(
+        token ->
+            getClient(mutability)
+                .delete()
+                .uri(path)
+                .header(HttpHeaders.AUTHORIZATION, "token " + props.apiKey() + ":" + token)
+                .retrieve()
+                .toEntity(String.class),
+        responseType,
+        mutability,
+        path,
+        null,
+        false);
+  }
+
   private RestClient getClient(Mutability mutability) {
     return mutability == Mutability.MUTATION ? mutationClient : readClient;
   }

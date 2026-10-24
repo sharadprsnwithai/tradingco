@@ -201,6 +201,107 @@ class KiteHttpClientTest {
   }
 
   @Test
+  void putSendsPutVerbWithFormBodyAndAuthHeaders() {
+    final RestClient.Builder builder = RestClient.builder();
+    final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+    final SessionDelegate delegate =
+        new SessionDelegate() {
+          @Override
+          public String accessToken() {
+            return TOKEN;
+          }
+
+          @Override
+          public void forceRelogin() {}
+        };
+
+    server
+        .expect(requestTo(BASE_URL + "/orders/regular/2410230000001"))
+        .andExpect(method(HttpMethod.PUT))
+        .andExpect(header("X-Kite-Version", "3"))
+        .andExpect(header("Authorization", "token " + API_KEY + ":" + TOKEN))
+        .andRespond(withSuccess("{\"status\":\"success\"}", MediaType.APPLICATION_JSON));
+
+    final KiteHttpClient client = new KiteHttpClient(props, delegate, builder);
+    final Object result =
+        client.put(
+            "/orders/regular/2410230000001",
+            Map.of("quantity", "20"),
+            Object.class,
+            Mutability.MUTATION);
+
+    server.verify();
+    assertThat(result).isNotNull();
+  }
+
+  @Test
+  void deleteSendsDeleteVerbWithAuthHeaders() {
+    final RestClient.Builder builder = RestClient.builder();
+    final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+    final SessionDelegate delegate =
+        new SessionDelegate() {
+          @Override
+          public String accessToken() {
+            return TOKEN;
+          }
+
+          @Override
+          public void forceRelogin() {}
+        };
+
+    server
+        .expect(requestTo(BASE_URL + "/orders/regular/2410230000002"))
+        .andExpect(method(HttpMethod.DELETE))
+        .andExpect(header("Authorization", "token " + API_KEY + ":" + TOKEN))
+        .andRespond(withSuccess("{\"status\":\"success\"}", MediaType.APPLICATION_JSON));
+
+    final KiteHttpClient client = new KiteHttpClient(props, delegate, builder);
+    client.delete("/orders/regular/2410230000002", Object.class, Mutability.MUTATION);
+
+    server.verify();
+  }
+
+  @Test
+  void putServerErrorThrowsAmbiguousOrderStateExceptionWithTag() {
+    final RestClient.Builder builder = RestClient.builder();
+    final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+    final SessionDelegate delegate =
+        new SessionDelegate() {
+          @Override
+          public String accessToken() {
+            return TOKEN;
+          }
+
+          @Override
+          public void forceRelogin() {}
+        };
+
+    server
+        .expect(ExpectedCount.once(), requestTo(BASE_URL + "/orders/regular/2410230000003"))
+        .andExpect(method(HttpMethod.PUT))
+        .andRespond(withStatus(HttpStatus.INTERNAL_SERVER_ERROR));
+
+    final KiteHttpClient client = new KiteHttpClient(props, delegate, builder);
+
+    assertThatThrownBy(
+            () ->
+                client.put(
+                    "/orders/regular/2410230000003",
+                    Map.of("tag", "modify-tag-1"),
+                    Object.class,
+                    Mutability.MUTATION))
+        .isInstanceOf(AmbiguousOrderStateException.class)
+        .satisfies(
+            ex -> {
+              final AmbiguousOrderStateException amb = (AmbiguousOrderStateException) ex;
+              assertThat(amb.correlationId()).isEqualTo("modify-tag-1");
+              assertThat(amb.operation()).isEqualTo("/orders/regular/2410230000003");
+            });
+
+    server.verify();
+  }
+
+  @Test
   void readFailureThrowsNetworkExceptionOrApiExceptionNeverAmbiguous() {
     final RestClient.Builder builder = RestClient.builder();
     final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();

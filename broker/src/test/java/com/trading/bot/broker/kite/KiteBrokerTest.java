@@ -191,6 +191,33 @@ class KiteBrokerTest {
   }
 
   @Test
+  void modifyOrderUsesPutVerbAndCancelOrderUsesDeleteVerb() {
+    final KiteHttpClient client = mock(KiteHttpClient.class);
+    final ExecutionTracker tracker = mock(ExecutionTracker.class);
+    final NotificationPublisher publisher = n -> {};
+    final KiteBroker broker = new KiteBroker(client, tracker, publisher, clock);
+
+    broker.modifyOrder(
+        new OrderId("2410230000001"),
+        new com.trading.bot.broker.api.model.OrderPatch(
+            java.util.OptionalInt.of(20), Optional.of(BigDecimal.valueOf(2500)), Optional.empty()));
+    broker.cancelOrder(new OrderId("2410230000002"));
+
+    @SuppressWarnings("unchecked")
+    final ArgumentCaptor<Map<String, String>> patchCaptor = ArgumentCaptor.forClass(Map.class);
+    verify(client)
+        .put(
+            eq("/orders/regular/2410230000001"),
+            patchCaptor.capture(),
+            eq(Object.class),
+            eq(Mutability.MUTATION));
+    assertThat(patchCaptor.getValue()).containsEntry("quantity", "20");
+
+    verify(client)
+        .delete(eq("/orders/regular/2410230000002"), eq(Object.class), eq(Mutability.MUTATION));
+  }
+
+  @Test
   void orderBookMapsAllStatusRowsFromDtoToDomain() {
     final KiteHttpClient client = mock(KiteHttpClient.class);
     final ExecutionTracker tracker = mock(ExecutionTracker.class);
