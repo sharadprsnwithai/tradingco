@@ -168,6 +168,7 @@ public final class KiteBroker implements Broker {
 
       return orderId;
     } catch (AmbiguousOrderStateException e) {
+      tracker.registerAmbiguous(tag);
       publisher.publish(
           new Notification(
               Severity.CRITICAL,

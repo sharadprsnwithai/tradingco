@@ -111,6 +111,16 @@ public final class Reconciler {
       }
     }
 
+    // Mid-session ambiguity resolution (spec §7): a tag we could not confirm on placement
+    // that now appears in the book resolves to SUBMITTED, published exactly once. Runs after
+    // the open-order pass so a freshly resolved order is not advanced within the same cycle.
+    for (final String ambiguousTag : tracker.ambiguousOrders()) {
+      book.stream()
+          .filter(o -> ambiguousTag.equals(o.tag().orElse(null)))
+          .findFirst()
+          .ifPresent(found -> tracker.resolveAmbiguity(ambiguousTag, found.orderId()));
+    }
+
     signals.markReconcilerRun(clock.instant().getEpochSecond());
   }
 
@@ -132,6 +142,12 @@ public final class Reconciler {
     for (final Order order : book) {
       if (order.tag().isPresent() && !order.tag().get().isBlank()) {
         final String tag = order.tag().get();
+        if (tracker.ambiguousOrders().contains(tag)) {
+          // Silent re-adopt rule (spec §7): only genuinely unacknowledged placements
+          // resolve with an ORDER_SUBMITTED notification.
+          tracker.resolveAmbiguity(tag, order.orderId());
+          continue;
+        }
         if (!OrderStatus.isTerminal(order.status()) && tracker.byTag(tag).isEmpty()) {
           final OrderRequest syntheticReq =
               new OrderRequest(
@@ -158,7 +174,6 @@ public final class Reconciler {
                   clock.instant()));
           recoveredIds.add(order.orderId().value());
         }
-        tracker.resolveAmbiguity(tag, order.orderId());
       }
     }
 

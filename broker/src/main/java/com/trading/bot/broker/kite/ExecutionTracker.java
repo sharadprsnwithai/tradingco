@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -36,6 +37,7 @@ public final class ExecutionTracker {
 
   private final Map<OrderId, TrackedOrderInternal> orders = new ConcurrentHashMap<>();
   private final Map<String, OrderId> tagToId = new ConcurrentHashMap<>();
+  private final Set<String> ambiguousTags = ConcurrentHashMap.newKeySet();
 
   public ExecutionTracker(NotificationPublisher publisher, MeterRegistry registry, Clock clock) {
     this.publisher = Objects.requireNonNull(publisher, "publisher must not be null");
@@ -161,6 +163,27 @@ public final class ExecutionTracker {
   }
 
   /**
+   * Registers a tag whose placement outcome is unknown (mutation failed ambiguously), pending
+   * reconciliation against the order book.
+   *
+   * @param tag correlation tag of the ambiguous placement
+   */
+  public void registerAmbiguous(String tag) {
+    if (tag != null && !tag.isBlank()) {
+      ambiguousTags.add(tag);
+    }
+  }
+
+  /**
+   * Returns the tags whose placement outcome is still unknown.
+   *
+   * @return immutable snapshot of ambiguous tags
+   */
+  public Set<String> ambiguousOrders() {
+    return Set.copyOf(ambiguousTags);
+  }
+
+  /**
    * Resolves ambiguity when an ambiguous order is found in the order book.
    *
    * @param correlationId correlation tag
@@ -170,6 +193,7 @@ public final class ExecutionTracker {
     Objects.requireNonNull(correlationId, "correlationId must not be null");
     Objects.requireNonNull(found, "found must not be null");
 
+    ambiguousTags.remove(correlationId);
     tagToId.put(correlationId, found);
 
     final TrackedOrderInternal order =
