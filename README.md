@@ -96,3 +96,21 @@ docker compose restart trading-bot
 
 - **Actuator Health Check:** [`http://localhost:8123/actuator/health`](http://localhost:8123/actuator/health)
 - **Actuator Metrics:** [`http://localhost:8123/actuator/metrics`](http://localhost:8123/actuator/metrics)
+
+---
+
+## 📊 Monthly Range Forecast (forecast-api)
+
+Run on last working day of month (~15:30 IST):
+```bash
+python scripts/forecast/download_nse.py
+curl -X POST http://forecast-api:5599/forecast/run
+```
+
+Build / start:
+```bash
+docker build -t forecast-api forecast_api/
+docker compose up forecast_api -d
+```
+
+Output: `data/forecast/latest.json` + Telegram alert via `NotificationPublisher`. Keeps 48 months history (`data/forecast/history/`).
