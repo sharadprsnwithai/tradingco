@@ -23,7 +23,11 @@ import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
-@SuppressWarnings("PMD.UnitTestContainsTooManyAsserts")
+@SuppressWarnings({
+  "PMD.UnitTestContainsTooManyAsserts",
+  "PMD.AvoidDuplicateLiterals",
+  "PMD.AvoidInstantiatingObjectsInLoops"
+})
 class ExecutionGatewayTest {
 
   private Quote makeQuote(InstrumentToken token, String symbol, BigDecimal price) {

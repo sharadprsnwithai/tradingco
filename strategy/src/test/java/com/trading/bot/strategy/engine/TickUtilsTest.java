@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import java.math.BigDecimal;
 import org.junit.jupiter.api.Test;
 
+@SuppressWarnings("PMD.UnitTestContainsTooManyAsserts")
 class TickUtilsTest {
 
   @Test
