@@ -15,6 +15,7 @@ import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
 import com.trading.bot.broker.api.model.OrderId;
 import com.trading.bot.broker.api.model.Quote;
+import com.trading.bot.broker.api.model.QuoteRef;
 import com.trading.bot.notifications.api.Notification;
 import com.trading.bot.notifications.api.NotificationPublisher;
 import com.trading.bot.strategy.config.ExecutionMode;
@@ -148,6 +149,55 @@ class IntradayOptionStrategyTest {
 
     // Zero sell orders placed! Safety interlock
     verify(gateway, never()).executeSellMarket(any(), any(), any(), anyInt());
+  }
+
+  @Test
+  void vixAboveThresholdAbortsHedgeAndStraddleEntry() {
+    final Broker broker = mock(Broker.class);
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final InstrumentResolver resolver = new InstrumentResolver();
+    final PositionRiskManager riskManager = mock(PositionRiskManager.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final List<Notification> published = new ArrayList<>();
+    final NotificationPublisher publisher = published::add;
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final Clock clock = Clock.fixed(Instant.parse("2026-10-26T04:15:00Z"), IST); // 09:45 IST
+
+    final InstrumentToken spotToken = new InstrumentToken(256265L);
+    final InstrumentToken vixToken = new InstrumentToken(264969L);
+
+    when(broker.quotes(any()))
+        .thenAnswer(
+            inv -> {
+              final List<QuoteRef> refs = inv.getArgument(0);
+              if (refs.stream().anyMatch(r -> r.token().equals(vixToken))) {
+                return Map.of(
+                    vixToken, makeQuote(vixToken, "INDIA VIX", BigDecimal.valueOf(26.50)));
+              }
+              return Map.of(
+                  spotToken, makeQuote(spotToken, "NIFTY 50", BigDecimal.valueOf(25000.0)));
+            });
+
+    final IntradayOptionStrategy strategy =
+        new IntradayOptionStrategy(
+            broker,
+            gateway,
+            resolver,
+            riskManager,
+            stateRepo,
+            alertService,
+            publisher,
+            props,
+            clock);
+
+    strategy.executeHedge();
+
+    // VIX 26.50 > maxVixThreshold 24.0 -> zero orders executed
+    verify(gateway, never()).executeBuyMarket(any(), any(), any(), anyInt());
+    verify(stateRepo, never()).save(any());
+
+    assertThat(published).anyMatch(n -> n.title().contains("VIX Circuit Breaker Engaged"));
   }
 
   @Test

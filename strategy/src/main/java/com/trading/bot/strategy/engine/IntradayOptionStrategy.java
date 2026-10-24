@@ -25,6 +25,7 @@ import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import org.slf4j.Logger;
@@ -42,6 +43,9 @@ public final class IntradayOptionStrategy {
   private static final Logger LOG = LoggerFactory.getLogger(IntradayOptionStrategy.class);
   private static final String KOLKATA_ZONE = "Asia/Kolkata";
   private static final ZoneId IST = ZoneId.of(KOLKATA_ZONE);
+
+  public static final long INDIA_VIX_TOKEN = 264969L;
+  public static final String INDIA_VIX_SYMBOL = "INDIA VIX";
 
   private final Broker broker;
   private final StrategyExecutionGateway gateway;
@@ -131,6 +135,10 @@ public final class IntradayOptionStrategy {
       return;
     }
 
+    if (!isVixWithinThreshold()) {
+      return;
+    }
+
     final double spot = fetchSpotPrice(index);
     if (spot <= 0) {
       if (LOG.isErrorEnabled()) {
@@ -209,6 +217,10 @@ public final class IntradayOptionStrategy {
               NotificationType.SYSTEM_ALERT,
               "Straddle Entry Aborted",
               "Cannot sell ATM straddle: 09:45 hedges are not active. Safety interlock engaged."));
+      return;
+    }
+
+    if (!isVixWithinThreshold()) {
       return;
     }
 
@@ -514,5 +526,41 @@ public final class IntradayOptionStrategy {
       }
     }
     return 0.0;
+  }
+
+  private boolean isVixWithinThreshold() {
+    try {
+      final QuoteRef vixRef =
+          new QuoteRef(Exchange.NSE, INDIA_VIX_SYMBOL, new InstrumentToken(INDIA_VIX_TOKEN));
+      final Map<InstrumentToken, Quote> quotes = broker.quotes(List.of(vixRef));
+      final Quote q = quotes.get(vixRef.token());
+      if (q != null && q.lastPrice() != null) {
+        final double vix = q.lastPrice().doubleValue();
+        if (vix > props.maxVixThreshold()) {
+          if (LOG.isWarnEnabled()) {
+            LOG.warn(
+                "India VIX ({}) exceeds threshold ({}). Circuit breaker engaged.",
+                vix,
+                props.maxVixThreshold());
+          }
+          publisher.publish(
+              Notification.of(
+                  Severity.CRITICAL,
+                  NotificationType.SYSTEM_ALERT,
+                  "VIX Circuit Breaker Engaged",
+                  String.format(
+                      Locale.ROOT,
+                      "India VIX is %.2f, exceeding max allowable threshold %.2f. Trading gated.",
+                      vix,
+                      props.maxVixThreshold())));
+          return false;
+        }
+      }
+    } catch (BrokerException e) {
+      if (LOG.isWarnEnabled()) {
+        LOG.warn("Notice checking India VIX: {}", e.getMessage());
+      }
+    }
+    return true;
   }
 }
