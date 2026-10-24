@@ -302,6 +302,74 @@ class KiteHttpClientTest {
   }
 
   @Test
+  void mutationWithUnparseableOkBodyThrowsAmbiguousOrderStateException() {
+    final RestClient.Builder builder = RestClient.builder();
+    final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+    final SessionDelegate delegate =
+        new SessionDelegate() {
+          @Override
+          public String accessToken() {
+            return TOKEN;
+          }
+
+          @Override
+          public void forceRelogin() {}
+        };
+
+    server
+        .expect(ExpectedCount.once(), requestTo(BASE_URL + "/orders/regular"))
+        .andRespond(withSuccess("{\"status\":\"succ", MediaType.APPLICATION_JSON));
+
+    final KiteHttpClient client = new KiteHttpClient(props, delegate, builder);
+
+    assertThatThrownBy(
+            () ->
+                client.post(
+                    "/orders/regular",
+                    Map.of("tag", "trunc-tag-1"),
+                    PlaceOrderResponseDto.class,
+                    Mutability.MUTATION))
+        .isInstanceOf(AmbiguousOrderStateException.class)
+        .satisfies(
+            ex -> {
+              final AmbiguousOrderStateException amb = (AmbiguousOrderStateException) ex;
+              assertThat(amb.correlationId()).isEqualTo("trunc-tag-1");
+              assertThat(amb.operation()).isEqualTo("/orders/regular");
+            });
+
+    server.verify();
+  }
+
+  @Test
+  void readWithUnparseableOkBodyThrowsApiExceptionNotAmbiguous() {
+    final RestClient.Builder builder = RestClient.builder();
+    final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+    final SessionDelegate delegate =
+        new SessionDelegate() {
+          @Override
+          public String accessToken() {
+            return TOKEN;
+          }
+
+          @Override
+          public void forceRelogin() {}
+        };
+
+    server
+        .expect(ExpectedCount.once(), requestTo(BASE_URL + "/orders"))
+        .andRespond(withSuccess("{\"status\":\"succ", MediaType.APPLICATION_JSON));
+
+    final KiteHttpClient client = new KiteHttpClient(props, delegate, builder);
+
+    assertThatThrownBy(() -> client.get("/orders", OrderBookDto.class, Mutability.READ))
+        .isInstanceOf(ApiException.class)
+        .isNotInstanceOf(AmbiguousOrderStateException.class)
+        .satisfies(ex -> assertThat(((ApiException) ex).errorType()).isEqualTo("UnparseableBody"));
+
+    server.verify();
+  }
+
+  @Test
   void readFailureThrowsNetworkExceptionOrApiExceptionNeverAmbiguous() {
     final RestClient.Builder builder = RestClient.builder();
     final MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();

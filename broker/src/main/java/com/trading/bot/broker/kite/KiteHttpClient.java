@@ -212,7 +212,8 @@ public final class KiteHttpClient {
 
     try {
       final ResponseEntity<String> response = requestFunction.execute(token);
-      return parseBody(response.getBody(), responseType);
+      return parseBody(
+          response.getBody(), responseType, mutability, path, extractCorrelationId(form));
     } catch (HttpStatusCodeException e) {
       final int status = e.getStatusCode().value();
       final String body = e.getResponseBodyAsString();
@@ -269,10 +270,23 @@ public final class KiteHttpClient {
   }
 
   @SuppressWarnings("PMD.PreserveStackTrace")
-  private <T> T parseBody(String body, Class<T> responseType) {
+  private <T> T parseBody(
+      String body,
+      Class<T> responseType,
+      Mutability mutability,
+      String path,
+      String correlationId) {
     try {
       return objectMapper.readValue(body, responseType);
     } catch (JacksonException e) {
+      // Spec §7: a truncated/unparseable 200 body on a mutation means the order may exist.
+      if (mutability == Mutability.MUTATION) {
+        throw new AmbiguousOrderStateException(
+            path,
+            correlationId,
+            "Unparseable 200 response on order mutation: " + truncateSanitized(body),
+            new IOException("Failed to parse JSON response body"));
+      }
       throw new ApiException(
           "UnparseableBody",
           HTTP_OK,
