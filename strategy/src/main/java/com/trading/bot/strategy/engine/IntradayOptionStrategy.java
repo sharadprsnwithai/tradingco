@@ -56,7 +56,8 @@ public final class IntradayOptionStrategy {
   private final NotificationPublisher publisher;
   private final StrategyProperties props;
   private final Clock clock;
-  private final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
+  private final java.util.concurrent.locks.ReentrantLock lock =
+      new java.util.concurrent.locks.ReentrantLock();
 
   @Autowired
   public IntradayOptionStrategy(
@@ -205,8 +206,11 @@ public final class IntradayOptionStrategy {
       lock.unlock();
     }
 
-    alertService.notifyHedgeExecution(new DailyTradeRecord(
-        today, index, StrategyState.HEDGED, hCe, hPe, null, null, BigDecimal.ZERO), spot, props.executionMode());
+    alertService.notifyHedgeExecution(
+        new DailyTradeRecord(
+            today, index, StrategyState.HEDGED, hCe, hPe, null, null, BigDecimal.ZERO),
+        spot,
+        props.executionMode());
   }
 
   /** Checkpoint 2: 10:00 AM IST - Sell ATM CE and ATM PE straddle with atomic rollback. */
@@ -305,7 +309,7 @@ public final class IntradayOptionStrategy {
               NotificationType.SYSTEM_ALERT,
               "Straddle Atomic Rollback",
               "PE leg failed. Unwound CE leg to prevent naked exposure: " + e.getMessage()));
-      
+
       lock.lock();
       try {
         stateRepository.save(

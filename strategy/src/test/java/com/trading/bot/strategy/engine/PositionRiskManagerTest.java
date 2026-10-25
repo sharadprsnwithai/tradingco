@@ -490,8 +490,10 @@ class PositionRiskManagerTest {
             null,
             BigDecimal.ZERO);
 
-    when(broker.orderBook()).thenThrow(new com.trading.bot.broker.api.error.NetworkException("API down"));
-    when(broker.quotes(any())).thenThrow(new com.trading.bot.broker.api.error.NetworkException("API down"));
+    when(broker.orderBook())
+        .thenThrow(new com.trading.bot.broker.api.error.NetworkException("API down"));
+    when(broker.quotes(any()))
+        .thenThrow(new com.trading.bot.broker.api.error.NetworkException("API down"));
 
     final DailyTradeRecord updated = riskManager.evaluateRisk(record);
     assertThat(updated).isEqualTo(record);

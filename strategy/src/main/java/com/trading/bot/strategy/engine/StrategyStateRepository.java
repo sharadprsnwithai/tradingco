@@ -1,5 +1,8 @@
 package com.trading.bot.strategy.engine;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.trading.bot.strategy.model.DailyTradeRecord;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -11,9 +14,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.json.JsonMapper;
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
 /** Persists and restores the daily strategy trade state from disk for crash resilience. */
 @Component
@@ -31,9 +31,7 @@ public final class StrategyStateRepository {
   public StrategyStateRepository(
       @Value("${strategy.state-file:data/strategy_state.json}") Path stateFilePath) {
     this.stateFilePath = Objects.requireNonNull(stateFilePath, "stateFilePath must not be null");
-    this.objectMapper = JsonMapper.builder()
-        .addModule(new JavaTimeModule())
-        .build();
+    this.objectMapper = JsonMapper.builder().addModule(new JavaTimeModule()).build();
   }
 
   /**
@@ -87,7 +85,8 @@ public final class StrategyStateRepository {
       }
     } catch (IOException e) {
       if (LOG.isErrorEnabled()) {
-        LOG.error("Critical failure reading strategy state from {}: {}", stateFilePath, e.getMessage());
+        LOG.error(
+            "Critical failure reading strategy state from {}: {}", stateFilePath, e.getMessage());
       }
       throw new RuntimeException("Failed to load strategy state", e);
     }

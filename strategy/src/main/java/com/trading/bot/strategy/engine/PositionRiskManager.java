@@ -126,7 +126,8 @@ public final class PositionRiskManager {
       if (shortCe.slOrderId() != null && orderBookMap.containsKey(shortCe.slOrderId().value())) {
         final Order slOrder = orderBookMap.get(shortCe.slOrderId().value());
         if (slOrder.status() == OrderStatus.FILLED) {
-          if (slOrder.averagePrice() != null && slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0) {
+          if (slOrder.averagePrice() != null
+              && slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0) {
             ceFilledAtExchange = true;
             ceExchangePrice = slOrder.averagePrice();
           } else {
@@ -254,7 +255,8 @@ public final class PositionRiskManager {
         if (slOrder.status() == OrderStatus.FILLED) {
           peFilledAtExchange = true;
           peExchangePrice =
-              (slOrder.averagePrice() != null && slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0)
+              (slOrder.averagePrice() != null
+                      && slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0)
                   ? slOrder.averagePrice()
                   : shortPe.slPrice();
         }
