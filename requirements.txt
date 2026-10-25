@@ -1,4 +1,0 @@
-# Monthly option forecast pipeline
-# Chronos model pin: amazon/chronos-t5-small (see scripts/forecast/forecast_core.py)
-chronos-forecasting>=1.5
-torch>=2.2
