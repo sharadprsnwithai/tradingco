@@ -11,8 +11,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
-import tools.jackson.databind.ObjectMapper;
-import tools.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.json.JsonMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 
 /** Persists and restores the daily strategy trade state from disk for crash resilience. */
 @Component
@@ -30,7 +31,9 @@ public final class StrategyStateRepository {
   public StrategyStateRepository(
       @Value("${strategy.state-file:data/strategy_state.json}") Path stateFilePath) {
     this.stateFilePath = Objects.requireNonNull(stateFilePath, "stateFilePath must not be null");
-    this.objectMapper = JsonMapper.builder().build();
+    this.objectMapper = JsonMapper.builder()
+        .addModule(new JavaTimeModule())
+        .build();
   }
 
   /**

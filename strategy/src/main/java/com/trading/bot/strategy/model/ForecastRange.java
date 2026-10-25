@@ -1,4 +1,4 @@
-package com.trading.bot.strategy.config;
+package com.trading.bot.strategy.model;
 
 import java.time.LocalDate;
 

@@ -163,8 +163,9 @@ public final class LiveStrategyGateway implements StrategyExecutionGateway {
 
   private String generateOrderTag(String prefix) {
     final long count = tagCounter.incrementAndGet() % 10_000L;
-    final long timePart = System.currentTimeMillis() % 1_000_000_000L;
-    final String tag = String.format(Locale.ROOT, "%s%09d%04d", prefix, timePart, count);
+    final long timePart = System.currentTimeMillis() % 100_000_000L;
+    final int rnd = java.util.concurrent.ThreadLocalRandom.current().nextInt(100, 999);
+    final String tag = String.format(Locale.ROOT, "%s%08d%04d%03d", prefix, timePart, count, rnd);
     return tag.length() > 20 ? tag.substring(0, 20) : tag;
   }
 

@@ -109,6 +109,15 @@ public final class PositionRiskManager {
       return record;
     }
 
+    for (final QuoteRef ref : refs) {
+      if (!quotes.containsKey(ref.token()) && LOG.isWarnEnabled()) {
+        LOG.warn(
+            "Missing live quote for active leg: symbol={}, token={}",
+            ref.tradingsymbol(),
+            ref.token().value());
+      }
+    }
+
     // 2. Evaluate Call Leg SL (Exchange fill detection OR quote threshold breach)
     if (shortCe != null && shortCe.isOpen()) {
       boolean ceFilledAtExchange = false;
