@@ -2,26 +2,31 @@ package com.trading.bot.strategy.engine;
 
 import com.trading.bot.broker.api.Broker;
 import com.trading.bot.broker.api.model.Exchange;
+import com.trading.bot.broker.api.model.HistoricalCandle;
+import com.trading.bot.broker.api.model.Holding;
 import com.trading.bot.broker.api.model.InstrumentToken;
+import com.trading.bot.broker.api.model.Margins;
+import com.trading.bot.broker.api.model.Order;
+import com.trading.bot.broker.api.model.OrderId;
+import com.trading.bot.broker.api.model.OrderPatch;
+import com.trading.bot.broker.api.model.OrderRequest;
+import com.trading.bot.broker.api.model.Position;
 import com.trading.bot.broker.api.model.Quote;
 import com.trading.bot.broker.api.model.QuoteRef;
-import com.trading.bot.strategy.config.ExecutionMode;
 import com.trading.bot.strategy.config.StrategyProperties;
 import com.trading.bot.strategy.gateway.BacktestStrategyGateway;
 import com.trading.bot.strategy.model.DailyTradeRecord;
-import com.trading.bot.strategy.model.StrategyState;
 import com.trading.bot.strategy.model.TargetIndex;
 import java.math.BigDecimal;
 import java.time.Clock;
-import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.ZoneId;
-import java.time.ZonedDateTime;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,17 +37,14 @@ public final class BacktestEngine {
   private static final ZoneId IST = ZoneId.of("Asia/Kolkata");
 
   private final StrategyProperties props;
-  private final Broker mockBroker;
   private final BacktestStrategyGateway gateway;
   private final StrategyStateRepository stateRepository;
 
   public BacktestEngine(
       StrategyProperties props,
-      Broker mockBroker,
       BacktestStrategyGateway gateway,
       StrategyStateRepository stateRepository) {
     this.props = Objects.requireNonNull(props, "props must not be null");
-    this.mockBroker = Objects.requireNonNull(mockBroker, "mockBroker must not be null");
     this.gateway = Objects.requireNonNull(gateway, "gateway must not be null");
     this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository must not be null");
   }
@@ -61,9 +63,6 @@ public final class BacktestEngine {
 
     final List<DailyTradeRecord> results = new java.util.ArrayList<>();
     final InstrumentResolver resolver = new InstrumentResolver();
-    final PositionRiskManager riskManager =
-        new PositionRiskManager(gateway, stateRepository, mockBroker, new StrategyAlertService(n -> {}), props);
-    final NotificationPublisherDummy publisher = new NotificationPublisherDummy();
 
     for (final LocalDate date : tradingDays) {
       stateRepository.clear();
@@ -72,10 +71,15 @@ public final class BacktestEngine {
         continue;
       }
 
+      final BacktestBrokerStub brokerStub = new BacktestBrokerStub(date, spot, gateway);
+      final PositionRiskManager riskManager =
+          new PositionRiskManager(gateway, stateRepository, brokerStub, new StrategyAlertService(n -> {}), props);
+      final NotificationPublisherDummy publisher = new NotificationPublisherDummy();
+
       final Clock dayClock = Clock.fixed(date.atTime(9, 15).atZone(IST).toInstant(), IST);
       final IntradayOptionStrategy strategy =
           new IntradayOptionStrategy(
-              mockBroker,
+              brokerStub,
               gateway,
               resolver,
               riskManager,
@@ -102,8 +106,6 @@ public final class BacktestEngine {
         if (t.isAfter(props.exitTime())) {
           break;
         }
-        // Simulate slight option price decay / fluctuation
-        simulateOptionPricing(index, spot, gateway);
         strategy.checkRisk();
       }
 
@@ -116,8 +118,49 @@ public final class BacktestEngine {
     return results;
   }
 
-  private void simulateOptionPricing(TargetIndex index, double spot, BacktestStrategyGateway gw) {
-    // Simulated pricing helper for backtest
+  private static class BacktestBrokerStub implements Broker {
+    private final LocalDate date;
+    private final Double spot;
+    private final BacktestStrategyGateway gateway;
+    private int tickCount = 0;
+
+    BacktestBrokerStub(LocalDate date, Double spot, BacktestStrategyGateway gateway) {
+      this.date = date;
+      this.spot = spot;
+      this.gateway = gateway;
+    }
+
+    @Override
+    public Map<InstrumentToken, Quote> quotes(Collection<QuoteRef> refs) {
+      tickCount++;
+      Map<InstrumentToken, Quote> map = new HashMap<>();
+      for (QuoteRef ref : refs) {
+        BigDecimal price;
+        if (ref.token().value() == IntradayOptionStrategy.INDIA_VIX_TOKEN) {
+          price = BigDecimal.valueOf(15.0);
+        } else if (ref.token().value() == 256265L || ref.token().value() == 265L) { // Spot
+          price = BigDecimal.valueOf(spot);
+        } else {
+          // Simulate theta decay with occasional volatility spikes
+          double decay = 100.0 - (tickCount * 0.2);
+          double noise = Math.sin(tickCount + date.getDayOfYear()) * 15.0;
+          double p = Math.max(5.0, decay + noise);
+          price = BigDecimal.valueOf(p);
+        }
+        map.put(ref.token(), new Quote(ref.token(), ref.tradingsymbol(), price, price, price, price, price, 1000L));
+        gateway.setCurrentPrice(ref.token(), price);
+      }
+      return map;
+    }
+
+    @Override public List<Order> orderBook() { return List.of(); }
+    @Override public OrderId placeOrder(OrderRequest request) { return new OrderId("bk-ord-" + System.currentTimeMillis()); }
+    @Override public void modifyOrder(OrderId id, OrderPatch patch) {}
+    @Override public void cancelOrder(OrderId id) {}
+    @Override public List<Position> positions() { return List.of(); }
+    @Override public List<Holding> holdings() { return List.of(); }
+    @Override public Margins margins() { return null; }
+    @Override public List<HistoricalCandle> historicalCandles(InstrumentToken token, String interval, String from, String to) { return List.of(); }
   }
 
   private static final class NotificationPublisherDummy
