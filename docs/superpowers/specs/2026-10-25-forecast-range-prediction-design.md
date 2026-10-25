@@ -27,7 +27,7 @@ Build a forecasting module that, on the **last working day of each month**, pred
 - **C3.** No new cloud services; local Docker compose for the model API.
 - **C4.** Data source: NSE India CSVs (historical daily OHLCV + VIX); versioned under `data/forecast/nse_daily/`; download cadence = once per month on last trading day (offline-first, no runtime API key needed).
 - **C5.** All forecasts reproducible by date (deterministic random seeds; model artifacts versioned under `model_artifacts/`).
-- **C6.** Probability persistence retention = 24 months (2 years) under `data/forecast/history/`; auto-prune beyond that; monthly audit check.
+- **C6.** Probability persistence retention = 48 months (4 years) under `data/forecast/history/`; auto-prune beyond that; monthly audit check.
 - **C7.** Python forecast job sends Telegram message using existing `NotificationPublisher` service — no new dependencies.
 
 ## Architecture
@@ -68,11 +68,11 @@ Build a forecasting module that, on the **last working day of each month**, pred
 ## Components
 
 ### 1. Data Ingestion (`scripts/forecast/download_nse.py`)
-- Downloads NIFTY 50, SENSEX, BANK NIFTY, and top-10 stock index constituents.
-- **Daily OHLCV + NSE India VIX** — source: NSE India public CSV endpoints (offline-friendly, no runtime API key).
+**Data ingestion (`scripts/forecast/download_nse.py`)**
+- Source: `yfinance` Python library (Yahoo Finance) — pulls NIFTY 50 (`^NSEI`), SENSEX (`^BSESN`), BANK NIFTY (`^NSEBANK`), VIX (`INDIAVIX`), and top-10 NSE stocks: RELIANCE, HDFC BANK, ICICI BANK, TCS, BAJAJ FINANCE, INFOSYS, AXIS BANK, NESTLE, TITAN, ITC.
 - Stores CSVs in `data/forecast/nse_daily/{symbol}.csv`.
 - Re-run monthly on last trading day to pull last 22 trading days.
-- Minimum training window: last 5 years (~1,250 daily rows per asset) — configurable via `MIN_TRAIN_YEARS`.
+- Offline-first: download once, cache CSV; forecast API reads local CSV only.
 
 ### 2. Training (`scripts/forecast/train_model.py`)
 - **Quantile regression** with PyTorch Forecasting `TemporalFusionTransformer`.
@@ -108,8 +108,8 @@ Build a forecasting module that, on the **last working day of each month**, pred
 
 ### 4. Forecast History (`data/forecast/history/`)
 - Every monthly run appends a date-stamped copy: `forecast_YYYY-MM.json`.
-- Retention policy: keep **24 months** (2 years) of forecasts; prune older than 730 days automatically at run time.
-- Purpose: audit trail so you can verify, after a year or two, whether the predicted probability matched actual results (calibration check).
+- Retention policy: keep **48 months** (4 years) of forecasts; prune older than 1460 days automatically at run time.
+- Purpose: audit trail so you can verify, after 2–4 years, whether the predicted probability matched actual results (calibration check).
 
 ### 5. Java Integration
 #### 5a. `ForecastProperties` (strategy module)
@@ -152,27 +152,31 @@ public record ForecastRange(
 ) {}
 ```
 
-### 6. Wiring into Strategy
+### 6. Wiring into Strategy (updated per code verification)
 - `IntradayOptionStrategy.executeHedge`:
-  - Read `ForecastClient.getRange(index.name())` — if present and `probInRange > 0.x`, proceed.
-  - Replace currently-dead `maxVixThreshold` check with real VIX gate from forecast.
+  - `ForecastClient.getRange(index.name())` provides forecast data (optional enhancement — engine already has VIX gate at `IntradayOptionStrategy:540`).
+  - Existing VIX gate (`maxVixThreshold`) is **already wired** and functional (line 540); forecast adds external validation.
 - `PositionRiskManager`:
-  - Read `expectedVol` from forecast to adjust SL multiplier if high-vol regime flagged.
+  - `expectedVol` from forecast can adjust SL multiplier (optional enhancement — existing risk manager runs `@Scheduled` at line 318).
+- **Risk loop verified**: `checkRisk()` already has `@Scheduled(fixedDelay = 1000)` (`IntradayOptionStrategy:318`).
+- **Config fields verified**: `maxVixThreshold`, `maxSpreadPercentage`, `profitTargetPercentage` already read in engine and gateway (`LiveStrategyGateway:83` uses `maxSpreadPercentage`).
+- **Tick utils verified**: `TickUtils.java` handles rounding centrally; duplication removed.
+- **Order tags verified**: `LiveStrategyGateway.generateOrderTag()` uses incrementing counter (`tagCounter`) — collision risk eliminated.
+- **NPE fix applied**: `PositionRiskManager:114` null guard added (`slOrder.averagePrice()` checked before `compareTo`).
 - **Telegram integration**: Uses existing `NotificationPublisher` (from `StrategyAlertService`) — no new dependencies.
-- **Bot sends Telegram on last working day of month** with range + probability for all assets.
 
 ## Data Flow (Monthly)
 1. **Last trading day, ~15:30 IST**: Flask API endpoint called (via `ForecastClient.refresh()`).
 2. Forecast JSON written to `data/forecast/latest.json`.
 3. Historical archive: `data/forecast/history/forecast_YYYY-MM.json` created.
-4. Retained: 24 months of history; auto-prune older.
+4. Retained: 48 months of history; auto-prune older.
 5. Strategy engine loads range at next run cycle.
-6. **Calibration audit**: after first two years, run `scripts/forecast/audit_calibration.py` to compare forecast ranges vs actual month-ends; verifies probability calibration.
+6. **Calibration audit**: after first 2 years (and yearly after that) run `scripts/forecast/audit_calibration.py` to compare forecast ranges vs actual month-ends; verifies probability calibration over 4-year history.
 7. **Telegram alert**: `ForecastClient.sendTelegramAlert()` sends monthly forecast summary.
 
 ## Calibration & Retention
-- **Retention policy**: 24 months (2 years) under `data/forecast/history/`.
-- **Calibration verification**: `scripts/forecast/audit_calibration.py` (baseline: out-of-sample 2024 data; ongoing post-deployment). Compares forecast ranges vs actual monthly close; logs whether the 80% range was hit ~80% of the time (coverage check over the 2-year window).
+- **Retention policy**: 48 months (4 years) under `data/forecast/history/`.
+- **Calibration verification**: `scripts/forecast/audit_calibration.py` (baseline: out-of-sample 2024 data; ongoing post-deployment). Compares forecast ranges vs actual monthly close; logs whether the 80% range was hit ~80% of the time (coverage check over 4-year window).
 - **Data ingestion**: `scripts/forecast/download_nse.py` — offline-friendly; no runtime API key needed.
 - **Telegram integration**: Uses existing `NotificationPublisher` — Telegram API allows 30 messages/sec; our bot sends 1 message/month, well under limit.
 
@@ -184,7 +188,7 @@ public record ForecastRange(
 | Model drift (regime changes) | Monthly retrain required; flag accuracy in alerts |
 | Python/Java version mismatch | Pin versions in Docker + requirements.txt |
 | Probability calibration degrades over time | Ongoing calibration audit; retrain if coverage < target |
-| Long-term forecast storage grows unbounded | 24-month retention; auto-prune older |
+| Long-term forecast storage grows unbounded | 48-month retention; auto-prune older (1460-day cap) |
 | Telegram API rate limits | Telegram API allows 30 messages/sec; our bot sends 1/month |
 
 ## Acceptance Criteria
