@@ -180,22 +180,49 @@ def test_forecast_never_sees_rows_after_the_trailing_month():
     run_walk_forward(frames, model, months=2, seed=42)
     df = frames["AAA"]
     months = df["date"].dt.to_period("M").unique()
+    # the final group is never scored, so the window ends at the second-to-last month
     assert [len(c) for c in model.contexts] == [
+        (N_MONTHS - 3) * DAYS_PER_MONTH,
         (N_MONTHS - 2) * DAYS_PER_MONTH,
-        (N_MONTHS - 1) * DAYS_PER_MONTH,
     ]
-    for context, period in zip(model.contexts, months[-2:]):
+    for context, period in zip(model.contexts, months[-3:-1]):
         np.testing.assert_allclose(context, df[df["date"] < period.start_time]["close"])
+
+
+@pytest.mark.parametrize("tail_rows", [1, DAYS_PER_MONTH])
+def test_final_month_group_is_never_scored(tail_rows):
+    frame = _frame([(1.02, None, None)] * 5).iloc[: 4 * DAYS_PER_MONTH + tail_rows]
+    model = StubModel()
+    report = run_walk_forward({"AAA": frame}, model, months=3, seed=42)
+
+    # months 1, 2 and 3 are scored; month 4 is the final group (in-progress or not)
+    assert [len(c) for c in model.contexts] == [21, 42, 63]
+    assert report["n_obs"] == 3
+    assert report["per_asset"]["AAA"]["n_obs"] == 3
+    assert report["per_asset"]["AAA"]["skipped"] == 0
+    assert report["coverage_95_touch"] == pytest.approx(1.0)
+    assert report["direction_pass_rate"] == pytest.approx(1.0)
+
+
+def test_asset_order_is_sorted_not_insertion_order():
+    aaa, bbb = _frame(AAA), _frame(BBB)
+    forward = run_walk_forward({"AAA": aaa, "BBB": bbb}, StubModel(), months=3)
+    backward = run_walk_forward({"BBB": bbb, "AAA": aaa}, StubModel(), months=3)
+
+    assert list(forward["per_asset"]) == ["AAA", "BBB"]
+    assert list(backward["per_asset"]) == ["AAA", "BBB"]
+    assert forward == backward
 
 
 def test_degenerate_trailing_window_is_skipped_not_dropped():
     flat_first_month = [(1.0, None, None), (1.02, None, None), (1.02, None, None), (1.02, None, None)]
     report = run_walk_forward({"FLAT": _frame(flat_first_month)}, StubModel(), months=5)
     stats = report["per_asset"]["FLAT"]
-    # month 0 has no trailing history, month 1's trailing window has zero variance
+    # the final group is not scored; of the 3 scored months, month 0 has no trailing
+    # history and month 1's trailing window has zero variance
     assert stats["skipped"] == 2
-    assert stats["n_obs"] == 2
-    assert report["n_obs"] == 2
+    assert stats["n_obs"] == 1
+    assert report["n_obs"] == 1
     assert stats["coverage_95_touch"] == pytest.approx(1.0)
 
 

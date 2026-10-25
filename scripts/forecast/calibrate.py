@@ -38,9 +38,10 @@ def run_walk_forward(frames: dict, model, months: int = 48, seed: int = 42) -> d
     """Score the last `months` months of every asset from trailing data only."""
     totals = {"covered95": 0, "covered80": 0, "obs": 0, "passes": 0, "directional": 0}
     per_asset = {}
-    for asset_index, (symbol, frame) in enumerate(frames.items()):
-        df = frame.sort_values("date", ignore_index=True)
-        groups = list(df.groupby(df["date"].dt.to_period("M"), sort=True))[-months:]
+    for asset_index, symbol in enumerate(sorted(frames)):
+        df = frames[symbol].sort_values("date", ignore_index=True)
+        # the final group may be in-progress: its month-end is unknown, so never score it
+        groups = list(df.groupby(df["date"].dt.to_period("M"), sort=True))[:-1][-months:]
         covered95 = covered80 = obs = passes = directional = skipped = 0
         for month_index, (period, rows) in enumerate(groups):
             trailing = df[df["date"] < period.start_time].reset_index(drop=True)
