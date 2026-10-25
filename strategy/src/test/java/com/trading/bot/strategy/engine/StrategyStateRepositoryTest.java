@@ -124,8 +124,9 @@ class StrategyStateRepositoryTest {
   }
 
   @Test
-  void loadReturnsEmptyWhenFileDoesNotExist() {
-    final Optional<DailyTradeRecord> loaded = repository.load(LocalDate.now());
-    assertThat(loaded).isEmpty();
+  void loadThrowsExceptionWhenFileIsCorrupted() throws IOException {
+    Files.writeString(stateFile, "{invalid-json}");
+    org.junit.jupiter.api.Assertions.assertThrows(
+        RuntimeException.class, () -> repository.load(LocalDate.of(2026, 10, 26)));
   }
 }

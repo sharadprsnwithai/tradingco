@@ -86,9 +86,10 @@ public final class StrategyStateRepository {
         return Optional.of(record);
       }
     } catch (IOException e) {
-      if (LOG.isWarnEnabled()) {
-        LOG.warn("Failed reading strategy state from {}: {}", stateFilePath, e.getMessage());
+      if (LOG.isErrorEnabled()) {
+        LOG.error("Critical failure reading strategy state from {}: {}", stateFilePath, e.getMessage());
       }
+      throw new RuntimeException("Failed to load strategy state", e);
     }
     return Optional.empty();
   }
