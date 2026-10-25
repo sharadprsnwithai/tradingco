@@ -9,6 +9,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.trading.bot.broker.api.Broker;
+import com.trading.bot.broker.api.error.NetworkException;
 import com.trading.bot.broker.api.model.Exchange;
 import com.trading.bot.broker.api.model.InstrumentToken;
 import com.trading.bot.broker.api.model.OrderId;
@@ -200,5 +201,23 @@ class ExecutionGatewayTest {
     // 100.03 * 1.02 = 102.0306 -> rounded to nearest 0.05 tick = 102.05
     assertThat(req.price()).isPresent();
     assertThat(req.price().get()).isEqualByComparingTo(BigDecimal.valueOf(102.05));
+  }
+
+  @Test
+  void spreadGateRetriesDoNotBlockIndefinitely() {
+    final Broker broker = mock(Broker.class);
+    final LiveStrategyGateway gateway = new LiveStrategyGateway(broker);
+    final InstrumentToken token = new InstrumentToken(256265L);
+    final QuoteRef ref = new QuoteRef(Exchange.NFO, "NIFTY26OCT25000CE", token);
+
+    when(broker.quotes(List.of(ref))).thenThrow(new NetworkException("Network glitch"));
+    when(broker.placeOrder(any())).thenReturn(new OrderId("ord-fallback"));
+    when(broker.orderBook()).thenReturn(List.of());
+
+    long start = System.currentTimeMillis();
+    gateway.executeBuyMarket("NIFTY26OCT25000CE", token, Exchange.NFO, 130);
+    long duration = System.currentTimeMillis() - start;
+
+    assertThat(duration).isLessThan(2000);
   }
 }
