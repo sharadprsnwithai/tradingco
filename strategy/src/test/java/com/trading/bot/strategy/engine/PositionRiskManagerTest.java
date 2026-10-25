@@ -52,6 +52,7 @@ class PositionRiskManagerTest {
           2,
           30.0,
           true,
+          true,
           LocalTime.of(9, 45),
           LocalTime.of(10, 0),
           LocalTime.of(15, 0),

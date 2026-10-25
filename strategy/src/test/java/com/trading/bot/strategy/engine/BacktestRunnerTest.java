@@ -26,6 +26,7 @@ class BacktestRunnerTest {
             2,
             35.0, // 35% SL
             true,
+            false,
             LocalTime.of(9, 45),
             LocalTime.of(10, 0),
             LocalTime.of(15, 0),

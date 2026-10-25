@@ -118,7 +118,40 @@ public final class PositionRiskManager {
       }
     }
 
-    // 2. Evaluate Call Leg SL (Exchange fill detection OR quote threshold breach)
+    // 4. Check Portfolio-Level Profit Target (if both legs open and target configured)
+    if (shortCe != null && shortCe.isOpen() && shortPe != null && shortPe.isOpen()
+        && props.portfolioProfitTargetPercentage() > 0) {
+      final Quote ceQ = quotes.get(shortCe.token());
+      final Quote peQ = quotes.get(shortPe.token());
+      if (ceQ != null && ceQ.lastPrice() != null && peQ != null && peQ.lastPrice() != null) {
+        final BigDecimal totalEntry = shortCe.entryPrice().add(shortPe.entryPrice());
+        final BigDecimal totalCurrent = ceQ.lastPrice().add(peQ.lastPrice());
+        
+        final double decayFactor = 1.0 - (props.portfolioProfitTargetPercentage() / 100.0);
+        final BigDecimal targetPremium = totalEntry.multiply(BigDecimal.valueOf(decayFactor));
+
+        if (totalCurrent.compareTo(targetPremium) <= 0) {
+          if (shortCe.slOrderId() != null) gateway.cancelOrder(shortCe.slOrderId());
+          if (shortPe.slOrderId() != null) gateway.cancelOrder(shortPe.slOrderId());
+
+          final BigDecimal ceExit = gateway.executeBuyMarket(shortCe.symbol(), shortCe.token(), derivExchange, shortCe.quantity());
+          final BigDecimal peExit = gateway.executeBuyMarket(shortPe.symbol(), shortPe.token(), derivExchange, shortPe.quantity());
+
+          final TradeLeg closedCe = new TradeLeg(shortCe.symbol(), shortCe.token(), shortCe.quantity(), shortCe.entryPrice(), ceExit, shortCe.slPrice(), null, false);
+          final TradeLeg closedPe = new TradeLeg(shortPe.symbol(), shortPe.token(), shortPe.quantity(), shortPe.entryPrice(), peExit, shortPe.slPrice(), null, false);
+
+          final BigDecimal pnl = closedCe.calculatePnl(true).add(closedPe.calculatePnl(true));
+          final DailyTradeRecord completed = new DailyTradeRecord(
+              record.date(), record.index(), StrategyState.COMPLETED,
+              record.hedgeCe(), record.hedgePe(), closedCe, closedPe,
+              (record.realizedPnl() != null ? record.realizedPnl() : BigDecimal.ZERO).add(pnl));
+          
+          stateRepository.save(completed);
+          alertService.notifyProfitTargetHit(closedCe, ceExit, props.executionMode());
+          return completed;
+        }
+      }
+    }
     if (shortCe != null && shortCe.isOpen()) {
       boolean ceFilledAtExchange = false;
       BigDecimal ceExchangePrice = BigDecimal.ZERO;
@@ -201,8 +234,10 @@ public final class PositionRiskManager {
               if (shortPe.slOrderId() != null) {
                 final BigDecimal peLimit =
                     TickUtils.roundToTick(shortPe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
-                gateway.modifyStopLoss(
-                    shortPe.slOrderId(), shortPe.quantity(), shortPe.entryPrice(), peLimit);
+                if (props.useExchangeSl()) {
+                  gateway.modifyStopLoss(
+                      shortPe.slOrderId(), shortPe.quantity(), shortPe.entryPrice(), peLimit);
+                }
               }
               shortPe =
                   new TradeLeg(
@@ -326,8 +361,10 @@ public final class PositionRiskManager {
               if (shortCe.slOrderId() != null) {
                 final BigDecimal ceLimit =
                     TickUtils.roundToTick(shortCe.entryPrice().multiply(BigDecimal.valueOf(1.05)));
-                gateway.modifyStopLoss(
-                    shortCe.slOrderId(), shortCe.quantity(), shortCe.entryPrice(), ceLimit);
+                if (props.useExchangeSl()) {
+                  gateway.modifyStopLoss(
+                      shortCe.slOrderId(), shortCe.quantity(), shortCe.entryPrice(), ceLimit);
+                }
               }
               shortCe =
                   new TradeLeg(

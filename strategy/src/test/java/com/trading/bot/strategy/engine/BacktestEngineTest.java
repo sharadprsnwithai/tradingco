@@ -35,6 +35,7 @@ class BacktestEngineTest {
             2,
             30.0,
             true,
+            false,
             LocalTime.of(9, 45),
             LocalTime.of(10, 0),
             LocalTime.of(15, 0),
@@ -71,7 +72,7 @@ class BacktestEngineTest {
     final StrategyStateRepository stateRepo =
         new StrategyStateRepository(tempDir.resolve("state.json"));
 
-    final BacktestEngine engine = new BacktestEngine(props, mockBroker, gateway, stateRepo);
+    final BacktestEngine engine = new BacktestEngine(props, gateway, stateRepo);
 
     final LocalDate monday = LocalDate.of(2026, 10, 26); // Monday -> Nifty
     final List<LocalDate> days = List.of(monday);

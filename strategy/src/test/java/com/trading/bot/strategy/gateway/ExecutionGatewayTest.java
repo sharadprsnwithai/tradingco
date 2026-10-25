@@ -152,9 +152,11 @@ class ExecutionGatewayTest {
             2,
             30.0,
             true,
+            false,
             24.0,
             2.0, // 2% max spread
             85.0,
+            50.0,
             java.time.LocalTime.of(9, 45),
             java.time.LocalTime.of(10, 0),
             java.time.LocalTime.of(15, 0),

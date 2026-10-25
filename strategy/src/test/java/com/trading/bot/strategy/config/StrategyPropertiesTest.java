@@ -37,6 +37,7 @@ class StrategyPropertiesTest {
           assertThat(props.exitTime()).isEqualTo(LocalTime.of(15, 0));
           assertThat(props.niftyHedgeDistance()).isEqualTo(1000);
           assertThat(props.sensexHedgeDistance()).isEqualTo(2000);
+          assertThat(props.useExchangeSl()).isFalse();
         });
   }
 
@@ -49,7 +50,8 @@ class StrategyPropertiesTest {
             "strategy.sl-percentage=25.0",
             "strategy.trail-to-breakeven=false",
             "strategy.nifty-hedge-distance=1200",
-            "strategy.sensex-hedge-distance=2500")
+            "strategy.sensex-hedge-distance=2500",
+            "strategy.use-exchange-sl=true")
         .run(
             context -> {
               assertThat(context).hasNotFailed();
@@ -61,6 +63,7 @@ class StrategyPropertiesTest {
               assertThat(props.trailToBreakeven()).isFalse();
               assertThat(props.niftyHedgeDistance()).isEqualTo(1200);
               assertThat(props.sensexHedgeDistance()).isEqualTo(2500);
+              assertThat(props.useExchangeSl()).isTrue();
             });
   }
 }

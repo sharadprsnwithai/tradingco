@@ -21,6 +21,7 @@ import org.springframework.validation.annotation.Validated;
  * @param exitTime time to square-off all active legs (default 15:00)
  * @param niftyHedgeDistance points offset for Nifty OTM hedges (default 1000)
  * @param sensexHedgeDistance points offset for Sensex OTM hedges (default 2000)
+ * @param useExchangeSl whether to place resting exchange stop-loss orders (default false for low turnover)
  */
 @ConfigurationProperties("strategy")
 @Validated
@@ -29,9 +30,11 @@ public record StrategyProperties(
     @Positive(message = "strategy.lots must be positive") int lots,
     @Positive(message = "strategy.sl-percentage must be positive") double slPercentage,
     Boolean trailToBreakeven,
+    Boolean useExchangeSl,
     double maxVixThreshold,
     double maxSpreadPercentage,
     double profitTargetPercentage,
+    double portfolioProfitTargetPercentage,
     LocalTime hedgeTime,
     LocalTime entryTime,
     LocalTime exitTime,
@@ -46,11 +49,13 @@ public record StrategyProperties(
   private static final double DEFAULT_MAX_VIX = 24.0;
   private static final double DEFAULT_MAX_SPREAD = 1.5;
   private static final double DEFAULT_PROFIT_TARGET = 85.0;
+  private static final double DEFAULT_PORTFOLIO_PROFIT_TARGET = 0.0;
   private static final LocalTime DEFAULT_HEDGE_TIME = LocalTime.of(9, 45);
   private static final LocalTime DEFAULT_ENTRY_TIME = LocalTime.of(10, 0);
   private static final LocalTime DEFAULT_EXIT_TIME = LocalTime.of(15, 0);
   private static final int DEFAULT_NIFTY_HEDGE_DISTANCE = 1000;
   private static final int DEFAULT_SENSEX_HEDGE_DISTANCE = 2000;
+  private static final boolean DEFAULT_USE_EXCHANGE_SL = false;
 
   @ConstructorBinding
   public StrategyProperties {
@@ -75,6 +80,9 @@ public record StrategyProperties(
     if (profitTargetPercentage <= 0) {
       profitTargetPercentage = DEFAULT_PROFIT_TARGET;
     }
+    if (portfolioProfitTargetPercentage <= 0) {
+      portfolioProfitTargetPercentage = DEFAULT_PORTFOLIO_PROFIT_TARGET;
+    }
     if (hedgeTime == null) {
       hedgeTime = DEFAULT_HEDGE_TIME;
     }
@@ -90,6 +98,9 @@ public record StrategyProperties(
     if (sensexHedgeDistance <= 0) {
       sensexHedgeDistance = DEFAULT_SENSEX_HEDGE_DISTANCE;
     }
+    if (useExchangeSl == null) {
+      useExchangeSl = DEFAULT_USE_EXCHANGE_SL;
+    }
   }
 
   public StrategyProperties(
@@ -97,6 +108,7 @@ public record StrategyProperties(
       int lots,
       double slPercentage,
       boolean trailToBreakeven,
+      boolean useExchangeSl,
       LocalTime hedgeTime,
       LocalTime entryTime,
       LocalTime exitTime,
@@ -107,9 +119,11 @@ public record StrategyProperties(
         lots,
         slPercentage,
         trailToBreakeven,
+        useExchangeSl,
         DEFAULT_MAX_VIX,
         DEFAULT_MAX_SPREAD,
         DEFAULT_PROFIT_TARGET,
+        DEFAULT_PORTFOLIO_PROFIT_TARGET,
         hedgeTime,
         entryTime,
         exitTime,

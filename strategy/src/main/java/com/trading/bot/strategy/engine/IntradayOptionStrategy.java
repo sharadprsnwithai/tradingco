@@ -267,8 +267,11 @@ public final class IntradayOptionStrategy {
       final BigDecimal ceSl =
           TickUtils.roundToTick(ceFill.multiply(BigDecimal.valueOf(slMultiplier)));
       final BigDecimal ceSlLimit = TickUtils.roundToTick(ceSl.multiply(BigDecimal.valueOf(1.05)));
-      final OrderId ceSlOrderId =
-          gateway.placeStopLossBuy(ceSymbol, ceToken, derivExchange, qty, ceSl, ceSlLimit);
+      OrderId ceSlOrderId = null;
+      if (props.useExchangeSl()) {
+        ceSlOrderId =
+            gateway.placeStopLossBuy(ceSymbol, ceToken, derivExchange, qty, ceSl, ceSlLimit);
+      }
       sCe = new TradeLeg(ceSymbol, ceToken, qty, ceFill, BigDecimal.ZERO, ceSl, ceSlOrderId, true);
     } catch (RuntimeException e) {
       if (LOG.isErrorEnabled()) {
@@ -289,8 +292,11 @@ public final class IntradayOptionStrategy {
       final BigDecimal peSl =
           TickUtils.roundToTick(peFill.multiply(BigDecimal.valueOf(slMultiplier)));
       final BigDecimal peSlLimit = TickUtils.roundToTick(peSl.multiply(BigDecimal.valueOf(1.05)));
-      final OrderId peSlOrderId =
-          gateway.placeStopLossBuy(peSymbol, peToken, derivExchange, qty, peSl, peSlLimit);
+      OrderId peSlOrderId = null;
+      if (props.useExchangeSl()) {
+        peSlOrderId =
+            gateway.placeStopLossBuy(peSymbol, peToken, derivExchange, qty, peSl, peSlLimit);
+      }
       sPe = new TradeLeg(peSymbol, peToken, qty, peFill, BigDecimal.ZERO, peSl, peSlOrderId, true);
     } catch (RuntimeException e) {
       if (LOG.isErrorEnabled()) {
