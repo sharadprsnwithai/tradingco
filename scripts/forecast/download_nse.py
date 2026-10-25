@@ -25,20 +25,31 @@ OUT_DIR = Path("data/forecast/nse_daily")
 
 def download():
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    skipped = []
     for name, ticker in SYMBOLS.items():
-        raw = yf.download(
-            ticker,
-            period="5y",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            multi_level_index=False,
-        )
-        df = normalize_prices(raw.reset_index())
-        # yfinance auto_adjust already folds splits/dividends into Close.
-        df["adjclose"] = df["close"]
-        df.to_csv(OUT_DIR / f"{name}.csv", index=False)
+        try:
+            raw = yf.download(
+                ticker,
+                period="5y",
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                multi_level_index=False,
+            )
+            df = normalize_prices(raw.reset_index())
+            # yfinance auto_adjust already folds splits/dividends into Close.
+            df["adjclose"] = df["close"]
+            df.to_csv(OUT_DIR / f"{name}.csv", index=False)
+        except Exception as exc:  # one bad symbol must not kill the monthly run
+            skipped.append(name)
+            print(f"{name} skipped: {exc}")
+            continue
         print(f"Downloaded {name}: {len(df)} rows")
+    if skipped:
+        print(
+            f"WARNING: skipped {len(skipped)} of {len(SYMBOLS)} symbols: "
+            f"{', '.join(skipped)}"
+        )
 
 if __name__ == "__main__":
     download()

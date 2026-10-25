@@ -1,6 +1,7 @@
 """Normalized price data access for the monthly forecast pipeline."""
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 DATA_DIR = Path("data/forecast/nse_daily")
@@ -46,8 +47,10 @@ def load_price_frame(symbol: str, data_dir: Path = DATA_DIR) -> pd.DataFrame:
 
 
 def get_adj_factor(df: pd.DataFrame) -> pd.Series:
-    """Adjusted close divided by raw close, per row."""
-    return df["adjclose"] / df["close"]
+    """Adjusted close divided by raw close; ones when close is already adjusted."""
+    if "adjclose" in df:
+        return df["adjclose"] / df["close"]
+    return pd.Series(np.ones(len(df)), index=df.index)
 
 
 def data_age_days(symbol: str, data_dir: Path = DATA_DIR) -> int:

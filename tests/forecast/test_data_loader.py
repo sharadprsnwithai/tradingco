@@ -81,6 +81,18 @@ def test_get_adj_factor_is_adjclose_over_close():
     assert get_adj_factor(df).tolist() == [0.95, 1.05]
 
 
+def test_get_adj_factor_chains_after_load(tmp_path):
+    _write_csv(
+        tmp_path,
+        "TCS",
+        "date,open,high,low,close\n"
+        "2026-10-22,4100,4150,4090,4120\n"
+        "2026-10-23,4120,4180,4110,4160\n",
+    )
+    frame = load_price_frame("TCS", data_dir=tmp_path)
+    assert get_adj_factor(frame).tolist() == [1.0, 1.0]
+
+
 def test_data_age_days_counts_days_since_last_row(tmp_path):
     today = pd.Timestamp.today().normalize()
     last = today - pd.Timedelta(days=3)
