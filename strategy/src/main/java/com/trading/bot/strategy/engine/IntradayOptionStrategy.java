@@ -56,6 +56,7 @@ public final class IntradayOptionStrategy {
   private final NotificationPublisher publisher;
   private final StrategyProperties props;
   private final Clock clock;
+  private final java.util.concurrent.locks.ReentrantLock lock = new java.util.concurrent.locks.ReentrantLock();
 
   @Autowired
   public IntradayOptionStrategy(
@@ -123,16 +124,21 @@ public final class IntradayOptionStrategy {
 
   /** Checkpoint 1: 09:45 AM IST - Buy 20 OTM CE and PE hedges with atomic rollback. */
   @SuppressWarnings(AVOID_GENERIC_EXC)
-  public synchronized void executeHedge() {
+  public void executeHedge() {
     final LocalDate today = LocalDate.now(clock);
     final TargetIndex index = getTargetIndexForDate(today);
     if (index == null) {
       return;
     }
 
-    final DailyTradeRecord existing = stateRepository.load(today).orElse(null);
-    if (existing != null && existing.state() != StrategyState.IDLE) {
-      return;
+    lock.lock();
+    try {
+      final DailyTradeRecord existing = stateRepository.load(today).orElse(null);
+      if (existing != null && existing.state() != StrategyState.IDLE) {
+        return;
+      }
+    } finally {
+      lock.unlock();
     }
 
     if (!isVixWithinThreshold()) {
@@ -189,24 +195,37 @@ public final class IntradayOptionStrategy {
       return;
     }
 
-    final DailyTradeRecord record =
-        new DailyTradeRecord(
-            today, index, StrategyState.HEDGED, hCe, hPe, null, null, BigDecimal.ZERO);
-    stateRepository.save(record);
+    lock.lock();
+    try {
+      final DailyTradeRecord record =
+          new DailyTradeRecord(
+              today, index, StrategyState.HEDGED, hCe, hPe, null, null, BigDecimal.ZERO);
+      stateRepository.save(record);
+    } finally {
+      lock.unlock();
+    }
 
-    alertService.notifyHedgeExecution(record, spot, props.executionMode());
+    alertService.notifyHedgeExecution(new DailyTradeRecord(
+        today, index, StrategyState.HEDGED, hCe, hPe, null, null, BigDecimal.ZERO), spot, props.executionMode());
   }
 
   /** Checkpoint 2: 10:00 AM IST - Sell ATM CE and ATM PE straddle with atomic rollback. */
   @SuppressWarnings(AVOID_GENERIC_EXC)
-  public synchronized void executeStraddle() {
+  public void executeStraddle() {
     final LocalDate today = LocalDate.now(clock);
     final TargetIndex index = getTargetIndexForDate(today);
     if (index == null) {
       return;
     }
 
-    final DailyTradeRecord record = stateRepository.load(today).orElse(null);
+    DailyTradeRecord record;
+    lock.lock();
+    try {
+      record = stateRepository.load(today).orElse(null);
+    } finally {
+      lock.unlock();
+    }
+
     if (record == null || record.state() != StrategyState.HEDGED) {
       if (LOG.isWarnEnabled()) {
         LOG.warn("Aborting 10:00 straddle sell: 09:45 hedges not active for {}", today);
@@ -286,16 +305,22 @@ public final class IntradayOptionStrategy {
               NotificationType.SYSTEM_ALERT,
               "Straddle Atomic Rollback",
               "PE leg failed. Unwound CE leg to prevent naked exposure: " + e.getMessage()));
-      stateRepository.save(
-          new DailyTradeRecord(
-              today,
-              index,
-              StrategyState.ABORTED,
-              closeLeg(record.hedgeCe()),
-              closeLeg(record.hedgePe()),
-              null,
-              null,
-              record.realizedPnl()));
+      
+      lock.lock();
+      try {
+        stateRepository.save(
+            new DailyTradeRecord(
+                today,
+                index,
+                StrategyState.ABORTED,
+                closeLeg(record.hedgeCe()),
+                closeLeg(record.hedgePe()),
+                null,
+                null,
+                record.realizedPnl()));
+      } finally {
+        lock.unlock();
+      }
       return;
     }
 
@@ -309,7 +334,12 @@ public final class IntradayOptionStrategy {
             sCe,
             sPe,
             record.realizedPnl());
-    stateRepository.save(updated);
+    lock.lock();
+    try {
+      stateRepository.save(updated);
+    } finally {
+      lock.unlock();
+    }
 
     alertService.notifyStraddleExecution(updated, spot, props.executionMode());
   }
@@ -317,10 +347,16 @@ public final class IntradayOptionStrategy {
   /** Checkpoint 3: Continuous 1-second Risk & Stop-Loss Monitoring Loop. */
   @Scheduled(fixedDelay = 1000)
   @SuppressWarnings(AVOID_GENERIC_EXC)
-  public synchronized void checkRisk() {
+  public void checkRisk() {
     final LocalDate today = LocalDate.now(clock);
     try {
-      final DailyTradeRecord record = stateRepository.load(today).orElse(null);
+      final DailyTradeRecord record;
+      lock.lock();
+      try {
+        record = stateRepository.load(today).orElse(null);
+      } finally {
+        lock.unlock();
+      }
       if (record != null
           && (record.state() == StrategyState.STRADDLE_ACTIVE
               || record.state() == StrategyState.ONE_LEG_STOPPED)) {
@@ -338,7 +374,7 @@ public final class IntradayOptionStrategy {
    */
   @Scheduled(fixedDelay = 5000)
   @SuppressWarnings(AVOID_GENERIC_EXC)
-  public synchronized void scheduledCheckpoints() {
+  public void scheduledCheckpoints() {
     try {
       final LocalTime now = LocalTime.now(clock);
       final LocalDate today = LocalDate.now(clock);
@@ -368,9 +404,16 @@ public final class IntradayOptionStrategy {
   }
 
   /** Checkpoint 4: 15:00 PM IST - Mandatory EOD Square-Off of all active legs. */
-  public synchronized void executeSquareOff() {
+  public void executeSquareOff() {
     final LocalDate today = LocalDate.now(clock);
-    final DailyTradeRecord record = stateRepository.load(today).orElse(null);
+    DailyTradeRecord record;
+    lock.lock();
+    try {
+      record = stateRepository.load(today).orElse(null);
+    } finally {
+      lock.unlock();
+    }
+
     if (record == null
         || record.state() == StrategyState.COMPLETED
         || record.state() == StrategyState.IDLE) {
@@ -469,7 +512,12 @@ public final class IntradayOptionStrategy {
             shortCe,
             shortPe,
             totalPnl);
-    stateRepository.save(completed);
+    lock.lock();
+    try {
+      stateRepository.save(completed);
+    } finally {
+      lock.unlock();
+    }
 
     alertService.notifyFinalSquareOff(completed, totalPnl, props.executionMode());
   }
