@@ -18,6 +18,7 @@ KEYS = {
     "term80",
     "term95",
     "touch95",
+    "touch80",
     "p_up",
     "p_down",
     "p_flat",
@@ -115,7 +116,7 @@ def test_stats_schema_and_probabilities():
 
     for key in ("median", "p_up", "p_down", "p_flat", "p_volexp", "last_close", "price_level_factor"):
         assert isinstance(stats[key], float)
-    for key in ("term80", "term95", "touch95"):
+    for key in ("term80", "term95", "touch95", "touch80"):
         assert isinstance(stats[key], tuple) and len(stats[key]) == 2
 
     call = model.calls[0]
@@ -138,6 +139,11 @@ def test_touch_envelope_straddles_terminal_bands_and_term95_is_wider():
         [touch_lo, touch_hi],
         [np.quantile(paths.min(axis=1), 0.05), np.quantile(paths.max(axis=1), 0.95)],
     )
+    np.testing.assert_allclose(
+        stats["touch80"],
+        [np.quantile(paths.min(axis=1), 0.10), np.quantile(paths.max(axis=1), 0.90)],
+    )
+    assert touch_lo <= stats["touch80"][0] and touch_hi >= stats["touch80"][1]
 
 
 def test_p_volexp_zero_when_paths_are_flatter_than_history():

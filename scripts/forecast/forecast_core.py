@@ -81,6 +81,10 @@ def forecast_asset(
             float(np.quantile(paths.min(axis=1), 0.05)),
             float(np.quantile(paths.max(axis=1), 0.95)),
         ),
+        "touch80": (
+            float(np.quantile(paths.min(axis=1), 0.10)),
+            float(np.quantile(paths.max(axis=1), 0.90)),
+        ),
         "p_up": p_up,
         "p_down": p_down,
         "p_flat": 1.0 - p_up - p_down,
