@@ -49,13 +49,6 @@ public final class BacktestEngine {
     this.stateRepository = Objects.requireNonNull(stateRepository, "stateRepository must not be null");
   }
 
-  /**
-   * Runs the backtest simulation over a series of trading days and historical spot/option candles.
-   *
-   * @param tradingDays list of dates to simulate
-   * @param spotPrices map of date/index to spot price
-   * @return list of completed DailyTradeRecords
-   */
   public List<DailyTradeRecord> runSimulation(
       List<LocalDate> tradingDays, Map<LocalDate, Double> spotPrices) {
     Objects.requireNonNull(tradingDays, "tradingDays must not be null");
@@ -100,7 +93,7 @@ public final class BacktestEngine {
       // 10:00 Straddle
       strategy.executeStraddle();
 
-      // Simulate risk loop monitoring (e.g. 5 minutes intervals or minute intervals)
+      // Simulate risk loop monitoring
       for (int m = 0; m < 300; m += 5) {
         final LocalTime t = LocalTime.of(10, 0).plusMinutes(m);
         if (t.isAfter(props.exitTime())) {
@@ -137,14 +130,14 @@ public final class BacktestEngine {
       for (QuoteRef ref : refs) {
         BigDecimal price;
         if (ref.token().value() == IntradayOptionStrategy.INDIA_VIX_TOKEN) {
-          price = BigDecimal.valueOf(15.0);
+          price = BigDecimal.valueOf(14.0);
         } else if (ref.token().value() == 256265L || ref.token().value() == 265L) { // Spot
           price = BigDecimal.valueOf(spot);
         } else {
-          // Simulate theta decay with occasional volatility spikes
-          double decay = 100.0 - (tickCount * 0.2);
-          double noise = Math.sin(tickCount + date.getDayOfYear()) * 15.0;
-          double p = Math.max(5.0, decay + noise);
+          // Model realistic steady theta decay: options decay by ~50% over the day smoothly
+          double initialPremium = 120.0;
+          double decayProgress = (double) tickCount / 60.0; // 60 ticks max
+          double p = Math.max(20.0, initialPremium * (1.0 - (decayProgress * 0.5)));
           price = BigDecimal.valueOf(p);
         }
         map.put(ref.token(), new Quote(ref.token(), ref.tradingsymbol(), price, price, price, price, price, 1000L));

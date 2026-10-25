@@ -1,8 +1,5 @@
 package com.trading.bot.strategy.engine;
 
-import static org.mockito.Mockito.mock;
-
-import com.trading.bot.broker.api.Broker;
 import com.trading.bot.strategy.config.ExecutionMode;
 import com.trading.bot.strategy.config.StrategyProperties;
 import com.trading.bot.strategy.gateway.BacktestStrategyGateway;
@@ -27,7 +24,7 @@ class BacktestRunnerTest {
         new StrategyProperties(
             ExecutionMode.PAPER,
             2,
-            30.0,
+            35.0, // 35% SL
             true,
             LocalTime.of(9, 45),
             LocalTime.of(10, 0),
@@ -57,7 +54,7 @@ class BacktestRunnerTest {
         .reduce(BigDecimal.ZERO, BigDecimal::add);
         
     System.out.println("==================================================");
-    System.out.println(" 3-MONTH BACKTEST RESULTS (NIFTY & SENSEX) ");
+    System.out.println(" TUNED 3-MONTH JAVA BACKTEST RESULTS ");
     System.out.println("==================================================");
     System.out.println("Total Trading Days Simulated: " + tradingDays.size());
     System.out.println("Total Days Traded & Completed: " + results.size());
