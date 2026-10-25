@@ -463,4 +463,37 @@ class PositionRiskManagerTest {
 
     assertThat(published).anyMatch(n -> n.title().contains("Profit Target Hit"));
   }
+
+  @Test
+  void evaluateRiskHandlesBrokerExceptionGracefully() {
+    final StrategyExecutionGateway gateway = mock(StrategyExecutionGateway.class);
+    final StrategyStateRepository stateRepo = mock(StrategyStateRepository.class);
+    final Broker broker = mock(Broker.class);
+    final NotificationPublisher publisher = n -> {};
+    final StrategyAlertService alertService = new StrategyAlertService(publisher);
+
+    final PositionRiskManager riskManager =
+        new PositionRiskManager(gateway, stateRepo, broker, alertService, props);
+
+    final InstrumentToken ceToken = new InstrumentToken(201L);
+    final TradeLeg shortCe =
+        new TradeLeg(
+            CE_SYMBOL, ceToken, 130, BigDecimal.valueOf(100.0), BigDecimal.valueOf(130.0), true);
+    final DailyTradeRecord record =
+        new DailyTradeRecord(
+            LocalDate.now(),
+            TargetIndex.NIFTY,
+            StrategyState.STRADDLE_ACTIVE,
+            null,
+            null,
+            shortCe,
+            null,
+            BigDecimal.ZERO);
+
+    when(broker.orderBook()).thenThrow(new com.trading.bot.broker.api.error.NetworkException("API down"));
+    when(broker.quotes(any())).thenThrow(new com.trading.bot.broker.api.error.NetworkException("API down"));
+
+    final DailyTradeRecord updated = riskManager.evaluateRisk(record);
+    assertThat(updated).isEqualTo(record);
+  }
 }

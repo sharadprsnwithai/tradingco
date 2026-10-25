@@ -99,7 +99,15 @@ public final class PositionRiskManager {
       }
     }
 
-    final Map<InstrumentToken, Quote> quotes = broker.quotes(refs);
+    final Map<InstrumentToken, Quote> quotes;
+    try {
+      quotes = broker.quotes(refs);
+    } catch (BrokerException e) {
+      if (LOG.isWarnEnabled()) {
+        LOG.warn("Notice querying quotes for SL reconciliation: {}", e.getMessage(), e);
+      }
+      return record;
+    }
 
     // 2. Evaluate Call Leg SL (Exchange fill detection OR quote threshold breach)
     if (shortCe != null && shortCe.isOpen()) {
@@ -192,7 +200,7 @@ public final class PositionRiskManager {
                       shortPe.token(),
                       shortPe.quantity(),
                       shortPe.entryPrice(),
-                      shortPe.exitPrice(),
+                      BigDecimal.ZERO,
                       shortPe.entryPrice(),
                       shortPe.slOrderId(),
                       true);
@@ -237,7 +245,7 @@ public final class PositionRiskManager {
         if (slOrder.status() == OrderStatus.FILLED) {
           peFilledAtExchange = true;
           peExchangePrice =
-              slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0
+              (slOrder.averagePrice() != null && slOrder.averagePrice().compareTo(BigDecimal.ZERO) > 0)
                   ? slOrder.averagePrice()
                   : shortPe.slPrice();
         }
@@ -316,7 +324,7 @@ public final class PositionRiskManager {
                       shortCe.token(),
                       shortCe.quantity(),
                       shortCe.entryPrice(),
-                      shortCe.exitPrice(),
+                      BigDecimal.ZERO,
                       shortCe.entryPrice(),
                       shortCe.slOrderId(),
                       true);
